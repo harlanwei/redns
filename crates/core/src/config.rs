@@ -232,7 +232,7 @@ where
         Float(f64),
         String(String),
         Seq(Vec<GenericYaml>),
-        Map(Vec<(GenericYaml, GenericYaml)>),
+        Map(std::collections::BTreeMap<String, GenericYaml>),
     }
 
     struct ValueVisitor;
