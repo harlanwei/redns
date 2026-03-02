@@ -4,8 +4,6 @@
 
 //! Per-IP token-bucket rate limiter.
 //!
-//! Ports `plugin/matcher/rate_limiter/rate_limiter.go`.
-//!
 //! Returns `true` if the request is allowed (within limits),
 //! `false` if the client has exceeded their rate limit.
 

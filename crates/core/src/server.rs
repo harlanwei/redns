@@ -16,8 +16,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! DNS server handler trait and entry handler.
-//!
-//! Ports `pkg/server_handler/entry_handler.go`.
 
 use crate::context::Context;
 use crate::plugin::{Executable, PluginResult};

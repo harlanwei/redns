@@ -3,8 +3,6 @@
 // This file is part of redns.
 
 //! IP set data provider — loads IP/CIDR lists for matching.
-//!
-//! Ports `plugin/data_provider/ip_set/ip_set.go`.
 
 use ipnet::IpNet;
 use redns_core::plugin::PluginResult;

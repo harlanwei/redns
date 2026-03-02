@@ -4,8 +4,6 @@
 
 //! Fallback executor — races a primary against a secondary executor.
 //!
-//! Ports `plugin/executable/sequence/fallback/fallback.go`.
-//!
 //! Behavior:
 //! - Starts the primary executor immediately.
 //! - If the primary fails or exceeds the `threshold` (default 500ms), the

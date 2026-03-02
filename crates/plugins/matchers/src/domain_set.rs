@@ -4,8 +4,6 @@
 
 //! Domain set data provider — loads domain lists for matching.
 //!
-//! Ports `plugin/data_provider/domain_set/domain_set.go`.
-//!
 //! Domain expressions support type prefixes:
 //! - `full:example.com` — exact match only
 //! - `domain:example.com` — subdomain match (default)
