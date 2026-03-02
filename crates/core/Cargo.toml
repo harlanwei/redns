@@ -1,0 +1,25 @@
+[package]
+name = "redns-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+hickory-proto = "0.25"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "0.0", default-features = false }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+base64 = "0.22"
+tokio-util = "0.7"
+quinn = "0.11.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+futures-util = "0.3.32"
+http = "1.4.0"
+bytes = "1.11.1"

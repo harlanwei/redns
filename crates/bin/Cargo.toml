@@ -1,0 +1,21 @@
+[package]
+name = "redns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "redns"
+path = "src/main.rs"
+
+[dependencies]
+redns-core = { path = "../core" }
+redns-matchers = { path = "../plugins/matchers" }
+redns-executables = { path = "../plugins/executables" }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "0.0", default-features = false }

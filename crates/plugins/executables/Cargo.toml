@@ -1,0 +1,19 @@
+[package]
+name = "redns-executables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+redns-core = { path = "../../core" }
+hickory-proto = "0.25"
+tracing = "0.1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["time", "sync", "rt"] }
+lru = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "0.0", default-features = false }
+
+[dev-dependencies]
+hickory-proto = "0.25"
+tokio = { version = "1", features = ["full"] }
