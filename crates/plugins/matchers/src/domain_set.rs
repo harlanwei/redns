@@ -52,9 +52,13 @@ impl DomainSet {
         }
     }
 
-    /// Normalize a domain: lowercase, strip trailing dot.
+    /// Normalize a domain: lowercase, strip leading/trailing dots.
     fn normalize(s: &str) -> String {
-        s.trim().to_lowercase().trim_end_matches('.').to_string()
+        s.trim()
+            .to_lowercase()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_string()
     }
 
     /// Add a domain expression with optional type prefix.
