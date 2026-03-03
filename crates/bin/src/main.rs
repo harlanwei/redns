@@ -308,7 +308,8 @@ async fn run_server(
     if let Some(ref log_file) = cfg.log.file {
         let file = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(log_file)
             .unwrap_or_else(|e| panic!("failed to open log file '{}': {}", log_file, e));
         let subscriber = tracing_subscriber::fmt()
