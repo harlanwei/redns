@@ -53,6 +53,9 @@ async fn main() {
         .finish();
     let _guard = tracing::subscriber::set_default(early_sub);
 
+    // Install rustls provider early to avoid runtime provider auto-detection panics.
+    redns_core::install_rustls_crypto_provider();
+
     let cli = Cli::parse();
 
     match cli.command {

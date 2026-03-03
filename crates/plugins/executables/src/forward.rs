@@ -10,6 +10,7 @@ use redns_core::plugin::PluginResult;
 use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -55,6 +56,32 @@ pub struct ForwardConfig {
 
 fn default_concurrent() -> usize {
     1
+}
+
+fn default_dial_port(upstream_addr: &str) -> u16 {
+    if upstream_addr.starts_with("tls://") || upstream_addr.starts_with("quic://") {
+        853
+    } else if upstream_addr.starts_with("https://") || upstream_addr.starts_with("h3://") {
+        443
+    } else {
+        53
+    }
+}
+
+fn parse_dial_addr(dial_addr: &str, upstream_addr: &str) -> PluginResult<SocketAddr> {
+    if let Ok(addr) = dial_addr.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    if let Ok(ip) = dial_addr.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_dial_port(upstream_addr)));
+    }
+
+    Err(format!(
+        "forward: invalid dial_addr '{}': expected IP or IP:port",
+        dial_addr
+    )
+    .into())
 }
 
 impl Default for ForwardConfig {
@@ -242,7 +269,7 @@ impl Forward {
             let name = ucfg.tag.clone().unwrap_or_else(|| ucfg.addr.clone());
             let mut opts = UpstreamOpts::default();
             if let Some(ref da) = ucfg.dial_addr {
-                opts.dial_addr = da.parse().ok();
+                opts.dial_addr = Some(parse_dial_addr(da, &ucfg.addr)?);
             }
             opts.bootstrap = ucfg.bootstrap.clone();
             let uw = Arc::new(UpstreamWrapper::new(
@@ -485,5 +512,25 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert!(selected.contains(&0));
         assert!(selected.contains(&1));
+    }
+
+    #[test]
+    fn parse_dial_addr_ip_without_port_uses_upstream_default_port() {
+        let addr = parse_dial_addr("223.5.5.5", "h3://9999.alidns.com/dns-query").unwrap();
+        assert_eq!(addr, "223.5.5.5:443".parse().unwrap());
+    }
+
+    #[test]
+    fn invalid_dial_addr_fails_forward_new() {
+        let cfg = ForwardConfig {
+            upstreams: vec![UpstreamConfig {
+                addr: "https://dns.google/dns-query".into(),
+                tag: None,
+                dial_addr: Some("not-an-ip".into()),
+                bootstrap: None,
+            }],
+            concurrent: 1,
+        };
+        assert!(Forward::new(cfg).is_err());
     }
 }

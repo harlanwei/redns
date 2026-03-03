@@ -16,6 +16,17 @@ pub mod tcp_server;
 pub mod udp_server;
 pub mod upstream;
 
+/// Ensure rustls has a process-level crypto provider installed.
+///
+/// This avoids runtime panics when multiple providers are compiled in.
+pub fn install_rustls_crypto_provider() {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+}
+
 // Re-exports for convenience.
 pub use chain_builder::ChainBuilder;
 pub use config::{Config, MatchConfig, PluginConfig, RuleArgs, RuleConfig};
