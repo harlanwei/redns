@@ -15,8 +15,65 @@
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
+
+// ── Domain Suffix Trie ──────────────────────────────────────────
+
+/// A trie node keyed by domain labels in reverse order (TLD first).
+///
+/// For example, inserting "google.com" stores labels ["com", "google"].
+/// Lookup for "www.google.com" walks: root → "com" → "google" (terminal) → match.
+#[derive(Default)]
+struct TrieNode {
+    children: HashMap<Box<str>, TrieNode>,
+    /// If true, this node represents a terminal domain entry.
+    terminal: bool,
+}
+
+/// A domain suffix trie for efficient subdomain matching.
+///
+/// Replaces `HashSet<String>` with O(labels) single-pass lookup
+/// instead of O(labels) hash lookups with substring slicing.
+struct DomainTrie {
+    root: TrieNode,
+}
+
+impl DomainTrie {
+    fn new() -> Self {
+        Self {
+            root: TrieNode::default(),
+        }
+    }
+
+    /// Insert a domain (e.g. "google.com") into the trie.
+    fn insert(&mut self, domain: &str) {
+        let mut node = &mut self.root;
+        for label in domain.rsplit('.') {
+            node = node.children.entry(label.into()).or_default();
+        }
+        node.terminal = true;
+    }
+
+    /// Check if a domain or any of its parent domains is in the trie.
+    fn matches(&self, domain: &str) -> bool {
+        let mut node = &self.root;
+        for label in domain.rsplit('.') {
+            match node.children.get(label) {
+                Some(child) => {
+                    node = child;
+                    if node.terminal {
+                        return true;
+                    }
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+// ── DomainSet ───────────────────────────────────────────────────
 
 /// A domain set that matches query names against loaded domain patterns.
 ///
@@ -24,9 +81,9 @@ use tracing::warn;
 pub struct DomainSet {
     /// Full/exact match domains (lowercased, without trailing dot).
     full: HashSet<String>,
-    /// Subdomain match domains (lowercased, without trailing dot).
-    /// Matches the domain itself and all subdomains.
-    domain: HashSet<String>,
+    /// Subdomain match via suffix trie — matches the domain itself
+    /// and all subdomains in a single traversal.
+    domain: DomainTrie,
     /// Keyword substring matches.
     keywords: Vec<String>,
     /// Regex matches.
@@ -46,7 +103,7 @@ impl DomainSet {
     pub fn new() -> Self {
         Self {
             full: HashSet::new(),
-            domain: HashSet::new(),
+            domain: DomainTrie::new(),
             keywords: Vec::new(),
             regexes: Vec::new(),
         }
@@ -81,7 +138,7 @@ impl DomainSet {
                     self.full.insert(pattern);
                 }
                 "domain" => {
-                    self.domain.insert(pattern);
+                    self.domain.insert(&pattern);
                 }
                 "keyword" => {
                     self.keywords.push(pattern);
@@ -97,14 +154,14 @@ impl DomainSet {
                 _ => {
                     // Unknown type prefix — treat as default (domain/subdomain).
                     let full_pattern = Self::normalize(exp);
-                    self.domain.insert(full_pattern);
+                    self.domain.insert(&full_pattern);
                 }
             }
         } else {
             // No prefix — default to subdomain matching.
             let pattern = Self::normalize(exp);
             if !pattern.is_empty() {
-                self.domain.insert(pattern);
+                self.domain.insert(&pattern);
             }
         }
         Ok(())
@@ -182,17 +239,9 @@ impl DomainSet {
             return true;
         }
 
-        // Subdomain match — check if normalized or any parent domain is in the set.
-        if self.domain.contains(&normalized) {
+        // Subdomain match — single trie traversal.
+        if self.domain.matches(&normalized) {
             return true;
-        }
-        // Walk up the domain hierarchy: "a.b.c" → check "b.c", "c".
-        let mut remaining = normalized.as_str();
-        while let Some(pos) = remaining.find('.') {
-            remaining = &remaining[pos + 1..];
-            if self.domain.contains(remaining) {
-                return true;
-            }
         }
 
         // Keyword match.

@@ -4,6 +4,10 @@
 
 //! redns CLI entry point.
 
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 use redns_core::chain_builder::ChainBuilder;
 use redns_core::config::parse_rule_args;
@@ -334,10 +338,11 @@ async fn run_server(
     register_builtins(&mut builder);
 
     // Register forward plugin with upstream collection for metrics API.
-    let all_upstreams: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>> =
+    // Uses a Mutex during startup only; frozen into Arc<[]> before serving.
+    let upstreams_collector: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     {
-        let upstreams_collector = all_upstreams.clone();
+        let collector = upstreams_collector.clone();
         builder.register_exec(
             "forward",
             Box::new(move |args: &str| {
@@ -350,7 +355,7 @@ async fn run_server(
                     ForwardConfig::from_str_args(args)
                 };
                 let fwd = Forward::new(cfg)?;
-                if let Ok(mut guard) = upstreams_collector.lock() {
+                if let Ok(mut guard) = collector.lock() {
                     guard.extend(fwd.upstreams().iter().cloned());
                 }
                 Ok(Box::new(fwd) as Box<dyn Executable>)
@@ -578,6 +583,12 @@ async fn run_server(
     }
 
     // ── Phase 4: Start API HTTP server ──────────────────────────
+    // Freeze the upstreams collection into an immutable Arc slice (no more Mutex).
+    let all_upstreams: Arc<[Arc<UpstreamWrapper>]> = {
+        let guard = upstreams_collector.lock().unwrap();
+        guard.clone().into()
+    };
+
     if let Some(ref api_addr) = cfg.api.http {
         match TcpListener::bind(api_addr).await {
             Ok(listener) => {
@@ -607,7 +618,7 @@ async fn run_server(
 /// Simple API HTTP server.
 async fn serve_api(
     listener: TcpListener,
-    upstreams: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>>,
+    upstreams: Arc<[Arc<UpstreamWrapper>]>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     loop {
@@ -634,7 +645,7 @@ async fn serve_api(
 
 async fn handle_api_request(
     mut stream: tokio::net::TcpStream,
-    upstreams: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>>,
+    upstreams: Arc<[Arc<UpstreamWrapper>]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -655,15 +666,8 @@ async fn handle_api_request(
     };
 
     if method == "GET" && path == "/metrics/upstreams" {
-        let metrics: Vec<redns_core::UpstreamMetrics> = {
-            let guard =
-                upstreams
-                    .lock()
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("lock error: {e}").into()
-                    })?;
-            guard.iter().map(|u| u.snapshot()).collect()
-        };
+        let metrics: Vec<redns_core::UpstreamMetrics> =
+            upstreams.iter().map(|u| u.snapshot()).collect();
         let body = serde_json::to_string_pretty(&metrics)?;
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
