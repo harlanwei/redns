@@ -13,6 +13,3 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "0.0", default-features = false }
 tracing = "0.1"
-
-[dev-dependencies]
-hickory-proto = "0.25"

@@ -1202,7 +1202,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde-saphyr",
- "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-util",
