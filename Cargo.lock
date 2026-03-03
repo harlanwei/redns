@@ -1179,6 +1179,7 @@ dependencies = [
  "redns-matchers",
  "serde",
  "serde-saphyr",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

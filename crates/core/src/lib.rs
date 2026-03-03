@@ -40,5 +40,5 @@ pub use sequence::{ChainNode, ChainWalker, NodeExecutor, Sequence};
 pub use server::{DnsHandler, EntryHandler, QueryMeta};
 pub use upstream::{
     DohUpstream, PooledTcpUpstream, PooledTlsUpstream, TcpUpstream, TlsUpstream, UdpUpstream,
-    Upstream, UpstreamWrapper,
+    Upstream, UpstreamMetrics, UpstreamWrapper,
 };

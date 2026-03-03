@@ -319,6 +319,11 @@ impl Forward {
 
         self.selector.select_from(&indices, self.concurrent)
     }
+
+    /// Returns a reference to all upstreams for metrics collection.
+    pub fn upstreams(&self) -> &[Arc<UpstreamWrapper>] {
+        &self.upstreams
+    }
 }
 
 #[async_trait]
@@ -356,6 +361,7 @@ impl Executable for Forward {
                     format!("invalid upstream response: {e}").into()
                 },
             )?;
+            selected[0].record_adopted();
             ctx.set_response(Some(resp));
         } else {
             let total = selected.len();
@@ -387,6 +393,7 @@ impl Executable for Forward {
                                 || rcode == ResponseCode::NoError
                                 || rcode == ResponseCode::NXDomain
                             {
+                                selected[_sel_idx].record_adopted();
                                 ctx.set_response(Some(resp));
                                 return Ok(());
                             }

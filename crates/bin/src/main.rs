@@ -9,6 +9,7 @@ use redns_core::chain_builder::ChainBuilder;
 use redns_core::config::parse_rule_args;
 use redns_core::redns::{Redns, find_and_load_config, load_config_file};
 use redns_core::server::EntryHandler;
+use redns_core::upstream::UpstreamWrapper;
 use redns_core::{PluginRegistry, Sequence};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
@@ -125,21 +126,7 @@ fn register_builtins(builder: &mut ChainBuilder) {
         "hosts",
         Box::new(|args: &str| Ok(Box::new(Hosts::from_lines(args)?) as Box<dyn Executable>)),
     );
-
     // ── Recursive Executables ────────────────────────────────────
-    builder.register_exec(
-        "forward",
-        Box::new(|args: &str| {
-            use redns_executables::forward::ForwardConfig;
-            // Try YAML deserialization first (full plugin args), then string (quick-setup).
-            let cfg = if let Ok(yaml_cfg) = ForwardConfig::from_yaml_str(args) {
-                yaml_cfg
-            } else {
-                ForwardConfig::from_str_args(args)
-            };
-            Ok(Box::new(Forward::new(cfg)?) as Box<dyn Executable>)
-        }),
-    );
     builder.register_rec_exec(
         "cache",
         Box::new(|args: &str| {
@@ -344,6 +331,31 @@ async fn run_server(
 
     let mut builder = ChainBuilder::new();
     register_builtins(&mut builder);
+
+    // Register forward plugin with upstream collection for metrics API.
+    let all_upstreams: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let upstreams_collector = all_upstreams.clone();
+        builder.register_exec(
+            "forward",
+            Box::new(move |args: &str| {
+                use redns_core::plugin::Executable;
+                use redns_executables::Forward;
+                use redns_executables::forward::ForwardConfig;
+                let cfg = if let Ok(yaml_cfg) = ForwardConfig::from_yaml_str(args) {
+                    yaml_cfg
+                } else {
+                    ForwardConfig::from_str_args(args)
+                };
+                let fwd = Forward::new(cfg)?;
+                if let Ok(mut guard) = upstreams_collector.lock() {
+                    guard.extend(fwd.upstreams().iter().cloned());
+                }
+                Ok(Box::new(fwd) as Box<dyn Executable>)
+            }),
+        );
+    }
 
     // ── Phase 1: Build non-sequence plugins and register by tag ──
     // Two passes: first register all normal plugins, then resolve
@@ -564,6 +576,21 @@ async fn run_server(
         }
     }
 
+    // ── Phase 4: Start API HTTP server ──────────────────────────
+    if let Some(ref api_addr) = cfg.api.http {
+        match TcpListener::bind(api_addr).await {
+            Ok(listener) => {
+                info!(addr = %api_addr, "API HTTP server listening");
+                let upstreams = all_upstreams.clone();
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    serve_api(listener, upstreams, c).await;
+                });
+            }
+            Err(e) => warn!(error = %e, addr = %api_addr, "failed to bind API HTTP"),
+        }
+    }
+
     info!("redns started");
     tokio::signal::ctrl_c()
         .await
@@ -573,5 +600,85 @@ async fn run_server(
     // Give servers time to clean up.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     info!("redns stopped");
+    Ok(())
+}
+
+/// Simple API HTTP server.
+async fn serve_api(
+    listener: TcpListener,
+    upstreams: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _peer)) => {
+                        let upstreams = upstreams.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_api_request(stream, upstreams).await {
+                                warn!(error = %e, "API request error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "API accept error");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_api_request(
+    mut stream: tokio::net::TcpStream,
+    upstreams: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    // Parse the request line.
+    let first_line = request.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let (method, path) = if parts.len() >= 2 {
+        (parts[0], parts[1])
+    } else {
+        ("", "")
+    };
+
+    if method == "GET" && path == "/metrics/upstreams" {
+        let metrics: Vec<redns_core::UpstreamMetrics> = {
+            let guard =
+                upstreams
+                    .lock()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("lock error: {e}").into()
+                    })?;
+            guard.iter().map(|u| u.snapshot()).collect()
+        };
+        let body = serde_json::to_string_pretty(&metrics)?;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).await?;
+    } else {
+        let body = "{\"error\":\"not found\"}";
+        let resp = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).await?;
+    }
+
     Ok(())
 }

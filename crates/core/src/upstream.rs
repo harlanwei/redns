@@ -835,6 +835,16 @@ impl Upstream for Doh3Upstream {
 
 // ── Upstream Wrapper with Latency/Error Tracking ────────────────
 
+/// A point-in-time snapshot of per-upstream metrics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpstreamMetrics {
+    pub name: String,
+    pub query_total: u64,
+    pub adopted_total: u64,
+    pub error_total: u64,
+    pub avg_latency_ms: f64,
+}
+
 /// Wraps an upstream transport with per-upstream latency and error tracking.
 pub struct UpstreamWrapper {
     inner: Box<dyn Upstream>,
@@ -842,6 +852,8 @@ pub struct UpstreamWrapper {
     ema_latency_ms: AtomicI64,
     query_count: AtomicU64,
     error_count: AtomicU64,
+    adopted_count: AtomicU64,
+    latency_sum_us: AtomicU64,
 }
 
 impl UpstreamWrapper {
@@ -855,6 +867,8 @@ impl UpstreamWrapper {
             ema_latency_ms: AtomicI64::new(0),
             query_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
+            adopted_count: AtomicU64::new(0),
+            latency_sum_us: AtomicU64::new(0),
         }
     }
 
@@ -879,11 +893,36 @@ impl UpstreamWrapper {
         self.error_count() as f64 / q as f64
     }
 
+    /// Record that this upstream's response was adopted by the Forward plugin.
+    pub fn record_adopted(&self) {
+        self.adopted_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns a point-in-time snapshot of this upstream's metrics.
+    pub fn snapshot(&self) -> UpstreamMetrics {
+        let query_total = self.query_count.load(Ordering::Relaxed);
+        let latency_sum = self.latency_sum_us.load(Ordering::Relaxed);
+        UpstreamMetrics {
+            name: self.name.clone(),
+            query_total,
+            adopted_total: self.adopted_count.load(Ordering::Relaxed),
+            error_total: self.error_count.load(Ordering::Relaxed),
+            avg_latency_ms: if query_total > 0 {
+                (latency_sum as f64 / query_total as f64) / 1000.0
+            } else {
+                0.0
+            },
+        }
+    }
+
     pub async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
         self.query_count.fetch_add(1, Ordering::Relaxed);
         let start = std::time::Instant::now();
         let result = self.inner.exchange(query).await;
-        let elapsed_ms = start.elapsed().as_millis() as i64;
+        let elapsed = start.elapsed();
+        let elapsed_ms = elapsed.as_millis() as i64;
+        self.latency_sum_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 
         match &result {
             Ok(_) => self.update_ema_latency(elapsed_ms),
