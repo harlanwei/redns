@@ -7,7 +7,6 @@
 use crate::plugin::PluginResult;
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use tracing::warn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -15,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 /// Maximum DNS UDP payload.
 const MAX_UDP_SIZE: usize = 4096;
@@ -31,6 +31,9 @@ const MAX_IDLE_CONNS: usize = 4;
 /// Maximum retries on stale pooled connection.
 const MAX_POOL_RETRY: usize = 2;
 
+/// Maximum idle UDP sockets in pool.
+const MAX_IDLE_UDP_SOCKETS: usize = 16;
+
 /// An upstream DNS transport that can exchange raw DNS wire messages.
 #[async_trait]
 pub trait Upstream: Send + Sync {
@@ -44,6 +47,7 @@ pub trait Upstream: Send + Sync {
 pub struct UdpUpstream {
     addr: SocketAddr,
     timeout: Duration,
+    pool: Mutex<VecDeque<UdpSocket>>,
 }
 
 impl UdpUpstream {
@@ -51,6 +55,7 @@ impl UdpUpstream {
         Self {
             addr,
             timeout: DEFAULT_TIMEOUT,
+            pool: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -58,27 +63,61 @@ impl UdpUpstream {
         self.timeout = timeout;
         self
     }
-}
 
-#[async_trait]
-impl Upstream for UdpUpstream {
-    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+    async fn create_socket(&self) -> PluginResult<UdpSocket> {
         let bind_addr: SocketAddr = if self.addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         };
+
         let sock = UdpSocket::bind(bind_addr).await.map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> { format!("udp bind: {e}").into() },
         )?;
-        sock.send_to(query, self.addr).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("udp send: {e}").into() },
-        )?;
+
+        sock.connect(self.addr)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("udp connect {}: {e}", self.addr).into()
+            })?;
+
+        Ok(sock)
+    }
+
+    async fn get_socket(&self) -> PluginResult<UdpSocket> {
+        let mut pool = self.pool.lock().await;
+        if let Some(sock) = pool.pop_front() {
+            return Ok(sock);
+        }
+        drop(pool);
+        self.create_socket().await
+    }
+
+    async fn put_socket(&self, sock: UdpSocket) {
+        let mut pool = self.pool.lock().await;
+        while pool.len() >= MAX_IDLE_UDP_SOCKETS {
+            pool.pop_front();
+        }
+        pool.push_back(sock);
+    }
+}
+
+#[async_trait]
+impl Upstream for UdpUpstream {
+    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+        let sock = self.get_socket().await?;
+
+        sock.send(query)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("udp send: {e}").into()
+            })?;
 
         let mut buf = vec![0u8; MAX_UDP_SIZE];
-        let result = tokio::time::timeout(self.timeout, sock.recv_from(&mut buf)).await;
+        let result = tokio::time::timeout(self.timeout, sock.recv(&mut buf)).await;
         match result {
-            Ok(Ok((n, _))) => {
+            Ok(Ok(n)) => {
+                self.put_socket(sock).await;
                 buf.truncate(n);
                 Ok(buf)
             }
@@ -561,6 +600,43 @@ impl Upstream for DohUpstream {
 
 // ── DoQ (DNS-over-QUIC, RFC 9250) ───────────────────────────────
 
+fn quic_bind_addr_for_target(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    }
+}
+
+fn build_quic_endpoint(
+    target: SocketAddr,
+    client_config: quinn::ClientConfig,
+    protocol: &str,
+) -> PluginResult<quinn::Endpoint> {
+    let bind_addr = quic_bind_addr_for_target(target);
+    let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("{protocol} endpoint bind: {e}").into()
+        },
+    )?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
+
+struct Doh3Session {
+    quinn_conn: quinn::Connection,
+    send_request: H3SendRequest,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Doh3Session {
+    fn is_healthy(&self) -> bool {
+        !self.driver.is_finished() && self.quinn_conn.close_reason().is_none()
+    }
+}
+
 /// DNS-over-QUIC upstream using `quinn` (RFC 9250).
 ///
 /// Per RFC 9250 §4.2: open a bi-directional QUIC stream, send a
@@ -570,17 +646,21 @@ pub struct DoqUpstream {
     addr: SocketAddr,
     server_name: String,
     timeout: Duration,
-    client_config: quinn::ClientConfig,
+    endpoint: quinn::Endpoint,
+    conn: Mutex<Option<quinn::Connection>>,
 }
 
 impl DoqUpstream {
     fn new(addr: SocketAddr, server_name: String) -> Self {
         let client_config = Self::build_client_config();
+        let endpoint =
+            build_quic_endpoint(addr, client_config, "doq").expect("failed to create doq endpoint");
         Self {
             addr,
             server_name,
             timeout: DEFAULT_TIMEOUT,
-            client_config,
+            endpoint,
+            conn: Mutex::new(None),
         }
     }
 
@@ -600,84 +680,119 @@ impl DoqUpstream {
             .expect("failed to create QUIC client config");
         quinn::ClientConfig::new(Arc::new(quic_config))
     }
-}
 
-#[async_trait]
-impl Upstream for DoqUpstream {
-    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let bind_addr: SocketAddr = if self.addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
+    async fn connect(&self) -> PluginResult<quinn::Connection> {
+        let connecting = self
+            .endpoint
+            .connect(self.addr, &self.server_name)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("doq connect: {e}").into()
+            })?;
 
-        let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("doq endpoint bind: {e}").into()
-            },
-        )?;
-        endpoint.set_default_client_config(self.client_config.clone());
-
-        let connecting = endpoint.connect(self.addr, &self.server_name).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("doq connect: {e}").into() },
-        )?;
-
-        let connection = tokio::time::timeout(self.timeout, connecting)
+        tokio::time::timeout(self.timeout, connecting)
             .await
             .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
                 "doq connect timed out".into()
             })?
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("doq connection: {e}").into()
-            })?;
+            })
+    }
 
-        let (mut send, mut recv) = connection.open_bi().await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("doq open stream: {e}").into()
-            },
-        )?;
+    async fn get_connection(&self) -> PluginResult<quinn::Connection> {
+        let mut guard = self.conn.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            if conn.close_reason().is_none() {
+                return Ok(conn.clone());
+            }
+            *guard = None;
+        }
 
-        // Send length-prefixed DNS query (RFC 9250 §4.2).
-        let len = query.len() as u16;
-        send.write_all(&len.to_be_bytes()).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("doq write: {e}").into() },
-        )?;
-        send.write_all(query)
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("doq write: {e}").into()
-            })?;
-        send.finish()
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("doq finish: {e}").into()
-            })?;
+        let conn = self.connect().await?;
+        *guard = Some(conn.clone());
+        Ok(conn)
+    }
 
-        // Read length-prefixed response.
-        let resp = tokio::time::timeout(self.timeout, async {
-            let mut len_buf = [0u8; 2];
-            recv.read_exact(&mut len_buf).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("doq read len: {e}").into()
-                },
-            )?;
-            let resp_len = u16::from_be_bytes(len_buf) as usize;
-            let mut resp_buf = vec![0u8; resp_len];
-            recv.read_exact(&mut resp_buf).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("doq read body: {e}").into()
-                },
-            )?;
-            Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(resp_buf)
-        })
-        .await
-        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-            "doq exchange timed out".into()
-        })??;
+    async fn invalidate_connection(&self, stable_id: usize) {
+        let mut guard = self.conn.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            if conn.stable_id() == stable_id {
+                if let Some(conn) = guard.take() {
+                    conn.close(quinn::VarInt::from_u32(0), b"reconnect");
+                }
+            }
+        }
+    }
+}
 
-        // Gracefully close the connection.
-        connection.close(quinn::VarInt::from_u32(0), b"done");
+#[async_trait]
+impl Upstream for DoqUpstream {
+    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+        let mut attempt = 0;
+        loop {
+            let conn = self.get_connection().await?;
+            let stable_id = conn.stable_id();
 
-        Ok(resp)
+            let exchange = async {
+                let (mut send, mut recv) = conn.open_bi().await.map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doq open stream: {e}").into()
+                    },
+                )?;
+
+                let len = query.len() as u16;
+                send.write_all(&len.to_be_bytes()).await.map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doq write: {e}").into()
+                    },
+                )?;
+                send.write_all(query).await.map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doq write: {e}").into()
+                    },
+                )?;
+                send.finish()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doq finish: {e}").into()
+                    })?;
+
+                let mut len_buf = [0u8; 2];
+                recv.read_exact(&mut len_buf).await.map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doq read len: {e}").into()
+                    },
+                )?;
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                recv.read_exact(&mut resp_buf).await.map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doq read body: {e}").into()
+                    },
+                )?;
+
+                Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(resp_buf)
+            };
+
+            match tokio::time::timeout(self.timeout, exchange).await {
+                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Err(e)) => {
+                    self.invalidate_connection(stable_id).await;
+                    if attempt < MAX_POOL_RETRY {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.invalidate_connection(stable_id).await;
+                    if attempt < MAX_POOL_RETRY {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err("doq exchange timed out".into());
+                }
+            }
+        }
     }
 }
 
@@ -688,22 +803,53 @@ impl Upstream for DoqUpstream {
 /// Sends HTTP/3 GET requests with base64url-encoded DNS queries,
 /// same as DoH (RFC 8484) but over HTTP/3 instead of HTTP/2 or HTTP/1.1.
 pub struct Doh3Upstream {
-    endpoint_url: String,
     addr: SocketAddr,
     server_name: String,
+    authority: String,
+    path_prefix: String,
     timeout: Duration,
-    client_config: quinn::ClientConfig,
+    endpoint: quinn::Endpoint,
+    session: Mutex<Option<Arc<Doh3Session>>>,
 }
 
 impl Doh3Upstream {
     fn new(endpoint_url: String, addr: SocketAddr, server_name: String) -> Self {
         let client_config = Self::build_client_config();
+        let endpoint =
+            build_quic_endpoint(addr, client_config, "h3").expect("failed to create h3 endpoint");
+
+        let url = reqwest::Url::parse(&endpoint_url).expect("invalid h3 endpoint url");
+        let authority = if let Some(port) = url.port() {
+            if port == 443 {
+                server_name.clone()
+            } else {
+                format!("{}:{}", server_name, port)
+            }
+        } else {
+            server_name.clone()
+        };
+
+        let mut path_prefix = url.path().to_string();
+        if let Some(q) = url.query() {
+            if q.is_empty() {
+                path_prefix.push('?');
+            } else {
+                path_prefix.push('?');
+                path_prefix.push_str(q);
+                path_prefix.push('&');
+            }
+        } else {
+            path_prefix.push('?');
+        }
+
         Self {
-            endpoint_url,
             addr,
             server_name,
+            authority,
+            path_prefix,
             timeout: DEFAULT_TIMEOUT,
-            client_config,
+            endpoint,
+            session: Mutex::new(None),
         }
     }
 
@@ -723,6 +869,75 @@ impl Doh3Upstream {
             .expect("failed to create QUIC client config");
         quinn::ClientConfig::new(Arc::new(quic_config))
     }
+
+    async fn connect_quic(&self) -> PluginResult<quinn::Connection> {
+        let connecting = self
+            .endpoint
+            .connect(self.addr, &self.server_name)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("h3 connect: {e}").into()
+            })?;
+
+        tokio::time::timeout(self.timeout, connecting)
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "h3 connect timed out".into()
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("h3 connection: {e}").into()
+            })
+    }
+
+    async fn create_session(&self) -> PluginResult<Arc<Doh3Session>> {
+        let quinn_conn = self.connect_quic().await?;
+        let h3_conn = h3_quinn::Connection::new(quinn_conn.clone());
+        let (mut driver, send_request) = h3::client::new(h3_conn).await.map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("h3 client init: {e}").into()
+            },
+        )?;
+
+        let driver = tokio::spawn(async move {
+            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        Ok(Arc::new(Doh3Session {
+            quinn_conn,
+            send_request,
+            driver,
+        }))
+    }
+
+    fn clear_session_locked(session: &mut Option<Arc<Doh3Session>>) {
+        if let Some(old) = session.take() {
+            old.quinn_conn
+                .close(quinn::VarInt::from_u32(0), b"reconnect");
+            old.driver.abort();
+        }
+    }
+
+    async fn get_session(&self) -> PluginResult<Arc<Doh3Session>> {
+        let mut guard = self.session.lock().await;
+        if let Some(session) = guard.as_ref() {
+            if session.is_healthy() {
+                return Ok(session.clone());
+            }
+        }
+        Self::clear_session_locked(&mut guard);
+
+        let session = self.create_session().await?;
+        *guard = Some(session.clone());
+        Ok(session)
+    }
+
+    async fn invalidate_session(&self, stable_id: usize) {
+        let mut guard = self.session.lock().await;
+        if let Some(session) = guard.as_ref() {
+            if session.quinn_conn.stable_id() == stable_id {
+                Self::clear_session_locked(&mut guard);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -738,99 +953,101 @@ impl Upstream for Doh3Upstream {
         }
 
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&wire);
-        let path = {
-            let url = reqwest::Url::parse(&self.endpoint_url).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("invalid h3 endpoint: {e}").into()
-                },
-            )?;
-            format!("{}?dns={}", url.path(), encoded)
-        };
 
-        let bind_addr: SocketAddr = if self.addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
+        let mut attempt = 0;
+        loop {
+            let session = self.get_session().await?;
+            let stable_id = session.quinn_conn.stable_id();
+            let mut send_request = session.send_request.clone();
 
-        let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("h3 endpoint bind: {e}").into()
-            },
-        )?;
-        endpoint.set_default_client_config(self.client_config.clone());
-
-        let connecting = endpoint.connect(self.addr, &self.server_name).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("h3 connect: {e}").into() },
-        )?;
-
-        let quinn_conn = tokio::time::timeout(self.timeout, connecting)
-            .await
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                "h3 connect timed out".into()
-            })?
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("h3 connection: {e}").into()
-            })?;
-
-        let h3_conn = h3_quinn::Connection::new(quinn_conn.clone());
-        let (mut driver, mut send_request) = h3::client::new(h3_conn).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("h3 client init: {e}").into()
-            },
-        )?;
-
-        // Drive the H3 connection in the background.
-        let drive_fut = tokio::spawn(async move {
-            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        });
-
-        // Build HTTP/3 request.
-        let req = http::Request::get(format!("https://{}{}", self.server_name, path))
+            let req = http::Request::get(format!(
+                "https://{}{}dns={}",
+                self.authority, self.path_prefix, encoded
+            ))
             .header("accept", "application/dns-message")
             .body(())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("h3 build request: {e}").into()
             })?;
 
-        let mut resp_stream = tokio::time::timeout(self.timeout, send_request.send_request(req))
-            .await
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                "h3 request timed out".into()
-            })?
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("h3 send request: {e}").into()
-            })?;
+            let mut resp_stream =
+                match tokio::time::timeout(self.timeout, send_request.send_request(req)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        self.invalidate_session(stable_id).await;
+                        if attempt < MAX_POOL_RETRY {
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(format!("h3 send request: {e}").into());
+                    }
+                    Err(_) => {
+                        self.invalidate_session(stable_id).await;
+                        if attempt < MAX_POOL_RETRY {
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err("h3 request timed out".into());
+                    }
+                };
 
-        let resp = resp_stream.recv_response().await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("h3 recv response: {e}").into()
-            },
-        )?;
+            let resp = match tokio::time::timeout(self.timeout, resp_stream.recv_response()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    self.invalidate_session(stable_id).await;
+                    if attempt < MAX_POOL_RETRY {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(format!("h3 recv response: {e}").into());
+                }
+                Err(_) => {
+                    self.invalidate_session(stable_id).await;
+                    if attempt < MAX_POOL_RETRY {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err("h3 response timed out".into());
+                }
+            };
 
-        if !resp.status().is_success() {
-            return Err(format!("h3: bad status {}", resp.status()).into());
+            if !resp.status().is_success() {
+                return Err(format!("h3: bad status {}", resp.status()).into());
+            }
+
+            let mut body_bytes = Vec::new();
+            let mut read_failed = None;
+            loop {
+                match tokio::time::timeout(self.timeout, resp_stream.recv_data()).await {
+                    Ok(Ok(Some(chunk))) => body_bytes.extend_from_slice(bytes::Buf::chunk(&chunk)),
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        read_failed = Some(format!("h3 recv body: {e}").into());
+                        break;
+                    }
+                    Err(_) => {
+                        read_failed = Some("h3 recv body timed out".into());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = read_failed {
+                self.invalidate_session(stable_id).await;
+                if attempt < MAX_POOL_RETRY {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(err);
+            }
+
+            if body_bytes.len() >= 2 && query.len() >= 2 {
+                body_bytes[0] = query[0];
+                body_bytes[1] = query[1];
+            }
+
+            return Ok(body_bytes);
         }
-
-        // Read the response body.
-        let mut body_bytes = Vec::new();
-        while let Some(chunk) = resp_stream.recv_data().await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("h3 recv body: {e}").into() },
-        )? {
-            body_bytes.extend_from_slice(bytes::Buf::chunk(&chunk));
-        }
-
-        // Clean up.
-        quinn_conn.close(quinn::VarInt::from_u32(0), b"done");
-        drive_fut.abort();
-
-        // Restore original query ID.
-        if body_bytes.len() >= 2 && query.len() >= 2 {
-            body_bytes[0] = query[0];
-            body_bytes[1] = query[1];
-        }
-
-        Ok(body_bytes)
     }
 }
 

@@ -24,6 +24,13 @@ const NOISE_FACTOR: f64 = 0.125;
 const ERROR_PENALTY_MULT: f64 = 8.0;
 const DEFAULT_LATENCY: f64 = 10.0;
 
+fn dns_header_rcode(resp_wire: &[u8]) -> Option<u16> {
+    if resp_wire.len() < 4 {
+        return None;
+    }
+    Some((resp_wire[3] & 0x0f) as u16)
+}
+
 // ── Configuration ───────────────────────────────────────────────
 
 /// Per-upstream configuration.
@@ -335,12 +342,13 @@ impl Executable for Forward {
             return Ok(());
         }
 
-        let query_bytes =
-            ctx.query()
-                .to_vec()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("failed to serialize query: {e}").into()
-                })?;
+        let query_bytes: Arc<[u8]> = ctx
+            .query()
+            .to_vec()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to serialize query: {e}").into()
+            })?
+            .into();
 
         let selected_indices = self.selector.select(self.concurrent);
         let selected: Vec<Arc<UpstreamWrapper>> = selected_indices
@@ -367,47 +375,66 @@ impl Executable for Forward {
             ctx.set_response(Some(resp));
         } else {
             let total = selected.len();
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, PluginResult<Vec<u8>>)>(total);
+            let mut tasks = tokio::task::JoinSet::new();
 
             for (sel_idx, u) in selected.iter().enumerate() {
-                let tx = tx.clone();
                 let qb = query_bytes.clone();
                 let u = u.clone();
-                tokio::spawn(async move {
-                    let result = u.exchange(&qb).await;
-                    let _ = tx.send((sel_idx, result)).await;
-                });
+                tasks.spawn(async move { (sel_idx, u.exchange(&qb).await) });
             }
-            drop(tx);
 
             let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
             let mut responses_received = 0;
 
-            while let Some((_sel_idx, result)) = rx.recv().await {
+            while let Some(join_result) = tasks.join_next().await {
                 responses_received += 1;
                 let is_last = responses_received >= total;
-                let upstream_name = selected[_sel_idx].name();
+
+                let (sel_idx, result) = match join_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!(plugin = %self.name, error = %e, "upstream task join failed");
+                        last_err = Some(format!("upstream task join failed: {e}").into());
+                        continue;
+                    }
+                };
+
+                let upstream_name = selected[sel_idx].name();
 
                 match result {
-                    Ok(resp_bytes) => match Message::from_vec(&resp_bytes) {
-                        Ok(resp) => {
-                            let rcode = resp.response_code();
-                            if is_last
-                                || rcode == ResponseCode::NoError
-                                || rcode == ResponseCode::NXDomain
-                            {
-                                selected[_sel_idx].record_adopted();
+                    Ok(resp_bytes) => {
+                        let rcode = match dns_header_rcode(&resp_bytes) {
+                            Some(rcode) => rcode,
+                            None => {
+                                warn!(plugin = %self.name, upstream = %upstream_name, "invalid upstream response (too short)");
+                                last_err = Some("invalid response: short dns header".into());
+                                continue;
+                            }
+                        };
+
+                        let noerror = u16::from(ResponseCode::NoError);
+                        let nxdomain = u16::from(ResponseCode::NXDomain);
+                        let adopt = is_last || rcode == noerror || rcode == nxdomain;
+
+                        if !adopt {
+                            debug!(plugin = %self.name, upstream = %upstream_name, rcode, "skipping upstream response with non-ideal rcode");
+                            last_err = Some(format!("upstream returned rcode {}", rcode).into());
+                            continue;
+                        }
+
+                        match Message::from_vec(&resp_bytes) {
+                            Ok(resp) => {
+                                selected[sel_idx].record_adopted();
                                 ctx.set_response(Some(resp));
+                                tasks.abort_all();
                                 return Ok(());
                             }
-                            debug!(plugin = %self.name, upstream = %upstream_name, rcode = ?rcode, "skipping upstream response with non-ideal rcode");
-                            last_err = Some(format!("upstream returned rcode {rcode:?}").into());
+                            Err(e) => {
+                                warn!(plugin = %self.name, upstream = %upstream_name, error = %e, "invalid upstream response");
+                                last_err = Some(format!("invalid response: {e}").into());
+                            }
                         }
-                        Err(e) => {
-                            warn!(plugin = %self.name, upstream = %upstream_name, error = %e, "invalid upstream response");
-                            last_err = Some(format!("invalid response: {e}").into());
-                        }
-                    },
+                    }
                     Err(e) => {
                         debug!(plugin = %self.name, upstream = %upstream_name, error = %e, "upstream exchange failed");
                         last_err = Some(e);
