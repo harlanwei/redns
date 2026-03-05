@@ -6,11 +6,12 @@
 
 use async_trait::async_trait;
 use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use redns_core::context::KV_SELECTED_UPSTREAM;
 use redns_core::plugin::PluginResult;
 use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -24,12 +25,50 @@ const WEIGHT_CACHE_TTL_SECS: u64 = 5;
 const NOISE_FACTOR: f64 = 0.125;
 const ERROR_PENALTY_MULT: f64 = 8.0;
 const DEFAULT_LATENCY: f64 = 10.0;
+const MAX_CNAME_FOLLOW: usize = 16;
 
 fn dns_header_rcode(resp_wire: &[u8]) -> Option<u16> {
     if resp_wire.len() < 4 {
         return None;
     }
     Some((resp_wire[3] & 0x0f) as u16)
+}
+
+fn find_cname_for_owner(resp: &Message, owner: &Name) -> Option<(Record, Name)> {
+    for rr in resp.answers() {
+        if rr.record_type() != RecordType::CNAME || rr.name() != owner {
+            continue;
+        }
+        if let RData::CNAME(cname) = rr.data() {
+            return Some((rr.clone(), cname.0.clone()));
+        }
+    }
+    None
+}
+
+fn has_answer_for_name_type(resp: &Message, name: &Name, qtype: RecordType) -> bool {
+    if qtype == RecordType::CNAME {
+        return true;
+    }
+    if qtype == RecordType::ANY {
+        return !resp.answers().is_empty();
+    }
+    resp.answers()
+        .iter()
+        .any(|rr| rr.name() == name && rr.record_type() == qtype)
+}
+
+fn merge_cname_chain(mut resp: Message, original_name: &Name, cname_prefix: &[Record]) -> Message {
+    if let Some(q) = resp.queries_mut().first_mut() {
+        q.set_name(original_name.clone());
+    }
+    if !cname_prefix.is_empty() {
+        let mut merged_answers = Vec::with_capacity(cname_prefix.len() + resp.answers().len());
+        merged_answers.extend(cname_prefix.iter().cloned());
+        merged_answers.extend(resp.answers().iter().cloned());
+        *resp.answers_mut() = merged_answers;
+    }
+    resp
 }
 
 // ── Configuration ───────────────────────────────────────────────
@@ -334,23 +373,8 @@ impl Forward {
     pub fn upstreams(&self) -> &[Arc<UpstreamWrapper>] {
         &self.upstreams
     }
-}
 
-#[async_trait]
-impl Executable for Forward {
-    async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-        if ctx.response().is_some() {
-            return Ok(());
-        }
-
-        let query_bytes: Arc<[u8]> = ctx
-            .query()
-            .to_vec()
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("failed to serialize query: {e}").into()
-            })?
-            .into();
-
+    async fn resolve_once(&self, query_bytes: Arc<[u8]>) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let selected_indices = self.selector.select(self.concurrent);
         let selected: Vec<Arc<UpstreamWrapper>> = selected_indices
             .iter()
@@ -373,83 +397,196 @@ impl Executable for Forward {
                 },
             )?;
             selected[0].record_adopted();
-            ctx.store_value(KV_SELECTED_UPSTREAM, selected[0].clone());
-            ctx.set_response(Some(resp));
-        } else {
-            let total = selected.len();
-            let mut tasks = tokio::task::JoinSet::new();
+            return Ok((resp, selected[0].clone()));
+        }
 
-            for (sel_idx, u) in selected.iter().enumerate() {
-                let qb = query_bytes.clone();
-                let u = u.clone();
-                tasks.spawn(async move { (sel_idx, u.exchange(&qb).await) });
-            }
+        let total = selected.len();
+        let mut tasks = tokio::task::JoinSet::new();
 
-            let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-            let mut responses_received = 0;
+        for (sel_idx, u) in selected.iter().enumerate() {
+            let qb = query_bytes.clone();
+            let u = u.clone();
+            tasks.spawn(async move { (sel_idx, u.exchange(&qb).await) });
+        }
 
-            while let Some(join_result) = tasks.join_next().await {
-                responses_received += 1;
-                let is_last = responses_received >= total;
+        let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        let mut responses_received = 0;
 
-                let (sel_idx, result) = match join_result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!(plugin = %self.name, error = %e, "upstream task join failed");
-                        last_err = Some(format!("upstream task join failed: {e}").into());
-                        continue;
-                    }
-                };
+        while let Some(join_result) = tasks.join_next().await {
+            responses_received += 1;
+            let is_last = responses_received >= total;
 
-                let upstream_name = selected[sel_idx].name();
+            let (sel_idx, result) = match join_result {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(plugin = %self.name, error = %e, "upstream task join failed");
+                    last_err = Some(format!("upstream task join failed: {e}").into());
+                    continue;
+                }
+            };
 
-                match result {
-                    Ok(resp_bytes) => {
-                        let rcode = match dns_header_rcode(&resp_bytes) {
-                            Some(rcode) => rcode,
-                            None => {
-                                warn!(plugin = %self.name, upstream = %upstream_name, "invalid upstream response (too short)");
-                                last_err = Some("invalid response: short dns header".into());
-                                continue;
-                            }
-                        };
+            let upstream_name = selected[sel_idx].name();
 
-                        let noerror = u16::from(ResponseCode::NoError);
-                        let nxdomain = u16::from(ResponseCode::NXDomain);
-                        let adopt = is_last || rcode == noerror || rcode == nxdomain;
-
-                        if !adopt {
-                            selected[sel_idx].record_rejected_rcode();
-                            debug!(plugin = %self.name, upstream = %upstream_name, rcode, "skipping upstream response with non-ideal rcode");
-                            last_err = Some(format!("upstream returned rcode {}", rcode).into());
+            match result {
+                Ok(resp_bytes) => {
+                    let rcode = match dns_header_rcode(&resp_bytes) {
+                        Some(rcode) => rcode,
+                        None => {
+                            warn!(plugin = %self.name, upstream = %upstream_name, "invalid upstream response (too short)");
+                            last_err = Some("invalid response: short dns header".into());
                             continue;
                         }
+                    };
 
-                        match Message::from_vec(&resp_bytes) {
-                            Ok(resp) => {
-                                selected[sel_idx].record_adopted();
-                                ctx.store_value(KV_SELECTED_UPSTREAM, selected[sel_idx].clone());
-                                ctx.set_response(Some(resp));
-                                tasks.abort_all();
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                warn!(plugin = %self.name, upstream = %upstream_name, error = %e, "invalid upstream response");
-                                last_err = Some(format!("invalid response: {e}").into());
-                            }
+                    let noerror = u16::from(ResponseCode::NoError);
+                    let nxdomain = u16::from(ResponseCode::NXDomain);
+                    let adopt = is_last || rcode == noerror || rcode == nxdomain;
+
+                    if !adopt {
+                        selected[sel_idx].record_rejected_rcode();
+                        debug!(plugin = %self.name, upstream = %upstream_name, rcode, "skipping upstream response with non-ideal rcode");
+                        last_err = Some(format!("upstream returned rcode {}", rcode).into());
+                        continue;
+                    }
+
+                    match Message::from_vec(&resp_bytes) {
+                        Ok(resp) => {
+                            selected[sel_idx].record_adopted();
+                            tasks.abort_all();
+                            return Ok((resp, selected[sel_idx].clone()));
+                        }
+                        Err(e) => {
+                            warn!(plugin = %self.name, upstream = %upstream_name, error = %e, "invalid upstream response");
+                            last_err = Some(format!("invalid response: {e}").into());
                         }
                     }
-                    Err(e) => {
-                        debug!(plugin = %self.name, upstream = %upstream_name, error = %e, "upstream exchange failed");
-                        last_err = Some(e);
-                    }
+                }
+                Err(e) => {
+                    debug!(plugin = %self.name, upstream = %upstream_name, error = %e, "upstream exchange failed");
+                    last_err = Some(e);
                 }
             }
-
-            if let Some(e) = last_err {
-                return Err(e);
-            }
         }
+
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        Err("forward: no upstream response".into())
+    }
+
+    async fn resolve_with_cname_chase(&self, query: &Message) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
+        let question = query
+            .queries()
+            .first()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "forward: query has no question".into()
+            })?;
+        let original_name = question.name().clone();
+        let qtype = question.query_type();
+
+        if qtype == RecordType::CNAME {
+            let query_bytes: Arc<[u8]> = query
+                .to_vec()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("failed to serialize query: {e}").into()
+                })?
+                .into();
+            return self.resolve_once(query_bytes).await;
+        }
+
+        let mut chase_query = query.clone();
+        let mut visited_names: HashSet<Name> = HashSet::new();
+        visited_names.insert(original_name.clone());
+        let mut carried_cnames: Vec<Record> = Vec::new();
+
+        for depth in 0..=MAX_CNAME_FOLLOW {
+            let current_name = chase_query
+                .queries()
+                .first()
+                .map(|q| q.name().clone())
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "forward: query has no question".into()
+                })?;
+
+            let query_bytes: Arc<[u8]> = chase_query
+                .to_vec()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("failed to serialize query: {e}").into()
+                })?
+                .into();
+
+            let (resp, upstream) = self.resolve_once(query_bytes).await?;
+
+            let mut in_resp_seen: HashSet<Name> = HashSet::new();
+            let mut step_cnames: Vec<Record> = Vec::new();
+            let mut final_target = current_name.clone();
+            in_resp_seen.insert(final_target.clone());
+
+            while let Some((cname_rr, cname_target)) = find_cname_for_owner(&resp, &final_target) {
+                if !in_resp_seen.insert(cname_target.clone()) {
+                    return Err(format!(
+                        "forward: cname loop detected in upstream response at '{}'",
+                        cname_target.to_ascii()
+                    )
+                    .into());
+                }
+                step_cnames.push(cname_rr);
+                final_target = cname_target;
+            }
+
+            if resp.response_code() != ResponseCode::NoError || step_cnames.is_empty() {
+                if carried_cnames.is_empty() {
+                    return Ok((resp, upstream));
+                }
+                return Ok((merge_cname_chain(resp, &original_name, &carried_cnames), upstream));
+            }
+
+            let carried_before = carried_cnames.len();
+            carried_cnames.extend(step_cnames);
+
+            if has_answer_for_name_type(&resp, &final_target, qtype) {
+                if carried_before == 0 {
+                    return Ok((resp, upstream));
+                }
+                return Ok((
+                    merge_cname_chain(resp, &original_name, &carried_cnames[..carried_before]),
+                    upstream,
+                ));
+            }
+
+            if depth >= MAX_CNAME_FOLLOW {
+                return Err(format!("forward: cname chase depth exceeded {}", MAX_CNAME_FOLLOW).into());
+            }
+
+            if !visited_names.insert(final_target.clone()) {
+                return Err(
+                    format!("forward: cname loop detected while chasing '{}'", final_target.to_ascii())
+                        .into(),
+                );
+            }
+
+            let q = chase_query.queries_mut().first_mut().ok_or_else(
+                || -> Box<dyn std::error::Error + Send + Sync> {
+                    "forward: query has no question".into()
+                },
+            )?;
+            q.set_name(final_target);
+        }
+
+        Err(format!("forward: cname chase depth exceeded {}", MAX_CNAME_FOLLOW).into())
+    }
+}
+
+#[async_trait]
+impl Executable for Forward {
+    async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+        if ctx.response().is_some() {
+            return Ok(());
+        }
+
+        let (resp, selected_upstream) = self.resolve_with_cname_chase(ctx.query()).await?;
+        ctx.store_value(KV_SELECTED_UPSTREAM, selected_upstream);
+        ctx.set_response(Some(resp));
 
         Ok(())
     }
@@ -458,6 +595,69 @@ impl Executable for Forward {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::{MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use redns_core::upstream::{Upstream, UpstreamWrapper};
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FnUpstream {
+        calls: Arc<AtomicUsize>,
+        handler: Arc<dyn Fn(&Message) -> PluginResult<Message> + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Upstream for FnUpstream {
+        async fn exchange(&self, q: &[u8]) -> PluginResult<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let req = Message::from_vec(q).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to decode query in test upstream: {e}").into()
+            })?;
+            let resp = (self.handler)(&req)?;
+            resp.to_vec().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to encode response in test upstream: {e}").into()
+            })
+        }
+    }
+
+    fn make_forward_with_upstream(upstream: Box<dyn Upstream>) -> Forward {
+        let wrapped = Arc::new(UpstreamWrapper::new(upstream, "mock".into()));
+        let upstreams = vec![wrapped];
+        Forward {
+            name: "test-forward".into(),
+            selector: UpstreamSelector::new(upstreams.clone()),
+            upstreams,
+            concurrent: 1,
+            tag_index: HashMap::new(),
+        }
+    }
+
+    fn make_query(name: &str, qtype: RecordType) -> Message {
+        let mut msg = Message::new();
+        msg.set_id(7)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query);
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii(name).unwrap()).set_query_type(qtype);
+            q
+        });
+        msg
+    }
+
+    fn response_with_answers(req: &Message, rcode: ResponseCode, answers: Vec<Record>) -> Message {
+        let mut resp = Message::new();
+        resp.set_id(req.id())
+            .set_message_type(MessageType::Response)
+            .set_response_code(rcode);
+        for q in req.queries() {
+            resp.add_query(q.clone());
+        }
+        for answer in answers {
+            resp.add_answer(answer);
+        }
+        resp
+    }
 
     #[test]
     fn forward_config_empty_fails() {
@@ -573,5 +773,175 @@ mod tests {
             concurrent: 1,
         };
         assert!(Forward::new(cfg, "test").is_err());
+    }
+
+    #[tokio::test]
+    async fn cname_only_response_is_chased() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let upstream = FnUpstream {
+            calls: calls_for_upstream,
+            handler: Arc::new(|req: &Message| {
+                let q = req
+                    .queries()
+                    .first()
+                    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                        "missing question".into()
+                    })?;
+                let qname = q.name().to_ascii();
+                if qname == "alias.com." {
+                    return Ok(response_with_answers(
+                        req,
+                        ResponseCode::NoError,
+                        vec![Record::from_rdata(
+                            Name::from_ascii("alias.com.").unwrap(),
+                            60,
+                            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                                Name::from_ascii("real.com.").unwrap(),
+                            )),
+                        )],
+                    ));
+                }
+                if qname == "real.com." {
+                    return Ok(response_with_answers(
+                        req,
+                        ResponseCode::NoError,
+                        vec![Record::from_rdata(
+                            Name::from_ascii("real.com.").unwrap(),
+                            60,
+                            RData::A(Ipv4Addr::new(1, 2, 3, 4).into()),
+                        )],
+                    ));
+                }
+                Err(format!("unexpected qname in test: {qname}").into())
+            }),
+        };
+
+        let forward = make_forward_with_upstream(Box::new(upstream));
+        let mut ctx = Context::new(make_query("alias.com.", RecordType::A));
+        forward.exec(&mut ctx).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let resp = ctx.response().unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.queries()[0].name().to_ascii(), "alias.com.");
+        assert_eq!(resp.answers().len(), 2);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::CNAME);
+        assert_eq!(resp.answers()[1].record_type(), RecordType::A);
+        assert_eq!(resp.answers()[1].name().to_ascii(), "real.com.");
+    }
+
+    #[tokio::test]
+    async fn cname_query_type_does_not_chase() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let upstream = FnUpstream {
+            calls: calls_for_upstream,
+            handler: Arc::new(|req: &Message| {
+                Ok(response_with_answers(
+                    req,
+                    ResponseCode::NoError,
+                    vec![Record::from_rdata(
+                        Name::from_ascii("alias.com.").unwrap(),
+                        60,
+                        RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                            Name::from_ascii("real.com.").unwrap(),
+                        )),
+                    )],
+                ))
+            }),
+        };
+
+        let forward = make_forward_with_upstream(Box::new(upstream));
+        let mut ctx = Context::new(make_query("alias.com.", RecordType::CNAME));
+        forward.exec(&mut ctx).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let resp = ctx.response().unwrap();
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::CNAME);
+    }
+
+    #[tokio::test]
+    async fn response_with_cname_and_terminal_answer_does_not_extra_chase() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let upstream = FnUpstream {
+            calls: calls_for_upstream,
+            handler: Arc::new(|req: &Message| {
+                Ok(response_with_answers(
+                    req,
+                    ResponseCode::NoError,
+                    vec![
+                        Record::from_rdata(
+                            Name::from_ascii("alias.com.").unwrap(),
+                            60,
+                            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                                Name::from_ascii("real.com.").unwrap(),
+                            )),
+                        ),
+                        Record::from_rdata(
+                            Name::from_ascii("real.com.").unwrap(),
+                            60,
+                            RData::A(Ipv4Addr::new(1, 2, 3, 4).into()),
+                        ),
+                    ],
+                ))
+            }),
+        };
+
+        let forward = make_forward_with_upstream(Box::new(upstream));
+        let mut ctx = Context::new(make_query("alias.com.", RecordType::A));
+        forward.exec(&mut ctx).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let resp = ctx.response().unwrap();
+        assert_eq!(resp.answers().len(), 2);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::CNAME);
+        assert_eq!(resp.answers()[1].record_type(), RecordType::A);
+    }
+
+    #[tokio::test]
+    async fn cname_loop_returns_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let upstream = FnUpstream {
+            calls: calls_for_upstream,
+            handler: Arc::new(|req: &Message| {
+                let qname = req.queries()[0].name().to_ascii();
+                if qname == "alias.com." {
+                    return Ok(response_with_answers(
+                        req,
+                        ResponseCode::NoError,
+                        vec![Record::from_rdata(
+                            Name::from_ascii("alias.com.").unwrap(),
+                            60,
+                            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                                Name::from_ascii("loop.com.").unwrap(),
+                            )),
+                        )],
+                    ));
+                }
+                if qname == "loop.com." {
+                    return Ok(response_with_answers(
+                        req,
+                        ResponseCode::NoError,
+                        vec![Record::from_rdata(
+                            Name::from_ascii("loop.com.").unwrap(),
+                            60,
+                            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                                Name::from_ascii("alias.com.").unwrap(),
+                            )),
+                        )],
+                    ));
+                }
+                Err(format!("unexpected qname in test: {qname}").into())
+            }),
+        };
+
+        let forward = make_forward_with_upstream(Box::new(upstream));
+        let mut ctx = Context::new(make_query("alias.com.", RecordType::A));
+        let err = forward.exec(&mut ctx).await.expect_err("expected cname loop error");
+        assert!(err.to_string().contains("cname loop"));
     }
 }
