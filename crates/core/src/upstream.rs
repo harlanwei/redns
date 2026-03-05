@@ -7,6 +7,7 @@
 use crate::plugin::PluginResult;
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use tracing::warn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -926,8 +927,9 @@ impl UpstreamWrapper {
 
         match &result {
             Ok(_) => self.update_ema_latency(elapsed_ms),
-            Err(_) => {
+            Err(e) => {
                 self.error_count.fetch_add(1, Ordering::Relaxed);
+                warn!(upstream = %self.name, error = %e, "upstream exchange failed");
             }
         }
         result

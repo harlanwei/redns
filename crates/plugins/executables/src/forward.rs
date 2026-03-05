@@ -249,6 +249,7 @@ impl UpstreamSelector {
 /// Forward executable — queries upstream DNS servers with latency-aware
 /// selection, tag-based routing, and rcode-aware retry.
 pub struct Forward {
+    name: String,
     upstreams: Vec<Arc<UpstreamWrapper>>,
     selector: UpstreamSelector,
     concurrent: usize,
@@ -257,7 +258,7 @@ pub struct Forward {
 }
 
 impl Forward {
-    pub fn new(cfg: ForwardConfig) -> PluginResult<Self> {
+    pub fn new(cfg: ForwardConfig, name: &str) -> PluginResult<Self> {
         if cfg.upstreams.is_empty() {
             return Err("forward: no upstreams configured".into());
         }
@@ -266,7 +267,7 @@ impl Forward {
         let mut tag_index: HashMap<String, Vec<usize>> = HashMap::new();
 
         for (i, ucfg) in cfg.upstreams.iter().enumerate() {
-            let name = ucfg.tag.clone().unwrap_or_else(|| ucfg.addr.clone());
+            let upstream_name = ucfg.tag.clone().unwrap_or_else(|| ucfg.addr.clone());
             let mut opts = UpstreamOpts::default();
             if let Some(ref da) = ucfg.dial_addr {
                 opts.dial_addr = Some(parse_dial_addr(da, &ucfg.addr)?);
@@ -274,7 +275,7 @@ impl Forward {
             opts.bootstrap = ucfg.bootstrap.clone();
             let uw = Arc::new(UpstreamWrapper::new(
                 upstream::new_upstream(&ucfg.addr, opts)?,
-                name,
+                upstream_name,
             ));
             upstreams.push(uw);
 
@@ -291,6 +292,7 @@ impl Forward {
         let selector = UpstreamSelector::new(upstreams.clone());
 
         Ok(Self {
+            name: name.to_string(),
             upstreams,
             selector,
             concurrent,
@@ -384,6 +386,7 @@ impl Executable for Forward {
             while let Some((_sel_idx, result)) = rx.recv().await {
                 responses_received += 1;
                 let is_last = responses_received >= total;
+                let upstream_name = selected[_sel_idx].name();
 
                 match result {
                     Ok(resp_bytes) => match Message::from_vec(&resp_bytes) {
@@ -397,16 +400,16 @@ impl Executable for Forward {
                                 ctx.set_response(Some(resp));
                                 return Ok(());
                             }
-                            debug!(rcode = ?rcode, "skipping upstream response with non-ideal rcode");
+                            debug!(plugin = %self.name, upstream = %upstream_name, rcode = ?rcode, "skipping upstream response with non-ideal rcode");
                             last_err = Some(format!("upstream returned rcode {rcode:?}").into());
                         }
                         Err(e) => {
-                            warn!(error = %e, "invalid upstream response");
+                            warn!(plugin = %self.name, upstream = %upstream_name, error = %e, "invalid upstream response");
                             last_err = Some(format!("invalid response: {e}").into());
                         }
                     },
                     Err(e) => {
-                        debug!(error = %e, "upstream exchange failed");
+                        debug!(plugin = %self.name, upstream = %upstream_name, error = %e, "upstream exchange failed");
                         last_err = Some(e);
                     }
                 }
@@ -428,7 +431,7 @@ mod tests {
     #[test]
     fn forward_config_empty_fails() {
         let cfg = ForwardConfig::default();
-        assert!(Forward::new(cfg).is_err());
+        assert!(Forward::new(cfg, "test").is_err());
     }
 
     #[test]
@@ -442,7 +445,7 @@ mod tests {
             }],
             concurrent: 1,
         };
-        assert!(Forward::new(cfg).is_ok());
+        assert!(Forward::new(cfg, "test").is_ok());
     }
 
     #[test]
@@ -470,7 +473,7 @@ mod tests {
             ],
             concurrent: 1,
         };
-        let f = Forward::new(cfg).unwrap();
+        let f = Forward::new(cfg, "test").unwrap();
         assert_eq!(f.tag_index.get("google"), Some(&vec![0]));
         assert_eq!(f.tag_index.get("cloudflare"), Some(&vec![1]));
         assert_eq!(f.tag_index.get("quad9"), Some(&vec![2]));
@@ -495,7 +498,7 @@ mod tests {
             ],
             concurrent: 1,
         };
-        let f = Forward::new(cfg).unwrap();
+        let f = Forward::new(cfg, "test").unwrap();
         let selected = f.select_by_tags(&["google".into()]);
         assert_eq!(selected, vec![0]);
     }
@@ -538,6 +541,6 @@ mod tests {
             }],
             concurrent: 1,
         };
-        assert!(Forward::new(cfg).is_err());
+        assert!(Forward::new(cfg, "test").is_err());
     }
 }

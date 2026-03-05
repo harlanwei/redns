@@ -354,7 +354,7 @@ async fn run_server(
                 } else {
                     ForwardConfig::from_str_args(args)
                 };
-                let fwd = Forward::new(cfg)?;
+                let fwd = Forward::new(cfg, "forward")?;
                 if let Ok(mut guard) = collector.lock() {
                     guard.extend(fwd.upstreams().iter().cloned());
                 }
