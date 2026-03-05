@@ -898,7 +898,7 @@ impl Doh3Upstream {
         )?;
 
         let driver = tokio::spawn(async move {
-            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
         Ok(Arc::new(Doh3Session {

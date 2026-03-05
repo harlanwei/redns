@@ -1194,7 +1194,6 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "futures-util",
  "h3",
  "h3-quinn",
  "hickory-proto",
