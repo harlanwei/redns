@@ -18,7 +18,9 @@
 //! DNS server handler trait and entry handler.
 
 use crate::context::Context;
+use crate::context::KV_SELECTED_UPSTREAM;
 use crate::plugin::{Executable, PluginResult};
+use crate::upstream::UpstreamWrapper;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use std::net::IpAddr;
@@ -87,6 +89,12 @@ impl DnsHandler for EntryHandler {
         let mut ctx = Context::new(query.clone());
         let result = self.entry.exec(&mut ctx).await;
         let elapsed = start.elapsed();
+        let selected_upstream = if result.is_ok() && ctx.response().is_some() {
+            ctx.get_value::<Arc<UpstreamWrapper>>(KV_SELECTED_UPSTREAM)
+                .cloned()
+        } else {
+            None
+        };
 
         let mut resp = match result {
             Ok(()) => ctx
@@ -98,6 +106,10 @@ impl DnsHandler for EntryHandler {
                 servfail_response(&query)
             }
         };
+
+        if let Some(upstream) = selected_upstream {
+            upstream.record_final_selected();
+        }
 
         debug!(
             qname = %qname,

@@ -24,6 +24,9 @@ use std::time::Instant;
 /// Default EDNS0 UDP payload size.
 const EDNS0_SIZE: u16 = 1200;
 
+/// Context KV key for the upstream selected by a forward stage.
+pub const KV_SELECTED_UPSTREAM: u32 = 0x5244_4e53;
+
 /// Global monotonically increasing context ID.
 static CONTEXT_UID: AtomicU32 = AtomicU32::new(0);
 

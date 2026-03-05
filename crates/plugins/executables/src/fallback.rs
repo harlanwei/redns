@@ -12,8 +12,10 @@
 //!   the primary but only its result is used if the primary fails/times out.
 //! - Uses the first valid (non-None) response.
 
-use redns_core::context::Context;
+use hickory_proto::op::Message;
+use redns_core::context::{Context, KV_SELECTED_UPSTREAM};
 use redns_core::plugin::{Executable, PluginResult};
+use redns_core::upstream::UpstreamWrapper;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -68,6 +70,31 @@ impl Fallback {
     }
 }
 
+struct BranchOutcome {
+    response: Option<Message>,
+    selected_upstream: Option<Arc<UpstreamWrapper>>,
+}
+
+fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
+    BranchOutcome {
+        response: ctx.response().cloned(),
+        selected_upstream: ctx
+            .get_value::<Arc<UpstreamWrapper>>(KV_SELECTED_UPSTREAM)
+            .cloned(),
+    }
+}
+
+fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
+    if let Some(resp) = outcome.response {
+        ctx.set_response(Some(resp));
+        if let Some(upstream) = outcome.selected_upstream {
+            ctx.store_value(KV_SELECTED_UPSTREAM, upstream);
+        }
+        return true;
+    }
+    false
+}
+
 #[async_trait::async_trait]
 impl Executable for Fallback {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
@@ -86,10 +113,13 @@ impl Executable for Fallback {
         // Spawn primary task.
         let primary_handle = tokio::spawn(async move {
             match primary.exec(&mut ctx_primary).await {
-                Ok(()) => ctx_primary.response().cloned(),
+                Ok(()) => branch_outcome_from_ctx(&ctx_primary),
                 Err(e) => {
                     warn!(error = %e, "fallback: primary failed");
-                    None
+                    BranchOutcome {
+                        response: None,
+                        selected_upstream: None,
+                    }
                 }
             }
         });
@@ -98,10 +128,13 @@ impl Executable for Fallback {
             // Start secondary immediately in parallel.
             let mut secondary_handle = tokio::spawn(async move {
                 match secondary.exec(&mut ctx_secondary).await {
-                    Ok(()) => ctx_secondary.response().cloned(),
+                    Ok(()) => branch_outcome_from_ctx(&ctx_secondary),
                     Err(e) => {
                         warn!(error = %e, "fallback: secondary failed");
-                        None
+                        BranchOutcome {
+                            response: None,
+                            selected_upstream: None,
+                        }
                     }
                 }
             });
@@ -109,18 +142,36 @@ impl Executable for Fallback {
             // Wait for primary with threshold timeout.
             let mut primary_handle = primary_handle;
             match tokio::time::timeout(threshold, &mut primary_handle).await {
-                Ok(Ok(Some(resp))) => {
+                Ok(Ok(outcome)) => {
                     // Primary responded within threshold — use it.
-                    debug!(elapsed = ?start.elapsed(), "fallback: primary responded within threshold");
-                    ctx.set_response(Some(resp));
-                    return Ok(());
-                }
-                Ok(Ok(None)) | Ok(Err(_)) => {
+                    if apply_outcome(ctx, outcome) {
+                        debug!(elapsed = ?start.elapsed(), "fallback: primary responded within threshold");
+                        return Ok(());
+                    }
                     // Primary finished but no response or panicked — use secondary.
                     debug!(elapsed = ?start.elapsed(), "fallback: primary done but no response, waiting for secondary");
-                    if let Ok(Some(resp)) = secondary_handle.await {
-                        ctx.set_response(Some(resp));
-                        return Ok(());
+                    match secondary_handle.await {
+                        Ok(outcome) => {
+                            if apply_outcome(ctx, outcome) {
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "fallback: secondary join failed");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "fallback: primary join failed");
+                    match secondary_handle.await {
+                        Ok(outcome) => {
+                            if apply_outcome(ctx, outcome) {
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "fallback: secondary join failed");
+                        }
                     }
                 }
                 Err(_) => {
@@ -128,27 +179,51 @@ impl Executable for Fallback {
                     debug!(elapsed = ?start.elapsed(), "fallback: primary exceeded threshold, racing both");
                     tokio::select! {
                         result = &mut primary_handle => {
-                            if let Ok(Some(resp)) = result {
-                                debug!(elapsed = ?start.elapsed(), "fallback: primary won race");
-                                ctx.set_response(Some(resp));
-                                return Ok(());
+                            match result {
+                                Ok(outcome) => {
+                                    if apply_outcome(ctx, outcome) {
+                                        debug!(elapsed = ?start.elapsed(), "fallback: primary won race");
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "fallback: primary join failed");
+                                }
                             }
-                            // Primary lost — wait for secondary.
-                            if let Ok(Some(resp)) = secondary_handle.await {
-                                ctx.set_response(Some(resp));
-                                return Ok(());
+
+                            match secondary_handle.await {
+                                Ok(outcome) => {
+                                    if apply_outcome(ctx, outcome) {
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "fallback: secondary join failed");
+                                }
                             }
                         }
                         result = &mut secondary_handle => {
-                            if let Ok(Some(resp)) = result {
-                                debug!(elapsed = ?start.elapsed(), "fallback: secondary won race");
-                                ctx.set_response(Some(resp));
-                                return Ok(());
+                            match result {
+                                Ok(outcome) => {
+                                    if apply_outcome(ctx, outcome) {
+                                        debug!(elapsed = ?start.elapsed(), "fallback: secondary won race");
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "fallback: secondary join failed");
+                                }
                             }
-                            // Secondary lost — wait for primary.
-                            if let Ok(Some(resp)) = primary_handle.await {
-                                ctx.set_response(Some(resp));
-                                return Ok(());
+
+                            match primary_handle.await {
+                                Ok(outcome) => {
+                                    if apply_outcome(ctx, outcome) {
+                                        return Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "fallback: primary join failed");
+                                }
                             }
                         }
                     }
@@ -158,25 +233,28 @@ impl Executable for Fallback {
             // Wait for primary with threshold timeout.
             let primary_result = tokio::time::timeout(threshold, primary_handle).await;
             match primary_result {
-                Ok(Ok(Some(resp))) => {
-                    debug!(elapsed = ?start.elapsed(), "fallback: primary responded within threshold");
-                    ctx.set_response(Some(resp));
-                    return Ok(());
-                }
-                _ => {
-                    // Primary failed or timed out — run secondary.
-                    debug!(elapsed = ?start.elapsed(), "fallback: primary timed out or failed, trying secondary");
-                    match secondary.exec(&mut ctx_secondary).await {
-                        Ok(()) => {
-                            if let Some(resp) = ctx_secondary.response().cloned() {
-                                ctx.set_response(Some(resp));
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "fallback: secondary failed");
-                        }
+                Ok(Ok(outcome)) => {
+                    if apply_outcome(ctx, outcome) {
+                        debug!(elapsed = ?start.elapsed(), "fallback: primary responded within threshold");
+                        return Ok(());
                     }
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "fallback: primary join failed");
+                }
+                Err(_) => {}
+            }
+
+            // Primary failed or timed out — run secondary.
+            debug!(elapsed = ?start.elapsed(), "fallback: primary timed out or failed, trying secondary");
+            match secondary.exec(&mut ctx_secondary).await {
+                Ok(()) => {
+                    if apply_outcome(ctx, branch_outcome_from_ctx(&ctx_secondary)) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "fallback: secondary failed");
                 }
             }
         }

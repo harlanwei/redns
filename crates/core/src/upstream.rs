@@ -1058,7 +1058,12 @@ impl Upstream for Doh3Upstream {
 pub struct UpstreamMetrics {
     pub name: String,
     pub query_total: u64,
+    pub completed_total: u64,
+    pub inflight_total: u64,
+    pub canceled_total: u64,
     pub adopted_total: u64,
+    pub final_selected_total: u64,
+    pub rejected_rcode_total: u64,
     pub error_total: u64,
     pub avg_latency_ms: f64,
 }
@@ -1069,8 +1074,12 @@ pub struct UpstreamWrapper {
     name: String,
     ema_latency_ms: AtomicI64,
     query_count: AtomicU64,
+    inflight_count: AtomicU64,
+    completed_count: AtomicU64,
     error_count: AtomicU64,
     adopted_count: AtomicU64,
+    final_selected_count: AtomicU64,
+    rejected_rcode_count: AtomicU64,
     latency_sum_us: AtomicU64,
 }
 
@@ -1084,8 +1093,12 @@ impl UpstreamWrapper {
             name,
             ema_latency_ms: AtomicI64::new(0),
             query_count: AtomicU64::new(0),
+            inflight_count: AtomicU64::new(0),
+            completed_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
             adopted_count: AtomicU64::new(0),
+            final_selected_count: AtomicU64::new(0),
+            rejected_rcode_count: AtomicU64::new(0),
             latency_sum_us: AtomicU64::new(0),
         }
     }
@@ -1099,12 +1112,18 @@ impl UpstreamWrapper {
     pub fn query_count(&self) -> u64 {
         self.query_count.load(Ordering::Relaxed)
     }
+    pub fn completed_count(&self) -> u64 {
+        self.completed_count.load(Ordering::Relaxed)
+    }
+    pub fn inflight_count(&self) -> u64 {
+        self.inflight_count.load(Ordering::Relaxed)
+    }
     pub fn error_count(&self) -> u64 {
         self.error_count.load(Ordering::Relaxed)
     }
 
     pub fn error_rate(&self) -> f64 {
-        let q = self.query_count();
+        let q = self.completed_count();
         if q == 0 {
             return 0.0;
         }
@@ -1116,17 +1135,35 @@ impl UpstreamWrapper {
         self.adopted_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that this upstream ended up being returned to the client.
+    pub fn record_final_selected(&self) {
+        self.final_selected_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that this upstream responded but was skipped due to RCODE policy.
+    pub fn record_rejected_rcode(&self) {
+        self.rejected_rcode_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns a point-in-time snapshot of this upstream's metrics.
     pub fn snapshot(&self) -> UpstreamMetrics {
         let query_total = self.query_count.load(Ordering::Relaxed);
+        let completed_total = self.completed_count.load(Ordering::Relaxed);
+        let inflight_total = self.inflight_count.load(Ordering::Relaxed);
         let latency_sum = self.latency_sum_us.load(Ordering::Relaxed);
         UpstreamMetrics {
             name: self.name.clone(),
             query_total,
+            completed_total,
+            inflight_total,
+            canceled_total: query_total
+                .saturating_sub(completed_total.saturating_add(inflight_total)),
             adopted_total: self.adopted_count.load(Ordering::Relaxed),
+            final_selected_total: self.final_selected_count.load(Ordering::Relaxed),
+            rejected_rcode_total: self.rejected_rcode_count.load(Ordering::Relaxed),
             error_total: self.error_count.load(Ordering::Relaxed),
-            avg_latency_ms: if query_total > 0 {
-                (latency_sum as f64 / query_total as f64) / 1000.0
+            avg_latency_ms: if completed_total > 0 {
+                (latency_sum as f64 / completed_total as f64) / 1000.0
             } else {
                 0.0
             },
@@ -1135,10 +1172,20 @@ impl UpstreamWrapper {
 
     pub async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
         self.query_count.fetch_add(1, Ordering::Relaxed);
+        self.inflight_count.fetch_add(1, Ordering::Relaxed);
+        struct InflightGuard<'a>(&'a AtomicU64);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _inflight_guard = InflightGuard(&self.inflight_count);
+
         let start = std::time::Instant::now();
         let result = self.inner.exchange(query).await;
         let elapsed = start.elapsed();
         let elapsed_ms = elapsed.as_millis() as i64;
+        self.completed_count.fetch_add(1, Ordering::Relaxed);
         self.latency_sum_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 

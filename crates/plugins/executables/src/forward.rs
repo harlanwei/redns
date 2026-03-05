@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use hickory_proto::op::{Message, ResponseCode};
+use redns_core::context::KV_SELECTED_UPSTREAM;
 use redns_core::plugin::PluginResult;
 use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
@@ -372,6 +373,7 @@ impl Executable for Forward {
                 },
             )?;
             selected[0].record_adopted();
+            ctx.store_value(KV_SELECTED_UPSTREAM, selected[0].clone());
             ctx.set_response(Some(resp));
         } else {
             let total = selected.len();
@@ -417,6 +419,7 @@ impl Executable for Forward {
                         let adopt = is_last || rcode == noerror || rcode == nxdomain;
 
                         if !adopt {
+                            selected[sel_idx].record_rejected_rcode();
                             debug!(plugin = %self.name, upstream = %upstream_name, rcode, "skipping upstream response with non-ideal rcode");
                             last_err = Some(format!("upstream returned rcode {}", rcode).into());
                             continue;
@@ -425,6 +428,7 @@ impl Executable for Forward {
                         match Message::from_vec(&resp_bytes) {
                             Ok(resp) => {
                                 selected[sel_idx].record_adopted();
+                                ctx.store_value(KV_SELECTED_UPSTREAM, selected[sel_idx].clone());
                                 ctx.set_response(Some(resp));
                                 tasks.abort_all();
                                 return Ok(());
