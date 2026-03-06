@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use hickory_proto::op::Message;
 use lru::LruCache;
+use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
@@ -133,6 +134,7 @@ impl RecursiveExecutable for Cache {
                         resp.set_id(ctx.query().id());
                         adjust_ttl(&mut resp, remaining);
                         ctx.set_response(Some(resp));
+                        ctx.set_mark(MARK_CACHE_HIT);
                         debug!(key = %key, ttl = remaining, "cache hit");
                         return Ok(());
                     }
@@ -142,6 +144,7 @@ impl RecursiveExecutable for Cache {
                         resp.set_id(ctx.query().id());
                         adjust_ttl(&mut resp, 5); // Short TTL for stale.
                         ctx.set_response(Some(resp));
+                        ctx.set_mark(MARK_CACHE_HIT);
                         debug!(key = %key, "cache lazy hit (stale)");
                         return Ok(());
                     }

@@ -410,12 +410,6 @@ impl DnsHandler for DashboardDnsHandler {
             .map(|items| dedupe_keep_order(items.clone()))
             .unwrap_or_default();
 
-        let upstreams = if upstreams.is_empty() && result.is_ok() {
-            vec!["<cached>".to_string()]
-        } else {
-            upstreams
-        };
-
         let entry = NewDnsLogEntry {
             ts_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

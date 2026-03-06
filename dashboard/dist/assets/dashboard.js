@@ -33,10 +33,31 @@ function upstreamDisplay(upstreams, rcode) {
   if (Array.isArray(upstreams) && upstreams.length) {
     return upstreams.join(", ");
   }
-  if (String(rcode || "").toLowerCase() === "noerror") {
-    return "<cached>";
-  }
   return "-";
+}
+
+function isRefusedRcode(rcode) {
+  return String(rcode || "").toLowerCase() === "refused";
+}
+
+function parseLogAnswerRow(rowText) {
+  const text = String(rowText || "").trim();
+  if (!text) {
+    return { type: "-", content: "-" };
+  }
+
+  const match = text.match(/^\S+\s+([A-Z][A-Za-z0-9_]*(?:\([0-9]+\))?)\s+(.+)$/);
+  if (match) {
+    return {
+      type: match[1],
+      content: match[2],
+    };
+  }
+
+  return {
+    type: "-",
+    content: text,
+  };
 }
 
 function badgeForRcode(rcode) {
@@ -283,7 +304,7 @@ class RednsDashboard extends HTMLElement {
     const modal = this.renderLogModal();
 
     this.innerHTML = `
-      <main class="relative isolate w-full px-3 pb-3 pt-4">
+      <main class="relative isolate mx-auto w-full max-w-[1600px] px-6 pb-4 pt-8 sm:px-8 lg:px-12">
         <div class="pointer-events-none absolute inset-x-0 top-0 -z-10 h-52 bg-[radial-gradient(circle_at_top_left,rgba(78,179,197,0.28),transparent_32%),radial-gradient(circle_at_top_right,rgba(241,165,96,0.24),transparent_24%)]"></div>
         ${header}
         ${summary}
@@ -513,7 +534,7 @@ class RednsDashboard extends HTMLElement {
       <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h2 class="text-xl font-semibold text-ink-900">DNS Logs</h2>
-          <p class="mt-1 text-sm text-ink-500">Rows are fully fitted inside the table. Click any row to view formatted answer records in a modal.</p>
+          <p class="mt-1 text-sm text-ink-500">Rows are fully fitted inside the table. Click non-REFUSED rows to view formatted answer records in a modal.</p>
         </div>
         <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
           <input class="control min-w-[18rem]" data-log-filter type="search" value="${esc(logs.filter)}" placeholder="Search qname, client, rcode, upstream" />
@@ -541,16 +562,19 @@ class RednsDashboard extends HTMLElement {
     const rows = logs.items
       .map((row) => {
         const upstreams = upstreamDisplay(row.upstreams, row.rcode);
+        const refused = isRefusedRcode(row.rcode);
+        const rowClass = refused ? "log-row-disabled" : "log-row";
+        const rowAttr = refused ? "" : ` data-log-id="${row.id}"`;
         return `
-          <tr class="log-row" data-log-id="${row.id}">
-            <td class="w-[16%] truncate-cell">${esc(fmtTime(row.ts_unix_ms))}</td>
-            <td class="w-[11%] truncate-cell font-mono text-xs sm:text-sm">${esc(row.client_ip || "-")}</td>
-            <td class="w-[8%] truncate-cell">${esc(row.protocol || "-")}</td>
-            <td class="w-[21%] truncate-cell font-mono text-xs sm:text-sm">${esc(row.qname || "-")}</td>
-            <td class="w-[8%] truncate-cell">${esc(row.qtype || "-")}</td>
-            <td class="w-[9%]"><span class="${badgeForRcode(row.rcode)}">${esc(row.rcode || "-")}</span></td>
-            <td class="w-[19%] truncate-cell font-mono text-xs sm:text-sm">${esc(upstreams)}</td>
-            <td class="w-[8%]">${fmtNum(row.latency_ms)}</td>
+          <tr class="${rowClass}"${rowAttr}>
+            <td class="log-col-time truncate-cell">${esc(fmtTime(row.ts_unix_ms))}</td>
+            <td class="log-col-client truncate-cell font-mono text-xs sm:text-sm">${esc(row.client_ip || "-")}</td>
+            <td class="log-col-protocol truncate-cell">${esc(row.protocol || "-")}</td>
+            <td class="log-col-qname truncate-cell font-mono text-xs sm:text-sm">${esc(row.qname || "-")}</td>
+            <td class="log-col-qtype truncate-cell">${esc(row.qtype || "-")}</td>
+            <td class="log-col-rcode"><span class="${badgeForRcode(row.rcode)}">${esc(row.rcode || "-")}</span></td>
+            <td class="log-col-upstreams truncate-cell font-mono text-xs sm:text-sm">${esc(upstreams)}</td>
+            <td class="log-col-latency">${fmtNum(row.latency_ms)}</td>
           </tr>
         `;
       })
@@ -567,17 +591,17 @@ class RednsDashboard extends HTMLElement {
           <p>Page <span class="font-semibold text-ink-900">${fmtNum(logs.page)}</span> of <span class="font-semibold text-ink-900">${fmtNum(logs.totalPages)}</span></p>
         </div>
         <div class="table-shell">
-          <table class="table-base">
+          <table class="table-base logs-table">
             <thead>
               <tr>
-                <th>Time</th>
-                <th>Client IP</th>
-                <th>Protocol</th>
-                <th>QName</th>
-                <th>QType</th>
-                <th>RCode</th>
-                <th>Upstreams</th>
-                <th>Latency (ms)</th>
+                <th class="log-col-time">Time</th>
+                <th class="log-col-client">Client IP</th>
+                <th class="log-col-protocol">Protocol</th>
+                <th class="log-col-qname">QName</th>
+                <th class="log-col-qtype">QType</th>
+                <th class="log-col-rcode">RCode</th>
+                <th class="log-col-upstreams">Upstreams</th>
+                <th class="log-col-latency">Latency (ms)</th>
               </tr>
             </thead>
             <tbody>${rows}</tbody>
@@ -602,12 +626,15 @@ class RednsDashboard extends HTMLElement {
     const rendered = rows.length
       ? rows
           .map(
-            (row, idx) => `
+            (row) => {
+              const parsed = parseLogAnswerRow(row);
+              return `
             <tr>
-              <td class="w-[8%] text-slate-500">${idx + 1}</td>
-              <td class="truncate-cell font-mono text-xs sm:text-sm">${esc(row)}</td>
+              <td class="w-[18%] text-slate-500">${esc(parsed.type)}</td>
+              <td class="truncate-cell font-mono text-xs sm:text-sm">${esc(parsed.content)}</td>
             </tr>
-          `,
+          `;
+            },
           )
           .join("")
       : `
@@ -640,8 +667,8 @@ class RednsDashboard extends HTMLElement {
               <table class="table-base">
                 <thead>
                   <tr>
-                    <th>#</th>
-                    <th>Answer</th>
+                    <th>Type</th>
+                    <th>Content</th>
                   </tr>
                 </thead>
                 <tbody>${rendered}</tbody>

@@ -17,8 +17,7 @@
 
 //! DNS server handler trait and entry handler.
 
-use crate::context::Context;
-use crate::context::KV_SELECTED_UPSTREAM;
+use crate::context::{Context, KV_SELECTED_UPSTREAM, MARK_CACHE_HIT};
 use crate::plugin::{Executable, PluginResult};
 use crate::upstream::UpstreamWrapper;
 use async_trait::async_trait;
@@ -105,6 +104,7 @@ impl DnsHandler for EntryHandler {
         } else {
             None
         };
+        let served_from_cache = result.is_ok() && ctx.response().is_some() && ctx.has_mark(MARK_CACHE_HIT);
 
         let mut resp = match result {
             Ok(()) => ctx
@@ -127,6 +127,14 @@ impl DnsHandler for EntryHandler {
                 }
             }
             upstream.record_final_selected();
+        }
+
+        if served_from_cache
+            && let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
+            && let Ok(mut selected) = selected_upstreams.lock()
+            && !selected.iter().any(|name| name == "<cached>")
+        {
+            selected.push("<cached>".to_string());
         }
 
         debug!(

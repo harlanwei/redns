@@ -27,6 +27,9 @@ const EDNS0_SIZE: u16 = 1200;
 /// Context KV key for the upstream selected by a forward stage.
 pub const KV_SELECTED_UPSTREAM: u32 = 0x5244_4e53;
 
+/// Context mark indicating the response was served from cache.
+pub const MARK_CACHE_HIT: u32 = 0x4341_4348;
+
 /// Global monotonically increasing context ID.
 static CONTEXT_UID: AtomicU32 = AtomicU32::new(0);
 
