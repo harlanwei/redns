@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background:
+      radial-gradient(circle at top left, rgba(78, 179, 197, 0.24), transparent 28%),
+      radial-gradient(circle at top right, rgba(241, 165, 96, 0.24), transparent 24%),
+      linear-gradient(180deg, #f9fcff 0%, #f3f7fb 42%, #edf2f7 100%);
+    color: #203247;
+    font-family: "IBM Plex Sans", "Source Sans 3", "Noto Sans", sans-serif;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply rounded-2xl border border-slate-200 bg-white shadow-sm;
+  }
+
+  .stat-card {
+    @apply glass-panel p-5 transition-transform duration-150 hover:-translate-y-0.5;
+  }
+
+  .nav-pill {
+    @apply inline-flex items-center rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-ink-700 transition-all duration-200 hover:border-tide-500/50 hover:bg-sky-50;
+  }
+
+  .nav-pill-active {
+    @apply border-tide-500 bg-tide-500 text-white;
+  }
+
+  .control {
+    @apply rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm text-ink-700 outline-none ring-0 transition focus:border-tide-500/70;
+  }
+
+  .table-shell {
+    @apply overflow-hidden rounded-2xl border border-slate-200 bg-white;
+  }
+
+  .table-base {
+    @apply w-full table-fixed text-left text-sm;
+  }
+
+  .table-base thead {
+    @apply bg-slate-50 text-ink-500;
+  }
+
+  .table-base th {
+    @apply px-3 py-3 text-xs font-semibold uppercase tracking-[0.12em] text-slate-500;
+  }
+
+  .table-base td {
+    @apply px-3 py-3 align-top text-ink-700;
+  }
+
+  .table-base tbody tr {
+    @apply border-t border-slate-100 transition-colors hover:bg-sky-50;
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold tracking-wide;
+  }
+
+  .badge-success {
+    @apply badge bg-emerald-100 text-emerald-700;
+  }
+
+  .badge-warn {
+    @apply badge bg-amber-100 text-amber-700;
+  }
+
+  .badge-danger {
+    @apply badge bg-rose-100 text-rose-700;
+  }
+
+  .pagination-button {
+    @apply inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-ink-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .truncate-cell {
+    @apply break-all;
+  }
+
+  .log-row {
+    @apply cursor-pointer;
+  }
+
+  .modal-overlay {
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4;
+  }
+
+  .modal-card {
+    @apply w-full max-w-4xl rounded-2xl border border-slate-200 bg-white shadow-xl;
+  }
+}

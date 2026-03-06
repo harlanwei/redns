@@ -9,7 +9,7 @@
 //! - HTTP POST with `application/dns-message` body
 //! - X-Forwarded-For header for client IP extraction
 
-use crate::server::DnsHandler;
+use crate::server::{DnsHandler, QueryMeta};
 use base64::Engine;
 use hickory_proto::op::Message;
 use std::net::{IpAddr, SocketAddr};
@@ -114,7 +114,8 @@ async fn handle_doh_connection(
         let path = parts[1];
 
         // Extract client IP from XFF header if configured.
-        let _client_ip = extract_client_ip(&request_str, peer.ip(), &config.src_ip_header);
+        let client_ip = extract_client_ip(&request_str, peer.ip(), &config.src_ip_header);
+        let request_path = path.split('?').next().unwrap_or(path).to_string();
 
         // Parse DNS query from request.
         let dns_query = match method {
@@ -206,7 +207,16 @@ async fn handle_doh_connection(
         };
 
         if let Some(query) = dns_query {
-            match handler.handle(query).await {
+            let meta = QueryMeta {
+                protocol: Some("doh".to_string()),
+                from_udp: false,
+                client_addr: Some(client_ip),
+                url_path: Some(request_path),
+                server_name: None,
+                selected_upstreams: None,
+            };
+
+            match handler.handle(query, meta).await {
                 Ok(resp) => match resp.to_vec() {
                     Ok(resp_bytes) => {
                         send_http_dns_response(&mut stream, &resp_bytes).await?;

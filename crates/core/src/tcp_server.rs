@@ -4,7 +4,7 @@
 
 //! Async TCP DNS server with graceful shutdown.
 
-use crate::server::DnsHandler;
+use crate::server::{DnsHandler, QueryMeta};
 use hickory_proto::op::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +74,16 @@ pub async fn serve_tcp(
                             }
                         };
 
-                        match handler.handle(query).await {
+                        let meta = QueryMeta {
+                            protocol: Some("tcp".to_string()),
+                            from_udp: false,
+                            client_addr: Some(peer.ip()),
+                            url_path: None,
+                            server_name: None,
+                            selected_upstreams: None,
+                        };
+
+                        match handler.handle(query, meta).await {
                             Ok(resp) => {
                                 match resp.to_vec() {
                                     Ok(resp_bytes) => {

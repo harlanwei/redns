@@ -8,6 +8,8 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod dashboard;
+
 use clap::{Parser, Subcommand};
 use redns_core::chain_builder::ChainBuilder;
 use redns_core::config::parse_rule_args;
@@ -530,6 +532,13 @@ async fn run_server(
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
+    let sqlite_path = cfg
+        .dashboard
+        .sqlite
+        .clone()
+        .unwrap_or_else(|| dashboard::default_sqlite_path(&file_used));
+    info!(path = %sqlite_path, "dashboard sqlite path selected");
+    let dashboard_store = Arc::new(dashboard::DashboardStore::new(sqlite_path)?);
 
     for srv in &servers {
         if srv.entry.is_empty() {
@@ -544,6 +553,9 @@ async fn run_server(
             }
         };
         let handler: Arc<dyn redns_core::DnsHandler> = Arc::new(EntryHandler::new(entry_exec));
+        let handler: Arc<dyn redns_core::DnsHandler> = Arc::new(
+            dashboard::DashboardDnsHandler::new(handler, dashboard_store.clone()),
+        );
 
         let addr = &srv.addr;
         let proto = &srv.protocol;
@@ -600,6 +612,25 @@ async fn run_server(
                 });
             }
             Err(e) => warn!(error = %e, addr = %api_addr, "failed to bind API HTTP"),
+        }
+    }
+
+    // ── Phase 5: Start Dashboard HTTP server ────────────────────
+    if let Some(ref dashboard_addr) = cfg.dashboard.http {
+        match TcpListener::bind(dashboard_addr).await {
+            Ok(listener) => {
+                info!(addr = %dashboard_addr, "Dashboard HTTP server listening");
+                let state = dashboard::DashboardState {
+                    api_http: cfg.api.http.clone(),
+                    upstreams: all_upstreams.clone(),
+                    store: dashboard_store.clone(),
+                };
+                let c = cancel.clone();
+                tokio::spawn(async move {
+                    dashboard::serve_dashboard(listener, state, c).await;
+                });
+            }
+            Err(e) => warn!(error = %e, addr = %dashboard_addr, "failed to bind Dashboard HTTP"),
         }
     }
 

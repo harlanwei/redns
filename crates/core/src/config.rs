@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub dashboard: DashboardConfig,
+    #[serde(default)]
     pub servers: Vec<ServerConfig>,
 }
 
@@ -82,6 +84,17 @@ pub struct ApiConfig {
     /// HTTP listen address (e.g. "127.0.0.1:8080").
     #[serde(default)]
     pub http: Option<String>,
+}
+
+/// Dashboard server configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DashboardConfig {
+    /// HTTP listen address for the dashboard (e.g. "127.0.0.1:9090").
+    #[serde(default)]
+    pub http: Option<String>,
+    /// Optional SQLite path for dashboard data.
+    #[serde(default)]
+    pub sqlite: Option<String>,
 }
 
 // ── Sequence Rule Config ─────────────────────────────────────────

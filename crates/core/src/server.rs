@@ -24,7 +24,7 @@ use crate::upstream::UpstreamWrapper;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -34,19 +34,25 @@ pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Metadata about an incoming DNS query.
 #[derive(Debug, Clone, Default)]
 pub struct QueryMeta {
+    /// Transport protocol label (e.g. "udp", "tcp", "doh").
+    pub protocol: Option<String>,
+    /// Whether the query was received over UDP.
+    pub from_udp: bool,
     /// The client's IP address.
     pub client_addr: Option<IpAddr>,
     /// The URL path (for DoH requests).
     pub url_path: Option<String>,
     /// The TLS server name (SNI, for DoT/DoH).
     pub server_name: Option<String>,
+    /// Optional selected upstream collector for query observers.
+    pub selected_upstreams: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 /// A DNS handler that processes a query and returns a response.
 #[async_trait]
 pub trait DnsHandler: Send + Sync {
     /// Handle a DNS query. Returns the response message.
-    async fn handle(&self, query: Message) -> PluginResult<Message>;
+    async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message>;
 }
 
 /// Wraps a sequence [`Executable`] as a [`DnsHandler`].
@@ -67,7 +73,7 @@ impl EntryHandler {
 
 #[async_trait]
 impl DnsHandler for EntryHandler {
-    async fn handle(&self, query: Message) -> PluginResult<Message> {
+    async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message> {
         // Basic query validation.
         if query.message_type() == MessageType::Response || query.queries().len() != 1 {
             return Ok(refused_response(&query));
@@ -87,6 +93,10 @@ impl DnsHandler for EntryHandler {
 
         let start = std::time::Instant::now();
         let mut ctx = Context::new(query.clone());
+        ctx.server_meta.from_udp = meta.from_udp;
+        ctx.server_meta.client_addr = meta.client_addr;
+        ctx.server_meta.url_path = meta.url_path;
+        ctx.server_meta.server_name = meta.server_name;
         let result = self.entry.exec(&mut ctx).await;
         let elapsed = start.elapsed();
         let selected_upstream = if result.is_ok() && ctx.response().is_some() {
@@ -108,6 +118,14 @@ impl DnsHandler for EntryHandler {
         };
 
         if let Some(upstream) = selected_upstream {
+            if let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
+                && let Ok(mut selected) = selected_upstreams.lock()
+            {
+                let upstream_name = upstream.name().to_string();
+                if !selected.iter().any(|name| name == &upstream_name) {
+                    selected.push(upstream_name);
+                }
+            }
             upstream.record_final_selected();
         }
 
@@ -198,7 +216,10 @@ mod tests {
     #[tokio::test]
     async fn no_response_returns_refused() {
         let handler = EntryHandler::new(Arc::new(NopExec));
-        let resp = handler.handle(make_query()).await.unwrap();
+        let resp = handler
+            .handle(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
         assert_eq!(resp.response_code(), ResponseCode::Refused);
         assert!(resp.recursion_available());
     }
@@ -206,7 +227,10 @@ mod tests {
     #[tokio::test]
     async fn error_returns_servfail() {
         let handler = EntryHandler::new(Arc::new(FailExec));
-        let resp = handler.handle(make_query()).await.unwrap();
+        let resp = handler
+            .handle(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
         assert_eq!(resp.response_code(), ResponseCode::ServFail);
         assert!(resp.recursion_available());
     }
@@ -214,7 +238,10 @@ mod tests {
     #[tokio::test]
     async fn success_returns_actual_response() {
         let handler = EntryHandler::new(Arc::new(SetResponseExec));
-        let resp = handler.handle(make_query()).await.unwrap();
+        let resp = handler
+            .handle(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
         assert_eq!(resp.response_code(), ResponseCode::NoError);
         assert!(resp.recursion_available());
     }

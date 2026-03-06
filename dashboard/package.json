@@ -1,0 +1,13 @@
+{
+  "name": "redns-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs && tailwindcss -i ./src/input.css -o ./dist/assets/dashboard.css --minify",
+    "dev": "npm run build && python3 -m http.server 4173 -d dist"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.17"
+  }
+}

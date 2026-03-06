@@ -1,0 +1,790 @@
+use hickory_proto::op::Message;
+use redns_core::{DnsHandler, PluginResult, QueryMeta, UpstreamMetrics, UpstreamWrapper};
+use rusqlite::{Connection, params};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
+
+type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+const INDEX_HTML: &str = include_str!("../../../dashboard/dist/index.html");
+const DASHBOARD_CSS: &str = include_str!("../../../dashboard/dist/assets/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../../../dashboard/dist/assets/dashboard.js");
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsLogEntry {
+    pub id: u64,
+    pub ts_unix_ms: u64,
+    pub client_ip: String,
+    pub protocol: String,
+    pub qname: String,
+    pub qtype: String,
+    pub rcode: String,
+    pub upstreams: Vec<String>,
+    pub result: String,
+    pub result_rows: Vec<String>,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogSummary {
+    pub total_items: u64,
+    pub unique_clients: u64,
+    pub non_noerror: u64,
+    pub avg_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedLogsResponse {
+    pub items: Vec<DnsLogEntry>,
+    pub page: u64,
+    pub page_size: u64,
+    pub total_items: u64,
+    pub total_pages: u64,
+    pub summary: LogSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientStatsEntry {
+    pub ip: String,
+    pub query_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientStatsResponse {
+    pub items: Vec<ClientStatsEntry>,
+    pub total_clients: u64,
+    pub total_queries: u64,
+    pub top_client: Option<String>,
+    pub top_volume: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearLogsResponse {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NewDnsLogEntry {
+    ts_unix_ms: u64,
+    client_ip: String,
+    protocol: String,
+    qname: String,
+    qtype: String,
+    rcode: String,
+    upstreams_json: String,
+    result: String,
+    result_rows_json: String,
+    latency_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogsQuery {
+    pub page: u64,
+    pub page_size: u64,
+    pub filter: String,
+}
+
+impl Default for LogsQuery {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            page_size: 25,
+            filter: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DashboardStore {
+    db_path: Arc<String>,
+}
+
+impl DashboardStore {
+    pub fn new(db_path: impl Into<String>) -> Result<Self, DynError> {
+        let db_path = db_path.into();
+        ensure_sqlite_file_exists(&db_path)?;
+        let store = Self {
+            db_path: Arc::new(db_path),
+        };
+        store.init()?;
+        Ok(store)
+    }
+
+    fn init(&self) -> Result<(), DynError> {
+        let conn = Self::open_connection(&self.db_path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS dns_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_unix_ms INTEGER NOT NULL,
+                client_ip TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                qname TEXT NOT NULL,
+                qtype TEXT NOT NULL,
+                rcode TEXT NOT NULL,
+                result TEXT NOT NULL,
+                result_rows_json TEXT NOT NULL DEFAULT '[]',
+                upstreams_json TEXT NOT NULL DEFAULT '[]',
+                latency_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dns_logs_ts ON dns_logs(ts_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_dns_logs_client ON dns_logs(client_ip);
+            CREATE INDEX IF NOT EXISTS idx_dns_logs_qname ON dns_logs(qname);
+            ",
+        )?;
+        Self::ensure_migrations(&conn)?;
+        Ok(())
+    }
+
+    fn ensure_migrations(conn: &Connection) -> Result<(), DynError> {
+        if !Self::has_column(conn, "dns_logs", "result_rows_json")? {
+            conn.execute(
+                "ALTER TABLE dns_logs ADD COLUMN result_rows_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        if !Self::has_column(conn, "dns_logs", "upstreams_json")? {
+            conn.execute(
+                "ALTER TABLE dns_logs ADD COLUMN upstreams_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, DynError> {
+        let sql = format!("PRAGMA table_info({})", table);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn open_connection(path: &str) -> Result<Connection, DynError> {
+        ensure_sqlite_file_exists(path)?;
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(3))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(conn)
+    }
+
+    async fn record(&self, entry: NewDnsLogEntry) -> Result<(), DynError> {
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), DynError> {
+            let conn = Self::open_connection(&path)?;
+            conn.execute(
+                "INSERT INTO dns_logs (
+                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    entry.ts_unix_ms as i64,
+                    entry.client_ip,
+                    entry.protocol,
+                    entry.qname,
+                    entry.qtype,
+                    entry.rcode,
+                    entry.result,
+                    entry.result_rows_json,
+                    entry.upstreams_json,
+                    entry.latency_ms as i64,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+
+    pub async fn fetch_logs(&self, query: LogsQuery) -> Result<PaginatedLogsResponse, DynError> {
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<PaginatedLogsResponse, DynError> {
+            let conn = Self::open_connection(&path)?;
+            let page_size = query.page_size.clamp(1, 200);
+            let page = query.page.max(1);
+            let pattern = like_pattern(&query.filter);
+
+            let summary = conn.query_row(
+                "SELECT
+                    COUNT(*),
+                    COUNT(DISTINCT client_ip),
+                    COALESCE(SUM(CASE WHEN lower(rcode) <> 'noerror' THEN 1 ELSE 0 END), 0),
+                    AVG(latency_ms)
+                 FROM dns_logs
+                 WHERE client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1",
+                params![pattern.clone()],
+                |row| {
+                    let avg: Option<f64> = row.get(3)?;
+                    Ok(LogSummary {
+                        total_items: row.get::<_, i64>(0)? as u64,
+                        unique_clients: row.get::<_, i64>(1)? as u64,
+                        non_noerror: row.get::<_, i64>(2)? as u64,
+                        avg_latency_ms: avg.unwrap_or(0.0).ceil() as u64,
+                    })
+                },
+            )?;
+
+            let total_pages = if summary.total_items == 0 {
+                1
+            } else {
+                summary.total_items.div_ceil(page_size)
+            };
+            let bounded_page = page.min(total_pages);
+            let bounded_offset = (bounded_page - 1) * page_size;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms
+                 FROM dns_logs
+                 WHERE client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1
+                 ORDER BY id DESC
+                 LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![pattern, page_size as i64, bounded_offset as i64],
+                |row| {
+                    Ok(DnsLogEntry {
+                        id: row.get::<_, i64>(0)? as u64,
+                        ts_unix_ms: row.get::<_, i64>(1)? as u64,
+                        client_ip: row.get(2)?,
+                        protocol: row.get(3)?,
+                        qname: row.get(4)?,
+                        qtype: row.get(5)?,
+                        rcode: row.get(6)?,
+                        result: row.get(7)?,
+                        result_rows: parse_json_string_vec(&row.get::<_, String>(8)?),
+                        upstreams: parse_json_string_vec(&row.get::<_, String>(9)?),
+                        latency_ms: row.get::<_, i64>(10)? as u64,
+                    })
+                },
+            )?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+
+            Ok(PaginatedLogsResponse {
+                items,
+                page: bounded_page,
+                page_size,
+                total_items: summary.total_items,
+                total_pages,
+                summary,
+            })
+        })
+        .await
+        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+
+    pub async fn fetch_clients(&self) -> Result<ClientStatsResponse, DynError> {
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<ClientStatsResponse, DynError> {
+            let conn = Self::open_connection(&path)?;
+            let total_queries: i64 =
+                conn.query_row("SELECT COUNT(*) FROM dns_logs", [], |row| row.get(0))?;
+            let total_clients: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT client_ip) FROM dns_logs",
+                [],
+                |row| row.get(0),
+            )?;
+
+            let mut stmt = conn.prepare(
+                "SELECT client_ip, COUNT(*) AS query_total
+                 FROM dns_logs
+                 GROUP BY client_ip
+                 ORDER BY query_total DESC, client_ip ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(ClientStatsEntry {
+                    ip: row.get(0)?,
+                    query_total: row.get::<_, i64>(1)? as u64,
+                })
+            })?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+
+            let top_client = items.first().map(|item| item.ip.clone());
+            let top_volume = items.first().map(|item| item.query_total).unwrap_or(0);
+
+            Ok(ClientStatsResponse {
+                items,
+                total_clients: total_clients as u64,
+                total_queries: total_queries as u64,
+                top_client,
+                top_volume,
+            })
+        })
+        .await
+        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+
+    pub async fn clear_logs(&self) -> Result<(), DynError> {
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), DynError> {
+            let conn = Self::open_connection(&path)?;
+            conn.execute("DELETE FROM dns_logs", [])?;
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='dns_logs'", [])?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+}
+
+pub fn default_sqlite_path(config_file: &str) -> String {
+    let config_path = Path::new(config_file);
+    let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    base_dir.join("redns.db").to_string_lossy().into_owned()
+}
+
+pub struct DashboardDnsHandler {
+    inner: Arc<dyn DnsHandler>,
+    store: Arc<DashboardStore>,
+}
+
+impl DashboardDnsHandler {
+    pub fn new(inner: Arc<dyn DnsHandler>, store: Arc<DashboardStore>) -> Self {
+        Self { inner, store }
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsHandler for DashboardDnsHandler {
+    async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message> {
+        let (qname, qtype) = query
+            .queries()
+            .first()
+            .map(|q| (q.name().to_ascii(), format!("{:?}", q.query_type())))
+            .unwrap_or_else(|| (String::new(), String::new()));
+
+        let client_ip = meta
+            .client_addr
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let protocol = meta.protocol.clone().unwrap_or_else(|| {
+            if meta.from_udp {
+                "udp".to_string()
+            } else {
+                "tcp".to_string()
+            }
+        });
+
+        let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut meta = meta;
+        meta.selected_upstreams = Some(selected_upstreams.clone());
+
+        let start = Instant::now();
+        let result = self.inner.handle(query, meta).await;
+        let elapsed = start.elapsed();
+
+        let (rcode, result_summary, result_rows) = match &result {
+            Ok(resp) => {
+                let (summary, rows) = summarize_dns_result(resp);
+                (format!("{:?}", resp.response_code()), summary, rows)
+            }
+            Err(e) => (
+                "ERROR".to_string(),
+                e.to_string(),
+                vec![format!("error: {}", e)],
+            ),
+        };
+
+        let upstreams = selected_upstreams
+            .lock()
+            .map(|items| dedupe_keep_order(items.clone()))
+            .unwrap_or_default();
+
+        let upstreams = if upstreams.is_empty() && result.is_ok() {
+            vec!["<cached>".to_string()]
+        } else {
+            upstreams
+        };
+
+        let entry = NewDnsLogEntry {
+            ts_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            client_ip,
+            protocol,
+            qname,
+            qtype,
+            rcode,
+            upstreams_json: serde_json::to_string(&upstreams).unwrap_or_else(|_| "[]".to_string()),
+            result: result_summary,
+            result_rows_json: serde_json::to_string(&result_rows)
+                .unwrap_or_else(|_| "[]".to_string()),
+            latency_ms: latency_ms_ceil(elapsed),
+        };
+        if let Err(e) = self.store.record(entry).await {
+            warn!(error = %e, "dashboard failed to persist dns log entry");
+        }
+
+        result
+    }
+}
+
+#[derive(Clone)]
+pub struct DashboardState {
+    pub api_http: Option<String>,
+    pub upstreams: Arc<[Arc<UpstreamWrapper>]>,
+    pub store: Arc<DashboardStore>,
+}
+
+pub async fn serve_dashboard(
+    listener: TcpListener,
+    state: DashboardState,
+    cancel: CancellationToken,
+) {
+    let state = Arc::new(state);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _peer)) => {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_dashboard_request(stream, state).await {
+                                warn!(error = %e, "dashboard request error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "dashboard accept error");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_dashboard_request(
+    mut stream: TcpStream,
+    state: Arc<DashboardState>,
+) -> Result<(), DynError> {
+    let mut buf = vec![0u8; 8192];
+    let n = stream.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let method = parts.first().copied().unwrap_or("");
+    let target = parts.get(1).copied().unwrap_or("/");
+    let path = target.split('?').next().unwrap_or(target);
+    let query = parse_query_string(target);
+
+    match (method, path) {
+        ("GET", "/")
+        | ("GET", "/upstreams")
+        | ("GET", "/logs")
+        | ("GET", "/clients")
+        | ("GET", "/index.html") => {
+            write_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                INDEX_HTML.as_bytes(),
+            )
+            .await?;
+        }
+        ("GET", "/assets/dashboard.css") => {
+            write_response(
+                &mut stream,
+                "200 OK",
+                "text/css; charset=utf-8",
+                DASHBOARD_CSS.as_bytes(),
+            )
+            .await?;
+        }
+        ("GET", "/assets/dashboard.js") => {
+            write_response(
+                &mut stream,
+                "200 OK",
+                "text/javascript; charset=utf-8",
+                DASHBOARD_JS.as_bytes(),
+            )
+            .await?;
+        }
+        ("GET", "/api/upstreams") => {
+            let body = upstream_metrics_json(&state).await?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await?;
+        }
+        ("GET", "/api/logs") => {
+            let logs_query = logs_query_from_params(&query);
+            let body = serde_json::to_vec(&state.store.fetch_logs(logs_query).await?)?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+        }
+        ("GET", "/api/clients") => {
+            let body = serde_json::to_vec(&state.store.fetch_clients().await?)?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+        }
+        ("POST", "/api/logs/clear") => {
+            state.store.clear_logs().await?;
+            let body = serde_json::to_vec(&ClearLogsResponse { ok: true })?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+        }
+        _ => {
+            write_response(
+                &mut stream,
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                b"{\"error\":\"not found\"}",
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn upstream_metrics_json(state: &DashboardState) -> Result<String, DynError> {
+    if let Some(api_addr) = &state.api_http {
+        match fetch_upstreams_from_api(api_addr).await {
+            Ok(body) => return Ok(body),
+            Err(e) => {
+                warn!(error = %e, addr = %api_addr, "failed to fetch upstream metrics from API");
+            }
+        }
+    }
+
+    let metrics: Vec<UpstreamMetrics> = state.upstreams.iter().map(|u| u.snapshot()).collect();
+    Ok(serde_json::to_string(&metrics)?)
+}
+
+async fn fetch_upstreams_from_api(api_addr: &str) -> Result<String, DynError> {
+    let mut stream = TcpStream::connect(api_addr)
+        .await
+        .map_err(|e| -> DynError {
+            format!("failed to connect to API {}: {}", api_addr, e).into()
+        })?;
+
+    let req = format!(
+        "GET /metrics/upstreams HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        api_addr
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| -> DynError { format!("failed to send API request: {}", e).into() })?;
+
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| -> DynError { format!("failed to read API response: {}", e).into() })?;
+
+    let response = String::from_utf8_lossy(&bytes);
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| -> DynError { "invalid API response format".into() })?;
+    let status_line = headers.lines().next().unwrap_or("");
+    if !status_line.contains(" 200 ") {
+        return Err(format!("API returned non-200 status: {}", status_line).into());
+    }
+
+    Ok(body.to_string())
+}
+
+async fn write_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), DynError> {
+    let resp = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.write_all(body).await?;
+    Ok(())
+}
+
+fn summarize_dns_result(resp: &Message) -> (String, Vec<String>) {
+    let answers = resp.answers();
+    if answers.is_empty() {
+        let row = format!("rcode={:?}, answers=0", resp.response_code());
+        return (row.clone(), vec![row]);
+    }
+
+    let mut rows = Vec::new();
+    for answer in answers {
+        rows.push(format!(
+            "{} {:?} {}",
+            answer.name().to_ascii(),
+            answer.record_type(),
+            answer.data()
+        ));
+    }
+
+    let summary = rows.join(" | ");
+    (summary, rows)
+}
+
+fn latency_ms_ceil(elapsed: Duration) -> u64 {
+    let micros = elapsed.as_micros();
+    if micros == 0 {
+        0
+    } else {
+        ((micros + 999) / 1000).min(u64::MAX as u128) as u64
+    }
+}
+
+fn logs_query_from_params(query: &HashMap<String, String>) -> LogsQuery {
+    let page = query
+        .get("page")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1);
+    let page_size = query
+        .get("page_size")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(25);
+    let filter = query.get("q").cloned().unwrap_or_default();
+    LogsQuery {
+        page: page.max(1),
+        page_size: page_size.clamp(1, 200),
+        filter,
+    }
+}
+
+fn like_pattern(filter: &str) -> String {
+    if filter.trim().is_empty() {
+        "%".to_string()
+    } else {
+        format!("%{}%", filter.trim())
+    }
+}
+
+fn parse_query_string(target: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    let Some((_, query)) = target.split_once('?') else {
+        return params;
+    };
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(percent_decode(key), percent_decode(value));
+    }
+    params
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(h), Some(l)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                    out.push((h << 4) | l);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(10 + (b - b'a')),
+        b'A'..=b'F' => Some(10 + (b - b'A')),
+        _ => None,
+    }
+}
+
+fn ensure_sqlite_file_exists(path: &str) -> Result<(), DynError> {
+    if path == ":memory:" {
+        return Ok(());
+    }
+
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if !path.exists() {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+    }
+    Ok(())
+}
+
+fn parse_json_string_vec(text: &str) -> Vec<String> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+fn dedupe_keep_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            deduped.push(item);
+        }
+    }
+    deduped
+}
