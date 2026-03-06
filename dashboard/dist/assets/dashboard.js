@@ -304,8 +304,7 @@ class RednsDashboard extends HTMLElement {
     const modal = this.renderLogModal();
 
     this.innerHTML = `
-      <main class="relative isolate mx-auto w-full max-w-[1600px] px-6 pb-4 pt-8 sm:px-8 lg:px-12">
-        <div class="pointer-events-none absolute inset-x-0 top-0 -z-10 h-52 bg-[radial-gradient(circle_at_top_left,rgba(78,179,197,0.28),transparent_32%),radial-gradient(circle_at_top_right,rgba(241,165,96,0.24),transparent_24%)]"></div>
+      <main class="mx-auto w-full max-w-[1600px] px-6 pb-10 pt-8 sm:px-8 lg:px-12 lg:pt-10">
         ${header}
         ${summary}
         ${body}
@@ -327,16 +326,21 @@ class RednsDashboard extends HTMLElement {
       .join("");
 
     return `
-      <section class="mb-4 flex w-full flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-        <div class="space-y-2">
-          <p class="text-xs font-semibold uppercase tracking-[0.2em] text-tide-700">DNS operations console</p>
+      <section class="hero-panel">
+        <div class="space-y-3">
+          <p class="inline-flex w-fit items-center rounded-full border border-tide-100 bg-tide-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-tide-700">DNS operations console</p>
           <h1 class="text-3xl font-semibold tracking-tight text-ink-900 sm:text-4xl">redns Dashboard</h1>
           <p class="max-w-4xl text-sm leading-6 text-ink-500 sm:text-base">Lightweight monitoring for upstream activity, paginated DNS logs, and SQLite-backed traffic statistics.</p>
           <nav class="flex flex-wrap gap-2">${nav}</nav>
         </div>
-        <div class="glass-panel flex items-center gap-3 px-4 py-2 text-sm text-ink-500">
-          <span class="inline-flex h-2.5 w-2.5 rounded-full bg-tide-500"></span>
-          <span>${esc(this.state.statusText)}</span>
+        <div class="status-panel">
+          <div class="flex items-start gap-3">
+            <span class="status-dot"></span>
+            <div>
+              <p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-tide-700">Status</p>
+              <p class="mt-1 text-sm text-ink-500">${esc(this.state.statusText)}</p>
+            </div>
+          </div>
         </div>
       </section>
     `;
@@ -348,10 +352,10 @@ class RednsDashboard extends HTMLElement {
       .map(
         (card) => `
           <article class="stat-card">
-            <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">${esc(card.label)}</p>
+            <p class="text-xs font-semibold uppercase tracking-[0.14em] text-ink-400">${esc(card.label)}</p>
             <div class="mt-2 flex items-end justify-between gap-4">
               <p class="text-2xl font-semibold text-ink-900 sm:text-3xl">${esc(card.value)}</p>
-              <p class="text-right text-xs leading-5 text-slate-500">${esc(card.caption || "")}</p>
+              <p class="text-right text-xs leading-5 text-ink-400">${esc(card.caption || "")}</p>
             </div>
           </article>
         `,
@@ -368,21 +372,18 @@ class RednsDashboard extends HTMLElement {
       const errorTotal = rows.reduce((sum, row) => sum + Number(row.error_total || 0), 0);
       const inflightTotal = rows.reduce((sum, row) => sum + Number(row.inflight_total || 0), 0);
       return [
-        { label: "Upstreams", value: fmtNum(rows.length), caption: "currently visible" },
+        { label: "Upstreams", value: fmtNum(rows.length) },
         {
           label: "Total Queries",
           value: fmtNum(totalQueries),
-          caption: "across upstream pool",
         },
         {
           label: "Inflight",
           value: fmtNum(inflightTotal),
-          caption: "queries in progress",
         },
         {
           label: "Errors",
           value: fmtNum(errorTotal),
-          caption: "recorded exchange failures",
         },
       ];
     }
@@ -393,22 +394,18 @@ class RednsDashboard extends HTMLElement {
         {
           label: "Matching Queries",
           value: fmtNum(summary.total_items),
-          caption: "SQLite filtered result set",
         },
         {
           label: "Unique Clients",
           value: fmtNum(summary.unique_clients),
-          caption: "within current filter",
         },
         {
           label: "Non-NOERROR",
           value: fmtNum(summary.non_noerror),
-          caption: "responses with elevated status",
         },
         {
           label: "Avg Latency",
           value: `${fmtNum(summary.avg_latency_ms)} ms`,
-          caption: "rounded up",
         },
       ];
     }
@@ -420,17 +417,14 @@ class RednsDashboard extends HTMLElement {
       {
         label: "Clients",
         value: fmtNum(this.state.clients.total_clients),
-        caption: "source IPs observed",
       },
       {
         label: "Total Queries",
         value: fmtNum(this.state.clients.total_queries),
-        caption: "across all clients",
       },
       {
         label: "Top Client",
         value: this.state.clients.top_client || "-",
-        caption: "highest query volume",
       },
       {
         label: "Top Volume",
@@ -630,7 +624,7 @@ class RednsDashboard extends HTMLElement {
               const parsed = parseLogAnswerRow(row);
               return `
             <tr>
-              <td class="w-[18%] text-slate-500">${esc(parsed.type)}</td>
+              <td class="w-[18%] text-ink-400">${esc(parsed.type)}</td>
               <td class="truncate-cell font-mono text-xs sm:text-sm">${esc(parsed.content)}</td>
             </tr>
           `;
@@ -639,7 +633,7 @@ class RednsDashboard extends HTMLElement {
           .join("")
       : `
           <tr>
-            <td colspan="2" class="text-slate-500">No answer rows captured for this query.</td>
+            <td colspan="2" class="text-ink-400">No answer rows captured for this query.</td>
           </tr>
         `;
 
@@ -722,13 +716,13 @@ class RednsDashboard extends HTMLElement {
             <td class="truncate-cell font-mono text-xs sm:text-sm">${esc(item.ip || "-")}</td>
             <td>
               <div class="flex items-center gap-3">
-                <div class="h-2.5 w-36 overflow-hidden rounded-full bg-slate-100">
-                  <div class="h-full rounded-full bg-gradient-to-r from-tide-500 to-sky-500" style="width:${width}%"></div>
+                <div class="h-2.5 w-36 overflow-hidden rounded-full bg-ink-100">
+                  <div class="h-full rounded-full bg-gradient-to-r from-tide-700 to-tide-500" style="width:${width}%"></div>
                 </div>
                 <span class="text-ink-700">${fmtNum(item.query_total)}</span>
               </div>
             </td>
-            <td class="text-slate-500">${fmtPercent((Number(item.query_total || 0) / Math.max(this.state.clients.total_queries || 1, 1)) * 100)}%</td>
+            <td class="text-ink-400">${fmtPercent((Number(item.query_total || 0) / Math.max(this.state.clients.total_queries || 1, 1)) * 100)}%</td>
           </tr>
         `;
       })
@@ -762,7 +756,7 @@ class RednsDashboard extends HTMLElement {
 
     for (let i = start; i <= end; i += 1) {
       buttons.push(`
-        <button class="pagination-button ${i === page ? "border-tide-500/70 bg-sky-50" : ""}" data-log-page="${i}">${fmtNum(i)}</button>
+        <button class="pagination-button ${i === page ? "border-tide-700 bg-tide-50 text-tide-700 shadow-sm" : ""}" data-log-page="${i}">${fmtNum(i)}</button>
       `);
     }
 

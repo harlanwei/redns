@@ -5,17 +5,19 @@ export default {
     extend: {
       colors: {
         ink: {
-          50: "#f8fafc",
-          100: "#eef3fb",
-          400: "#5f7391",
-          500: "#41556f",
-          700: "#203247",
-          900: "#09111d"
+          50: "#f4f7fb",
+          100: "#e8eef7",
+          400: "#64748b",
+          500: "#42536b",
+          700: "#17314f",
+          900: "#0a1f3d"
         },
         tide: {
-          300: "#6fd0df",
-          500: "#1596aa",
-          700: "#0f6e7d"
+          50: "#eef3f9",
+          100: "#d8e3f0",
+          300: "#8da8c5",
+          500: "#2b527f",
+          700: "#173355"
         },
         ember: {
           300: "#f3bb7a",
@@ -28,8 +30,8 @@ export default {
         mono: ["IBM Plex Mono", "Fira Code", "monospace"]
       },
       boxShadow: {
-        panel: "0 18px 40px rgba(9, 17, 29, 0.10)",
-        glow: "0 10px 30px rgba(21, 150, 170, 0.18)"
+        panel: "0 20px 48px rgba(10, 31, 61, 0.08)",
+        glow: "0 18px 42px rgba(23, 51, 85, 0.12)"
       }
     }
   },

@@ -4,34 +4,58 @@
 
 @layer base {
   body {
-    background:
-      radial-gradient(circle at top left, rgba(78, 179, 197, 0.24), transparent 28%),
-      radial-gradient(circle at top right, rgba(241, 165, 96, 0.24), transparent 24%),
-      linear-gradient(180deg, #f9fcff 0%, #f3f7fb 42%, #edf2f7 100%);
-    color: #203247;
-    font-family: "IBM Plex Sans", "Source Sans 3", "Noto Sans", sans-serif;
+    background: #ffffff;
+    color: #17314f;
+    font-family: sans-serif;
+  }
+
+  ::selection {
+    background: rgba(43, 82, 127, 0.16);
+    color: #0a1f3d;
   }
 }
 
 @layer components {
   .glass-panel {
-    @apply rounded-2xl border border-slate-200 bg-white shadow-sm;
+    @apply rounded-[4px] border border-slate-200 bg-white shadow-panel;
+  }
+
+  .hero-panel {
+    @apply glass-panel mb-5 flex w-full flex-col gap-6 px-6 py-6 sm:px-8 sm:py-8 lg:flex-row lg:items-end lg:justify-between;
+  }
+
+  .status-panel {
+    @apply rounded-[4px] border border-tide-100 bg-ink-50 px-4 py-4 text-sm text-ink-500;
+    min-width: min(100%, 18rem);
+  }
+
+  .status-dot {
+    @apply inline-flex h-2.5 w-2.5 rounded-full bg-tide-500;
+    box-shadow: 0 0 0 6px rgba(43, 82, 127, 0.12);
   }
 
   .stat-card {
-    @apply glass-panel p-5 transition-transform duration-150 hover:-translate-y-0.5;
+    @apply glass-panel relative overflow-hidden p-5;
   }
 
   .nav-pill {
-    @apply inline-flex items-center rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-ink-700 transition-all duration-200 hover:border-tide-500/50 hover:bg-sky-50;
+    @apply inline-flex items-center rounded-full border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-ink-700 transition-all duration-200 hover:border-tide-500 hover:bg-tide-50 hover:text-tide-700;
   }
 
   .nav-pill-active {
-    @apply border-tide-500 bg-tide-500 text-white;
+    @apply border-tide-700 bg-tide-700 text-white shadow-sm;
   }
 
   .control {
-    @apply rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm text-ink-700 outline-none ring-0 transition focus:border-tide-500/70;
+    @apply rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm text-ink-700 outline-none ring-0 transition;
+    box-shadow: inset 0 1px 2px rgba(10, 31, 61, 0.04);
+  }
+
+  .control:focus {
+    @apply border-tide-500;
+    box-shadow:
+      0 0 0 4px rgba(43, 82, 127, 0.12),
+      inset 0 1px 2px rgba(10, 31, 61, 0.04);
   }
 
   .table-shell {
@@ -43,11 +67,11 @@
   }
 
   .table-base thead {
-    @apply bg-slate-50 text-ink-500;
+    @apply bg-ink-50 text-ink-500;
   }
 
   .table-base th {
-    @apply px-3 py-3 text-xs font-semibold uppercase tracking-[0.12em] text-slate-500;
+    @apply px-3 py-3 text-xs font-semibold uppercase tracking-[0.12em] text-ink-400;
   }
 
   .table-base td {
@@ -55,7 +79,7 @@
   }
 
   .table-base tbody tr {
-    @apply border-t border-slate-100 transition-colors hover:bg-sky-50;
+    @apply border-t border-slate-100 transition-colors hover:bg-ink-50;
   }
 
   .badge {
@@ -75,7 +99,7 @@
   }
 
   .pagination-button {
-    @apply inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-ink-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40;
+    @apply inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-ink-700 transition hover:border-tide-500 hover:bg-ink-50 hover:text-tide-700 disabled:cursor-not-allowed disabled:opacity-40;
   }
 
   .truncate-cell {
@@ -142,10 +166,10 @@
   }
 
   .modal-overlay {
-    @apply fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4;
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-ink-900/45 p-4;
   }
 
   .modal-card {
-    @apply w-full max-w-4xl rounded-2xl border border-slate-200 bg-white shadow-xl;
+    @apply w-full max-w-4xl rounded-[28px] border border-slate-200 bg-white shadow-panel;
   }
 }
