@@ -17,6 +17,9 @@ use redns_core::redns::{Redns, find_and_load_config, load_config_file};
 use redns_core::server::EntryHandler;
 use redns_core::upstream::UpstreamWrapper;
 use redns_core::{PluginRegistry, Sequence};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{error, info, warn};
@@ -74,6 +77,47 @@ async fn main() {
             }
         }
     }
+}
+
+fn parse_listen_addr(addr: &str) -> io::Result<SocketAddr> {
+    addr.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid socket address '{addr}': {e}"),
+        )
+    })
+}
+
+fn bind_udp_socket(addr: &str) -> io::Result<UdpSocket> {
+    let addr = parse_listen_addr(addr)?;
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+
+    socket.bind(&SockAddr::from(addr))?;
+    socket.set_nonblocking(true)?;
+
+    UdpSocket::from_std(socket.into())
+}
+
+fn bind_tcp_listener(addr: &str) -> io::Result<TcpListener> {
+    let addr = parse_listen_addr(addr)?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+
+    socket.bind(&SockAddr::from(addr))?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+
+    TcpListener::from_std(socket.into())
 }
 
 /// Registers all built-in matcher and executor factories on the given builder.
@@ -568,7 +612,7 @@ async fn run_server(
         let proto = &srv.protocol;
 
         if proto.contains("udp") || proto == "udp+tcp" {
-            match UdpSocket::bind(addr).await {
+            match bind_udp_socket(addr) {
                 Ok(socket) => {
                     info!(addr = %addr, "UDP server listening");
                     let h = handler.clone();
@@ -585,7 +629,7 @@ async fn run_server(
         }
 
         if proto.contains("tcp") || proto == "udp+tcp" {
-            match TcpListener::bind(addr).await {
+            match bind_tcp_listener(addr) {
                 Ok(listener) => {
                     info!(addr = %addr, "TCP server listening");
                     let h = handler.clone();
@@ -609,7 +653,7 @@ async fn run_server(
     };
 
     if let Some(ref api_addr) = cfg.api.http {
-        match TcpListener::bind(api_addr).await {
+        match bind_tcp_listener(api_addr) {
             Ok(listener) => {
                 info!(addr = %api_addr, "API HTTP server listening");
                 let upstreams = all_upstreams.clone();
@@ -624,7 +668,7 @@ async fn run_server(
 
     // ── Phase 5: Start Dashboard HTTP server ────────────────────
     if let Some(ref dashboard_addr) = cfg.dashboard.http {
-        match TcpListener::bind(dashboard_addr).await {
+        match bind_tcp_listener(dashboard_addr) {
             Ok(listener) => {
                 info!(addr = %dashboard_addr, "Dashboard HTTP server listening");
                 let state = dashboard::DashboardState {
@@ -651,6 +695,29 @@ async fn run_server(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     info!("redns stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_tcp_listener, bind_udp_socket};
+
+    #[tokio::test]
+    async fn udp_ipv4_and_ipv6_any_can_share_a_port() {
+        let ipv4 = bind_udp_socket("0.0.0.0:0").expect("bind IPv4 UDP listener");
+        let port = ipv4.local_addr().expect("read IPv4 UDP addr").port();
+        let ipv6 = bind_udp_socket(&format!("[::]:{port}")).expect("bind IPv6 UDP listener");
+
+        assert_eq!(ipv6.local_addr().expect("read IPv6 UDP addr").port(), port);
+    }
+
+    #[tokio::test]
+    async fn tcp_ipv4_and_ipv6_any_can_share_a_port() {
+        let ipv4 = bind_tcp_listener("0.0.0.0:0").expect("bind IPv4 TCP listener");
+        let port = ipv4.local_addr().expect("read IPv4 TCP addr").port();
+        let ipv6 = bind_tcp_listener(&format!("[::]:{port}")).expect("bind IPv6 TCP listener");
+
+        assert_eq!(ipv6.local_addr().expect("read IPv6 TCP addr").port(), port);
+    }
 }
 
 /// Simple API HTTP server.
