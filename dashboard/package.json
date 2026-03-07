@@ -1,13 +1,1 @@
-{
-  "name": "redns-dashboard",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "build": "node build.mjs && tailwindcss -i ./src/input.css -o ./dist/assets/dashboard.css --minify",
-    "dev": "npm run build && python3 -m http.server 4173 -d dist"
-  },
-  "devDependencies": {
-    "tailwindcss": "^3.4.17"
-  }
-}
+{"name": "dashboard", "private": true, "version": "0.0.0", "type": "module", "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview", "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.node.json"}, "devDependencies": {"@sveltejs/vite-plugin-svelte": "^5.0.0", "@tsconfig/svelte": "^5.0.4", "autoprefixer": "^10.4.20", "postcss": "^8.4.49", "svelte": "^5.2.7", "svelte-check": "^4.1.1", "tailwindcss": "^3.4.17", "tslib": "^2.8.1", "typescript": "~5.6.2", "vite": "^6.0.5"}}

@@ -1,39 +1,39 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  content: ["./src/index.html", "./src/app.js"],
+  content: [
+    "./index.html",
+    "./src/**/*.{svelte,js,ts,jsx,tsx}",
+  ],
   theme: {
     extend: {
       colors: {
-        ink: {
-          50: "#f4f7fb",
-          100: "#e8eef7",
-          400: "#64748b",
-          500: "#42536b",
-          700: "#17314f",
-          900: "#0a1f3d"
+        navy: {
+          50: '#f0f4f8',
+          100: '#d9e2ec',
+          200: '#bcccdc',
+          300: '#9fb3c8',
+          400: '#829ab1',
+          500: '#627d98',
+          600: '#486581',
+          700: '#334e68',
+          800: '#243b53',
+          900: '#102a43',
+          950: '#0a192f',
         },
-        tide: {
-          50: "#eef3f9",
-          100: "#d8e3f0",
-          300: "#8da8c5",
-          500: "#2b527f",
-          700: "#173355"
-        },
-        ember: {
-          300: "#f3bb7a",
-          500: "#dc7d2f",
-          700: "#9f5014"
+        gray: {
+          50: '#f8fafc',
+          100: '#f1f5f9',
+          200: '#e2e8f0',
+          300: '#cbd5e1',
+          400: '#94a3b8',
+          500: '#64748b',
+          600: '#475569',
+          700: '#334155',
+          800: '#1e293b',
+          900: '#0f172a',
         }
-      },
-      fontFamily: {
-        sans: ["IBM Plex Sans", "Source Sans 3", "Noto Sans", "sans-serif"],
-        mono: ["IBM Plex Mono", "Fira Code", "monospace"]
-      },
-      boxShadow: {
-        panel: "0 20px 48px rgba(10, 31, 61, 0.08)",
-        glow: "0 18px 42px rgba(23, 51, 85, 0.12)"
       }
-    }
+    },
   },
-  plugins: []
-};
+  plugins: [],
+}

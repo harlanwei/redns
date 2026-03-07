@@ -335,8 +335,8 @@ async fn run_server(
     config_path: Option<String>,
     working_dir: Option<String>,
 ) -> Result<(), redns_core::PluginError> {
-    if let Some(dir) = working_dir {
-        std::env::set_current_dir(&dir).map_err(|e| -> redns_core::PluginError {
+    if let Some(ref dir) = working_dir {
+        std::env::set_current_dir(dir).map_err(|e| -> redns_core::PluginError {
             format!("failed to change working directory to {}: {}", dir, e).into()
         })?;
         info!(path = %dir, "working directory changed");
@@ -671,10 +671,18 @@ async fn run_server(
         match bind_tcp_listener(dashboard_addr) {
             Ok(listener) => {
                 info!(addr = %dashboard_addr, "Dashboard HTTP server listening");
+                let static_dir = cfg.dashboard.static_dir.clone().unwrap_or_else(|| {
+                    if let Some(dir) = &working_dir {
+                        format!("{}/dashboard/dist", dir)
+                    } else {
+                        "dashboard/dist".to_string()
+                    }
+                });
                 let state = dashboard::DashboardState {
                     api_http: cfg.api.http.clone(),
                     upstreams: all_upstreams.clone(),
                     store: dashboard_store.clone(),
+                    static_dir,
                 };
                 let c = cancel.clone();
                 tokio::spawn(async move {

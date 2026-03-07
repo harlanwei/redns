@@ -13,9 +13,6 @@ use tracing::{info, warn};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
-const INDEX_HTML: &str = include_str!("../../../dashboard/dist/index.html");
-const DASHBOARD_CSS: &str = include_str!("../../../dashboard/dist/assets/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("../../../dashboard/dist/assets/dashboard.js");
 const DNS_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const DNS_LOG_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -448,7 +445,7 @@ impl DnsHandler for DashboardDnsHandler {
         let (rcode, result_summary, result_rows) = match &result {
             Ok(resp) => {
                 let rcode = resp.response_code();
-                let (summary, rows) = persisted_dns_result(resp);
+                let (summary, rows) = persisted_dns_result(resp, &qname);
                 (format!("{:?}", rcode), summary, rows)
             }
             Err(e) => (
@@ -492,6 +489,7 @@ pub struct DashboardState {
     pub api_http: Option<String>,
     pub upstreams: Arc<[Arc<UpstreamWrapper>]>,
     pub store: Arc<DashboardStore>,
+    pub static_dir: String,
 }
 
 pub async fn serve_dashboard(
@@ -541,37 +539,6 @@ async fn handle_dashboard_request(
     let query = parse_query_string(target);
 
     match (method, path) {
-        ("GET", "/")
-        | ("GET", "/upstreams")
-        | ("GET", "/logs")
-        | ("GET", "/clients")
-        | ("GET", "/index.html") => {
-            write_response(
-                &mut stream,
-                "200 OK",
-                "text/html; charset=utf-8",
-                INDEX_HTML.as_bytes(),
-            )
-            .await?;
-        }
-        ("GET", "/assets/dashboard.css") => {
-            write_response(
-                &mut stream,
-                "200 OK",
-                "text/css; charset=utf-8",
-                DASHBOARD_CSS.as_bytes(),
-            )
-            .await?;
-        }
-        ("GET", "/assets/dashboard.js") => {
-            write_response(
-                &mut stream,
-                "200 OK",
-                "text/javascript; charset=utf-8",
-                DASHBOARD_JS.as_bytes(),
-            )
-            .await?;
-        }
         ("GET", "/api/upstreams") => {
             let body = upstream_metrics_json(&state).await?;
             write_response(
@@ -613,6 +580,41 @@ async fn handle_dashboard_request(
                 &body,
             )
             .await?;
+        }
+        ("GET", _) => {
+            let mut file_path = PathBuf::from(&state.static_dir);
+            let mut rel_path = path.trim_start_matches('/');
+            if rel_path.is_empty() {
+                rel_path = "index.html";
+            }
+            file_path.push(rel_path);
+
+            let mut file_contents = vec![];
+            let content_type = mime_guess::from_path(&file_path).first_or_octet_stream().to_string();
+
+            match tokio::fs::File::open(&file_path).await {
+                Ok(mut file) => {
+                    file.read_to_end(&mut file_contents).await?;
+                    write_response(&mut stream, "200 OK", &content_type, &file_contents).await?;
+                }
+                Err(_) => {
+                    // SPA fallback: Serve index.html if file isn't found
+                    let mut index_path = PathBuf::from(&state.static_dir);
+                    index_path.push("index.html");
+                    if let Ok(mut file) = tokio::fs::File::open(&index_path).await {
+                        file.read_to_end(&mut file_contents).await?;
+                        write_response(&mut stream, "200 OK", "text/html; charset=utf-8", &file_contents).await?;
+                    } else {
+                        write_response(
+                            &mut stream,
+                            "404 Not Found",
+                            "application/json; charset=utf-8",
+                            b"{\"error\":\"not found\"}",
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
         _ => {
             write_response(
@@ -693,34 +695,40 @@ async fn write_response(
     Ok(())
 }
 
-fn summarize_dns_result(resp: &Message) -> (String, Vec<String>) {
+fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
     let answers = resp.answers();
     if answers.is_empty() {
         let row = format!("rcode={:?}, answers=0", resp.response_code());
-        return (row.clone(), vec![row]);
+        return (String::new(), vec![row]);
     }
 
     let mut rows = Vec::new();
     for answer in answers {
+        let ans_name = answer.name().to_ascii();
+        let name_disp = if ans_name.eq_ignore_ascii_case(qname) {
+            "@"
+        } else {
+            &ans_name
+        };
         rows.push(format!(
             "{} {:?} {}",
-            answer.name().to_ascii(),
+            name_disp,
             answer.record_type(),
             answer.data()
         ));
     }
 
-    let summary = rows.join(" | ");
-    (summary, rows)
+    // Return empty summary to save disk space, we will just rely on result_rows_json.
+    (String::new(), rows)
 }
 
-fn persisted_dns_result(resp: &Message) -> (String, Vec<String>) {
+fn persisted_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
     if resp.response_code() == ResponseCode::NXDomain
         || (resp.response_code() == ResponseCode::NoError && resp.answers().is_empty())
     {
         (String::new(), Vec::new())
     } else {
-        summarize_dns_result(resp)
+        summarize_dns_result(resp, qname)
     }
 }
 
@@ -929,21 +937,22 @@ mod tests {
 
     #[test]
     fn persisted_dns_result_elides_nxdomain_and_empty_noerror_only() {
+        let qname = "example.com.";
         let mut noerror = Message::new();
         noerror.set_response_code(ResponseCode::NoError);
-        let (summary, rows) = persisted_dns_result(&noerror);
+        let (summary, rows) = persisted_dns_result(&noerror, qname);
         assert!(summary.is_empty());
         assert!(rows.is_empty());
 
         let mut servfail = Message::new();
         servfail.set_response_code(ResponseCode::ServFail);
-        let (summary, rows) = persisted_dns_result(&servfail);
-        assert_eq!(summary, "rcode=ServFail, answers=0");
+        let (summary, rows) = persisted_dns_result(&servfail, qname);
+        assert_eq!(summary, ""); // We are no longer returning summary text
         assert_eq!(rows, vec!["rcode=ServFail, answers=0".to_string()]);
 
         let mut nxdomain = Message::new();
         nxdomain.set_response_code(ResponseCode::NXDomain);
-        let (summary, rows) = persisted_dns_result(&nxdomain);
+        let (summary, rows) = persisted_dns_result(&nxdomain, qname);
         assert!(summary.is_empty());
         assert!(rows.is_empty());
     }

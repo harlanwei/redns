@@ -1,5 +1,4 @@
 all:
-	npm i
-	npm run build
+	npm i && npm run build
 
 .PHONY: all

@@ -95,6 +95,9 @@ pub struct DashboardConfig {
     /// Optional SQLite path for dashboard data.
     #[serde(default)]
     pub sqlite: Option<String>,
+    /// Directory to serve static frontend files from. Defaults to "./dashboard/dist".
+    #[serde(default)]
+    pub static_dir: Option<String>,
 }
 
 // ── Sequence Rule Config ─────────────────────────────────────────
