@@ -1,5 +1,5 @@
 dashboard:
-	make -C dashboard
+	if [ ! -d dashboard/dist ]; then make -C dashboard; fi
 
 amd64-musl: dashboard
 	cargo build --release --target x86_64-unknown-linux-musl

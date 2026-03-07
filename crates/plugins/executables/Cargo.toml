@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 redns-core = { path = "../../core" }
-hickory-proto = "0.25"
+hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
 tracing = "0.1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["time", "sync", "rt"] }
