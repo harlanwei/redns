@@ -590,7 +590,9 @@ async fn handle_dashboard_request(
             file_path.push(rel_path);
 
             let mut file_contents = vec![];
-            let content_type = mime_guess::from_path(&file_path).first_or_octet_stream().to_string();
+            let content_type = mime_guess::from_path(&file_path)
+                .first_or_octet_stream()
+                .to_string();
 
             match tokio::fs::File::open(&file_path).await {
                 Ok(mut file) => {
@@ -603,7 +605,13 @@ async fn handle_dashboard_request(
                     index_path.push("index.html");
                     if let Ok(mut file) = tokio::fs::File::open(&index_path).await {
                         file.read_to_end(&mut file_contents).await?;
-                        write_response(&mut stream, "200 OK", "text/html; charset=utf-8", &file_contents).await?;
+                        write_response(
+                            &mut stream,
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            &file_contents,
+                        )
+                        .await?;
                     } else {
                         write_response(
                             &mut stream,

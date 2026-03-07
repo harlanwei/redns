@@ -6,7 +6,7 @@
 
 #[cfg(unix)]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
 
 mod dashboard;
 
