@@ -1,4 +1,4 @@
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use redns_core::{DnsHandler, PluginResult, QueryMeta, UpstreamMetrics, UpstreamWrapper};
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -9,13 +9,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const INDEX_HTML: &str = include_str!("../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str = include_str!("../../../dashboard/dist/assets/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../../../dashboard/dist/assets/dashboard.js");
+const DNS_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const DNS_LOG_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DnsLogEntry {
@@ -344,6 +346,56 @@ impl DashboardStore {
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
     }
+
+    pub async fn prune_expired_logs(&self) -> Result<u64, DynError> {
+        self.prune_expired_logs_at(SystemTime::now()).await
+    }
+
+    async fn prune_expired_logs_at(&self, now: SystemTime) -> Result<u64, DynError> {
+        let path = self.db_path.clone();
+        let cutoff_ms = dns_log_retention_cutoff_ms(now);
+        tokio::task::spawn_blocking(move || -> Result<u64, DynError> {
+            let conn = Self::open_connection(&path)?;
+            let deleted = conn.execute(
+                "DELETE FROM dns_logs WHERE ts_unix_ms < ?1",
+                params![cutoff_ms as i64],
+            )? as u64;
+            if deleted > 0 {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            }
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+}
+
+pub async fn run_log_retention(store: Arc<DashboardStore>, cancel: CancellationToken) {
+    match store.prune_expired_logs().await {
+        Ok(deleted) if deleted > 0 => {
+            info!(
+                deleted,
+                "pruned expired DNS log rows from dashboard sqlite store"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => warn!(error = %error, "failed to prune expired DNS log rows"),
+    }
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(DNS_LOG_PRUNE_INTERVAL) => {
+                match store.prune_expired_logs().await {
+                    Ok(deleted) if deleted > 0 => {
+                        info!(deleted, "pruned expired DNS log rows from dashboard sqlite store");
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "failed to prune expired DNS log rows"),
+                }
+            }
+        }
+    }
 }
 
 pub fn default_sqlite_path(config_file: &str) -> String {
@@ -395,8 +447,9 @@ impl DnsHandler for DashboardDnsHandler {
 
         let (rcode, result_summary, result_rows) = match &result {
             Ok(resp) => {
-                let (summary, rows) = summarize_dns_result(resp);
-                (format!("{:?}", resp.response_code()), summary, rows)
+                let rcode = resp.response_code();
+                let (summary, rows) = persisted_dns_result(resp);
+                (format!("{:?}", rcode), summary, rows)
             }
             Err(e) => (
                 "ERROR".to_string(),
@@ -661,6 +714,16 @@ fn summarize_dns_result(resp: &Message) -> (String, Vec<String>) {
     (summary, rows)
 }
 
+fn persisted_dns_result(resp: &Message) -> (String, Vec<String>) {
+    if resp.response_code() == ResponseCode::NXDomain
+        || (resp.response_code() == ResponseCode::NoError && resp.answers().is_empty())
+    {
+        (String::new(), Vec::new())
+    } else {
+        summarize_dns_result(resp)
+    }
+}
+
 fn latency_ms_ceil(elapsed: Duration) -> u64 {
     let micros = elapsed.as_micros();
     if micros == 0 {
@@ -768,6 +831,13 @@ fn ensure_sqlite_file_exists(path: &str) -> Result<(), DynError> {
     Ok(())
 }
 
+fn dns_log_retention_cutoff_ms(now: SystemTime) -> u64 {
+    now.checked_sub(DNS_LOG_RETENTION)
+        .and_then(|cutoff| cutoff.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 fn parse_json_string_vec(text: &str) -> Vec<String> {
     serde_json::from_str(text).unwrap_or_default()
 }
@@ -781,4 +851,100 @@ fn dedupe_keep_order(items: Vec<String>) -> Vec<String> {
         }
     }
     deduped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("redns-{name}-{}-{unique}.db", std::process::id()))
+    }
+
+    fn sample_entry(ts_unix_ms: u64, qname: &str) -> NewDnsLogEntry {
+        NewDnsLogEntry {
+            ts_unix_ms,
+            client_ip: "127.0.0.1".to_string(),
+            protocol: "udp".to_string(),
+            qname: qname.to_string(),
+            qtype: "A".to_string(),
+            rcode: "NOERROR".to_string(),
+            upstreams_json: "[\"upstream-a\"]".to_string(),
+            result: "ok".to_string(),
+            result_rows_json: "[]".to_string(),
+            latency_ms: 12,
+        }
+    }
+
+    fn cleanup_db(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn prune_expired_logs_removes_rows_older_than_24_hours() {
+        let path = temp_db_path("retention");
+        let path_str = path.to_string_lossy().into_owned();
+        let store = DashboardStore::new(path_str.clone()).expect("create dashboard store");
+
+        let now_ms = 3 * DNS_LOG_RETENTION.as_millis() as u64;
+        let cutoff_ms = now_ms - DNS_LOG_RETENTION.as_millis() as u64;
+
+        store
+            .record(sample_entry(cutoff_ms - 1, "old.example"))
+            .await
+            .expect("insert old row");
+        store
+            .record(sample_entry(cutoff_ms, "boundary.example"))
+            .await
+            .expect("insert boundary row");
+        store
+            .record(sample_entry(cutoff_ms + 1, "new.example"))
+            .await
+            .expect("insert new row");
+
+        let deleted = store
+            .prune_expired_logs_at(UNIX_EPOCH + Duration::from_millis(now_ms))
+            .await
+            .expect("prune logs");
+
+        assert_eq!(deleted, 1);
+
+        let logs = store
+            .fetch_logs(LogsQuery::default())
+            .await
+            .expect("fetch logs");
+        let qnames: Vec<_> = logs.items.into_iter().map(|item| item.qname).collect();
+        assert_eq!(qnames.len(), 2);
+        assert!(qnames.iter().any(|qname| qname == "boundary.example"));
+        assert!(qnames.iter().any(|qname| qname == "new.example"));
+
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn persisted_dns_result_elides_nxdomain_and_empty_noerror_only() {
+        let mut noerror = Message::new();
+        noerror.set_response_code(ResponseCode::NoError);
+        let (summary, rows) = persisted_dns_result(&noerror);
+        assert!(summary.is_empty());
+        assert!(rows.is_empty());
+
+        let mut servfail = Message::new();
+        servfail.set_response_code(ResponseCode::ServFail);
+        let (summary, rows) = persisted_dns_result(&servfail);
+        assert_eq!(summary, "rcode=ServFail, answers=0");
+        assert_eq!(rows, vec!["rcode=ServFail, answers=0".to_string()]);
+
+        let mut nxdomain = Message::new();
+        nxdomain.set_response_code(ResponseCode::NXDomain);
+        let (summary, rows) = persisted_dns_result(&nxdomain);
+        assert!(summary.is_empty());
+        assert!(rows.is_empty());
+    }
 }

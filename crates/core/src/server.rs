@@ -104,7 +104,8 @@ impl DnsHandler for EntryHandler {
         } else {
             None
         };
-        let served_from_cache = result.is_ok() && ctx.response().is_some() && ctx.has_mark(MARK_CACHE_HIT);
+        let served_from_cache =
+            result.is_ok() && ctx.response().is_some() && ctx.has_mark(MARK_CACHE_HIT);
 
         let mut resp = match result {
             Ok(()) => ctx

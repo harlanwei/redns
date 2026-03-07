@@ -323,6 +323,7 @@ impl Forward {
             let uw = Arc::new(UpstreamWrapper::new(
                 upstream::new_upstream(&ucfg.addr, opts)?,
                 upstream_name,
+                upstream::upstream_protocol_label(&ucfg.addr).to_string(),
             ));
             upstreams.push(uw);
 
@@ -374,7 +375,10 @@ impl Forward {
         &self.upstreams
     }
 
-    async fn resolve_once(&self, query_bytes: Arc<[u8]>) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
+    async fn resolve_once(
+        &self,
+        query_bytes: Arc<[u8]>,
+    ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let selected_indices = self.selector.select(self.concurrent);
         let selected: Vec<Arc<UpstreamWrapper>> = selected_indices
             .iter()
@@ -474,13 +478,15 @@ impl Forward {
         Err("forward: no upstream response".into())
     }
 
-    async fn resolve_with_cname_chase(&self, query: &Message) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
-        let question = query
-            .queries()
-            .first()
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+    async fn resolve_with_cname_chase(
+        &self,
+        query: &Message,
+    ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
+        let question = query.queries().first().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
                 "forward: query has no question".into()
-            })?;
+            },
+        )?;
         let original_name = question.name().clone();
         let qtype = question.query_type();
 
@@ -538,7 +544,10 @@ impl Forward {
                 if carried_cnames.is_empty() {
                     return Ok((resp, upstream));
                 }
-                return Ok((merge_cname_chain(resp, &original_name, &carried_cnames), upstream));
+                return Ok((
+                    merge_cname_chain(resp, &original_name, &carried_cnames),
+                    upstream,
+                ));
             }
 
             let carried_before = carried_cnames.len();
@@ -555,14 +564,17 @@ impl Forward {
             }
 
             if depth >= MAX_CNAME_FOLLOW {
-                return Err(format!("forward: cname chase depth exceeded {}", MAX_CNAME_FOLLOW).into());
+                return Err(
+                    format!("forward: cname chase depth exceeded {}", MAX_CNAME_FOLLOW).into(),
+                );
             }
 
             if !visited_names.insert(final_target.clone()) {
-                return Err(
-                    format!("forward: cname loop detected while chasing '{}'", final_target.to_ascii())
-                        .into(),
-                );
+                return Err(format!(
+                    "forward: cname loop detected while chasing '{}'",
+                    final_target.to_ascii()
+                )
+                .into());
             }
 
             let q = chase_query.queries_mut().first_mut().ok_or_else(
@@ -610,18 +622,20 @@ mod tests {
     impl Upstream for FnUpstream {
         async fn exchange(&self, q: &[u8]) -> PluginResult<Vec<u8>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let req = Message::from_vec(q).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("failed to decode query in test upstream: {e}").into()
-            })?;
+            let req =
+                Message::from_vec(q).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("failed to decode query in test upstream: {e}").into()
+                })?;
             let resp = (self.handler)(&req)?;
-            resp.to_vec().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("failed to encode response in test upstream: {e}").into()
-            })
+            resp.to_vec()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("failed to encode response in test upstream: {e}").into()
+                })
         }
     }
 
     fn make_forward_with_upstream(upstream: Box<dyn Upstream>) -> Forward {
-        let wrapped = Arc::new(UpstreamWrapper::new(upstream, "mock".into()));
+        let wrapped = Arc::new(UpstreamWrapper::new(upstream, "mock".into(), "UDP".into()));
         let upstreams = vec![wrapped];
         Forward {
             name: "test-forward".into(),
@@ -639,7 +653,8 @@ mod tests {
             .set_op_code(OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
-            q.set_name(Name::from_ascii(name).unwrap()).set_query_type(qtype);
+            q.set_name(Name::from_ascii(name).unwrap())
+                .set_query_type(qtype);
             q
         });
         msg
@@ -746,8 +761,16 @@ mod tests {
             }
         }
 
-        let u1 = Arc::new(UpstreamWrapper::new(Box::new(MockUpstream), "u1".into()));
-        let u2 = Arc::new(UpstreamWrapper::new(Box::new(MockUpstream), "u2".into()));
+        let u1 = Arc::new(UpstreamWrapper::new(
+            Box::new(MockUpstream),
+            "u1".into(),
+            "UDP".into(),
+        ));
+        let u2 = Arc::new(UpstreamWrapper::new(
+            Box::new(MockUpstream),
+            "u2".into(),
+            "TCP".into(),
+        ));
         let selector = UpstreamSelector::new(vec![u1, u2]);
         let selected = selector.select(5);
         assert_eq!(selected.len(), 2);
@@ -782,12 +805,9 @@ mod tests {
         let upstream = FnUpstream {
             calls: calls_for_upstream,
             handler: Arc::new(|req: &Message| {
-                let q = req
-                    .queries()
-                    .first()
-                    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                        "missing question".into()
-                    })?;
+                let q = req.queries().first().ok_or_else(
+                    || -> Box<dyn std::error::Error + Send + Sync> { "missing question".into() },
+                )?;
                 let qname = q.name().to_ascii();
                 if qname == "alias.com." {
                     return Ok(response_with_answers(
@@ -941,7 +961,10 @@ mod tests {
 
         let forward = make_forward_with_upstream(Box::new(upstream));
         let mut ctx = Context::new(make_query("alias.com.", RecordType::A));
-        let err = forward.exec(&mut ctx).await.expect_err("expected cname loop error");
+        let err = forward
+            .exec(&mut ctx)
+            .await
+            .expect_err("expected cname loop error");
         assert!(err.to_string().contains("cname loop"));
     }
 }

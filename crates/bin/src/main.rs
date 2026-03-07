@@ -539,6 +539,13 @@ async fn run_server(
         .unwrap_or_else(|| dashboard::default_sqlite_path(&file_used));
     info!(path = %sqlite_path, "dashboard sqlite path selected");
     let dashboard_store = Arc::new(dashboard::DashboardStore::new(sqlite_path)?);
+    {
+        let store = dashboard_store.clone();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            dashboard::run_log_retention(store, c).await;
+        });
+    }
 
     for srv in &servers {
         if srv.entry.is_empty() {

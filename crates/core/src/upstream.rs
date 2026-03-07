@@ -1057,6 +1057,7 @@ impl Upstream for Doh3Upstream {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UpstreamMetrics {
     pub name: String,
+    pub protocol: String,
     pub query_total: u64,
     pub completed_total: u64,
     pub inflight_total: u64,
@@ -1072,6 +1073,7 @@ pub struct UpstreamMetrics {
 pub struct UpstreamWrapper {
     inner: Box<dyn Upstream>,
     name: String,
+    protocol: String,
     ema_latency_ms: AtomicI64,
     query_count: AtomicU64,
     inflight_count: AtomicU64,
@@ -1087,10 +1089,11 @@ impl UpstreamWrapper {
     /// EMA smoothing factor.
     const ALPHA: f64 = 0.3;
 
-    pub fn new(inner: Box<dyn Upstream>, name: String) -> Self {
+    pub fn new(inner: Box<dyn Upstream>, name: String, protocol: String) -> Self {
         Self {
             inner,
             name,
+            protocol,
             ema_latency_ms: AtomicI64::new(0),
             query_count: AtomicU64::new(0),
             inflight_count: AtomicU64::new(0),
@@ -1105,6 +1108,9 @@ impl UpstreamWrapper {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+    pub fn protocol(&self) -> &str {
+        &self.protocol
     }
     pub fn ema_latency(&self) -> i64 {
         self.ema_latency_ms.load(Ordering::Relaxed)
@@ -1153,6 +1159,7 @@ impl UpstreamWrapper {
         let latency_sum = self.latency_sum_us.load(Ordering::Relaxed);
         UpstreamMetrics {
             name: self.name.clone(),
+            protocol: self.protocol.clone(),
             query_total,
             completed_total,
             inflight_total,
@@ -1645,11 +1652,33 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
     }
 }
 
+pub fn upstream_protocol_label(addr: &str) -> &'static str {
+    if addr.strip_prefix("udp://").is_some() {
+        "UDP"
+    } else if addr.strip_prefix("tcp://").is_some() {
+        "TCP"
+    } else if addr.strip_prefix("tls://").is_some() {
+        "DoT"
+    } else if addr.starts_with("https://") {
+        "DoH"
+    } else if addr.strip_prefix("quic://").is_some() {
+        "DoQ"
+    } else if addr.strip_prefix("h3://").is_some() {
+        "DoH3"
+    } else {
+        "UDP"
+    }
+}
+
 /// Creates an `UpstreamWrapper` from an address string.
 pub fn new_wrapped_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<UpstreamWrapper> {
     let inner = new_upstream(addr, opts)?;
     let name = addr.to_string();
-    Ok(UpstreamWrapper::new(inner, name))
+    Ok(UpstreamWrapper::new(
+        inner,
+        name,
+        upstream_protocol_label(addr).to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -1672,6 +1701,26 @@ mod tests {
     fn parse_bare_addr_defaults_udp() {
         let u = new_upstream("8.8.8.8:53", UpstreamOpts::default());
         assert!(u.is_ok());
+    }
+
+    #[test]
+    fn upstream_protocol_labels_match_supported_transports() {
+        assert_eq!(upstream_protocol_label("udp://8.8.8.8:53"), "UDP");
+        assert_eq!(upstream_protocol_label("tcp://8.8.8.8:53"), "TCP");
+        assert_eq!(upstream_protocol_label("tls://1.1.1.1:853"), "DoT");
+        assert_eq!(
+            upstream_protocol_label("https://dns.google/dns-query"),
+            "DoH"
+        );
+        assert_eq!(
+            upstream_protocol_label("quic://dns.adguard-dns.com:853"),
+            "DoQ"
+        );
+        assert_eq!(
+            upstream_protocol_label("h3://dns.example/dns-query"),
+            "DoH3"
+        );
+        assert_eq!(upstream_protocol_label("8.8.8.8:53"), "UDP");
     }
 
     #[test]

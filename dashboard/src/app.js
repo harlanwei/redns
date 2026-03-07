@@ -7,6 +7,24 @@ const PAGE_BY_PATH = {
 
 const POLL_MS = 4000;
 
+const UPSTREAM_SORT_DEFAULT_DIR = {
+  name: "asc",
+  protocol: "asc",
+  query_total: "desc",
+  completed_total: "desc",
+  error_total: "desc",
+  final_selected_total: "desc",
+  avg_latency_ms: "asc",
+};
+
+const UPSTREAM_NUMERIC_KEYS = new Set([
+  "query_total",
+  "completed_total",
+  "error_total",
+  "final_selected_total",
+  "avg_latency_ms",
+]);
+
 function esc(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -29,6 +47,51 @@ function fmtPercent(value) {
   return Number(value || 0).toFixed(2);
 }
 
+function fmtTransport(value) {
+  const normalized = String(value || "").toLowerCase();
+  if (normalized === "udp") {
+    return "UDP";
+  }
+  if (normalized === "tcp") {
+    return "TCP";
+  }
+  if (normalized === "doh") {
+    return "DoH";
+  }
+  if (normalized === "dot") {
+    return "DoT";
+  }
+  if (normalized === "doq") {
+    return "DoQ";
+  }
+  if (normalized === "doh3" || normalized === "h3") {
+    return "DoH3";
+  }
+  return value || "-";
+}
+
+function upstreamDefaultSortDir(key) {
+  return UPSTREAM_SORT_DEFAULT_DIR[key] || "desc";
+}
+
+function fmtCountWithPercent(value, total) {
+  const count = Number(value || 0);
+  const queryTotal = Number(total || 0);
+  const percentage = queryTotal > 0 ? (count / queryTotal) * 100 : 0;
+  return `${fmtNum(count)} <span class="table-metric-share">(${fmtPercent(percentage)}%)</span>`;
+}
+
+function upstreamLatencyValue(row) {
+  return Number(row?.final_selected_total || 0) > 0
+    ? Number(row?.avg_latency_ms || 0)
+    : Number.POSITIVE_INFINITY;
+}
+
+function fmtUpstreamLatency(row) {
+  const latency = upstreamLatencyValue(row);
+  return Number.isFinite(latency) ? latency.toFixed(2) : "&infin;";
+}
+
 function upstreamDisplay(upstreams, rcode) {
   if (Array.isArray(upstreams) && upstreams.length) {
     return upstreams.join(", ");
@@ -36,8 +99,9 @@ function upstreamDisplay(upstreams, rcode) {
   return "-";
 }
 
-function isRefusedRcode(rcode) {
-  return String(rcode || "").toLowerCase() === "refused";
+function isNonInteractiveLogRcode(rcode) {
+  const value = String(rcode || "").toLowerCase();
+  return value === "refused" || value === "nxdomain";
 }
 
 function parseLogAnswerRow(rowText) {
@@ -94,6 +158,14 @@ class RednsDashboard extends HTMLElement {
   constructor() {
     super();
     this.page = PAGE_BY_PATH[window.location.pathname] || "upstreams";
+    this.shouldAnimatePage = true;
+    try {
+      const lastPath = window.sessionStorage.getItem("redns-dashboard-last-path");
+      this.shouldAnimatePage = !lastPath || lastPath !== window.location.pathname;
+      window.sessionStorage.setItem("redns-dashboard-last-path", window.location.pathname);
+    } catch {
+      this.shouldAnimatePage = true;
+    }
     this.state = {
       loading: true,
       statusText: "Connecting...",
@@ -152,13 +224,7 @@ class RednsDashboard extends HTMLElement {
       if (!(target instanceof HTMLElement)) {
         return;
       }
-      if (target.matches("[data-upstream-sort-key]")) {
-        this.state.upstreamSortKey = target.value;
-        this.refresh(false);
-      } else if (target.matches("[data-upstream-sort-dir]")) {
-        this.state.upstreamSortDir = target.value;
-        this.refresh(false);
-      } else if (target.matches("[data-client-sort-key]")) {
+      if (target.matches("[data-client-sort-key]")) {
         this.state.clientSortKey = target.value;
         this.refresh(false);
       } else if (target.matches("[data-log-page-size]")) {
@@ -205,6 +271,13 @@ class RednsDashboard extends HTMLElement {
         if (window.confirm("Clear all DNS logs and statistics from the database?")) {
           this.clearLogs();
         }
+        return;
+      }
+
+      const sortButton = target.closest("[data-upstream-sort]");
+      if (sortButton) {
+        const key = sortButton.getAttribute("data-upstream-sort") || "query_total";
+        this.toggleUpstreamSort(key);
         return;
       }
 
@@ -304,13 +377,16 @@ class RednsDashboard extends HTMLElement {
     const modal = this.renderLogModal();
 
     this.innerHTML = `
-      <main class="mx-auto w-full max-w-[1600px] px-6 pb-10 pt-8 sm:px-8 lg:px-12 lg:pt-10">
-        ${header}
-        ${summary}
-        ${body}
-      </main>
+      <div class="dashboard-shell">
+        <main class="dashboard-main ${this.shouldAnimatePage ? "dashboard-main-animate" : ""} mx-auto w-full max-w-[1600px] px-6 pb-10 pt-8 sm:px-8 lg:px-12 lg:pt-10">
+          ${header}
+          ${summary}
+          ${body}
+        </main>
+      </div>
       ${modal}
     `;
+    this.shouldAnimatePage = false;
   }
 
   renderHeader() {
@@ -326,22 +402,8 @@ class RednsDashboard extends HTMLElement {
       .join("");
 
     return `
-      <section class="hero-panel">
-        <div class="space-y-3">
-          <p class="inline-flex w-fit items-center rounded-full border border-tide-100 bg-tide-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-tide-700">DNS operations console</p>
-          <h1 class="text-3xl font-semibold tracking-tight text-ink-900 sm:text-4xl">redns Dashboard</h1>
-          <p class="max-w-4xl text-sm leading-6 text-ink-500 sm:text-base">Lightweight monitoring for upstream activity, paginated DNS logs, and SQLite-backed traffic statistics.</p>
-          <nav class="flex flex-wrap gap-2">${nav}</nav>
-        </div>
-        <div class="status-panel">
-          <div class="flex items-start gap-3">
-            <span class="status-dot"></span>
-            <div>
-              <p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-tide-700">Status</p>
-              <p class="mt-1 text-sm text-ink-500">${esc(this.state.statusText)}</p>
-            </div>
-          </div>
-        </div>
+      <section class="dashboard-nav-wrap">
+        <nav class="dashboard-nav" aria-label="Dashboard sections">${nav}</nav>
       </section>
     `;
   }
@@ -352,17 +414,17 @@ class RednsDashboard extends HTMLElement {
       .map(
         (card) => `
           <article class="stat-card">
-            <p class="text-xs font-semibold uppercase tracking-[0.14em] text-ink-400">${esc(card.label)}</p>
+            <p class="stat-label">${esc(card.label)}</p>
             <div class="mt-2 flex items-end justify-between gap-4">
-              <p class="text-2xl font-semibold text-ink-900 sm:text-3xl">${esc(card.value)}</p>
-              <p class="text-right text-xs leading-5 text-ink-400">${esc(card.caption || "")}</p>
+              <p class="stat-value">${esc(card.value)}</p>
+              <p class="stat-caption">${esc(card.caption || "")}</p>
             </div>
           </article>
         `,
       )
       .join("");
 
-    return `<section class="mb-4 grid w-full gap-3 md:grid-cols-2 xl:grid-cols-4">${html}</section>`;
+    return `<section class="summary-grid grid w-full md:grid-cols-2 xl:grid-cols-4">${html}</section>`;
   }
 
   summaryCardsForPage() {
@@ -441,40 +503,72 @@ class RednsDashboard extends HTMLElement {
     const key = this.state.upstreamSortKey;
     const desc = this.state.upstreamSortDir === "desc";
     rows.sort((a, b) => {
-      const av = a[key];
-      const bv = b[key];
       let diff;
-      if (typeof av === "number" && typeof bv === "number") {
-        diff = av - bv;
+      if (UPSTREAM_NUMERIC_KEYS.has(key)) {
+        diff = key === "avg_latency_ms"
+          ? upstreamLatencyValue(a) - upstreamLatencyValue(b)
+          : Number(a[key] || 0) - Number(b[key] || 0);
       } else {
-        diff = String(av || "").localeCompare(String(bv || ""));
+        diff = String(a[key] || "").localeCompare(String(b[key] || ""), undefined, {
+          numeric: true,
+          sensitivity: "base",
+        });
       }
       return desc ? -diff : diff;
     });
     return rows;
   }
 
+  toggleUpstreamSort(key) {
+    if (this.state.upstreamSortKey === key) {
+      this.state.upstreamSortDir = this.state.upstreamSortDir === "desc" ? "asc" : "desc";
+    } else {
+      this.state.upstreamSortKey = key;
+      this.state.upstreamSortDir = upstreamDefaultSortDir(key);
+    }
+    this.render();
+  }
+
+  renderUpstreamSortHeader(column) {
+    const active = this.state.upstreamSortKey === column.key;
+    const direction = active ? this.state.upstreamSortDir : upstreamDefaultSortDir(column.key);
+    const arrow = direction === "desc" ? "&darr;" : "&uarr;";
+    const ariaSort = active
+      ? this.state.upstreamSortDir === "desc"
+        ? "descending"
+        : "ascending"
+      : "none";
+
+    return `
+      <th class="${column.width}" aria-sort="${ariaSort}">
+        <button
+          type="button"
+          class="sort-header ${active ? "sort-header-active" : ""}"
+          data-upstream-sort="${esc(column.key)}"
+          aria-label="Sort by ${esc(column.label)}"
+        >
+          <span>${esc(column.label)}</span>
+          <span class="sort-indicator ${active ? "sort-indicator-active" : ""}" aria-hidden="true">${arrow}</span>
+        </button>
+      </th>
+    `;
+  }
+
   renderUpstreams() {
     const rows = this.sortedUpstreams();
-      const controlBar = `
-      <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    const columns = [
+      { key: "name", label: "Upstream", width: "w-[24%]" },
+      { key: "protocol", label: "Protocol", width: "w-[12%]" },
+      { key: "query_total", label: "Queries", width: "w-[10%]" },
+      { key: "completed_total", label: "Completed", width: "w-[16%]" },
+      { key: "error_total", label: "Errors", width: "w-[14%]" },
+      { key: "final_selected_total", label: "Selected", width: "w-[14%]" },
+      { key: "avg_latency_ms", label: "Avg Latency (ms)", width: "w-[10%]" },
+    ];
+    const controlBar = `
+      <div class="section-head mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 class="text-xl font-semibold text-ink-900">Upstream Metrics</h2>
-          <p class="mt-1 text-sm text-ink-500">Live metrics mirrored from the API endpoint, with local sorting in the static client.</p>
-        </div>
-        <div class="flex flex-col gap-2 sm:flex-row">
-          <select class="control" data-upstream-sort-key>
-            ${this.selectOptions(this.state.upstreamSortKey, [
-              ["query_total", "Sort by queries"],
-              ["avg_latency_ms", "Sort by avg latency"],
-              ["error_total", "Sort by errors"],
-              ["final_selected_total", "Sort by selected"],
-              ["name", "Sort by upstream name"],
-            ])}
-          </select>
-          <select class="control" data-upstream-sort-dir>
-            ${this.selectOptions(this.state.upstreamSortDir, [["desc", "Descending"], ["asc", "Ascending"]])}
-          </select>
+          <h2 class="section-title">Upstream Metrics</h2>
         </div>
       </div>
     `;
@@ -488,32 +582,26 @@ class RednsDashboard extends HTMLElement {
         (row) => `
           <tr>
             <td class="truncate-cell font-mono text-xs sm:text-sm">${esc(row.name || "-")}</td>
+            <td>${esc(row.protocol || "-")}</td>
             <td>${fmtNum(row.query_total)}</td>
-            <td>${fmtNum(row.completed_total)}</td>
-            <td>${fmtNum(row.inflight_total)}</td>
-            <td>${fmtNum(row.error_total)}</td>
-            <td>${fmtNum(row.final_selected_total)}</td>
-            <td>${Number(row.avg_latency_ms || 0).toFixed(2)}</td>
+            <td>${fmtCountWithPercent(row.completed_total, row.query_total)}</td>
+            <td>${fmtCountWithPercent(row.error_total, row.query_total)}</td>
+            <td>${fmtCountWithPercent(row.final_selected_total, row.query_total)}</td>
+            <td>${fmtUpstreamLatency(row)}</td>
           </tr>
         `,
       )
       .join("");
 
+    const headerCells = columns.map((column) => this.renderUpstreamSortHeader(column)).join("");
+
     return `
-      <section class="glass-panel w-full p-4">
+      <section class="glass-panel dashboard-panel w-full p-4 sm:p-5">
         ${controlBar}
         <div class="table-shell">
           <table class="table-base">
             <thead>
-              <tr>
-                <th class="w-[32%]">Upstream</th>
-                <th class="w-[13%]">Queries</th>
-                <th class="w-[13%]">Completed</th>
-                <th class="w-[13%]">Inflight</th>
-                <th class="w-[13%]">Errors</th>
-                <th class="w-[16%]">Selected</th>
-                <th class="w-[13%]">Avg Latency (ms)</th>
-              </tr>
+              <tr>${headerCells}</tr>
             </thead>
             <tbody>${tableRows}</tbody>
           </table>
@@ -525,10 +613,9 @@ class RednsDashboard extends HTMLElement {
   renderLogs() {
     const logs = this.state.logs;
     const header = `
-      <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+      <div class="section-head mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <h2 class="text-xl font-semibold text-ink-900">DNS Logs</h2>
-          <p class="mt-1 text-sm text-ink-500">Rows are fully fitted inside the table. Click non-REFUSED rows to view formatted answer records in a modal.</p>
+          <h2 class="section-title">DNS Logs</h2>
         </div>
         <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
           <input class="control min-w-[18rem]" data-log-filter type="search" value="${esc(logs.filter)}" placeholder="Search qname, client, rcode, upstream" />
@@ -542,7 +629,7 @@ class RednsDashboard extends HTMLElement {
 
     if (!logs.items.length && !this.state.loading) {
       return `
-        <section class="glass-panel w-full p-4">
+        <section class="glass-panel dashboard-panel w-full p-4 sm:p-5">
           ${header}
           ${this.emptyState(
             logs.filter
@@ -556,17 +643,17 @@ class RednsDashboard extends HTMLElement {
     const rows = logs.items
       .map((row) => {
         const upstreams = upstreamDisplay(row.upstreams, row.rcode);
-        const refused = isRefusedRcode(row.rcode);
-        const rowClass = refused ? "log-row-disabled" : "log-row";
-        const rowAttr = refused ? "" : ` data-log-id="${row.id}"`;
+        const disabled = isNonInteractiveLogRcode(row.rcode);
+        const rowClass = disabled ? "log-row-disabled" : "log-row";
+        const rowAttr = disabled ? "" : ` data-log-id="${row.id}"`;
         return `
           <tr class="${rowClass}"${rowAttr}>
             <td class="log-col-time truncate-cell">${esc(fmtTime(row.ts_unix_ms))}</td>
             <td class="log-col-client truncate-cell font-mono text-xs sm:text-sm">${esc(row.client_ip || "-")}</td>
-            <td class="log-col-protocol truncate-cell">${esc(row.protocol || "-")}</td>
+            <td class="log-col-protocol truncate-cell">${esc(fmtTransport(row.protocol))}</td>
             <td class="log-col-qname truncate-cell font-mono text-xs sm:text-sm">${esc(row.qname || "-")}</td>
-            <td class="log-col-qtype truncate-cell">${esc(row.qtype || "-")}</td>
-            <td class="log-col-rcode"><span class="${badgeForRcode(row.rcode)}">${esc(row.rcode || "-")}</span></td>
+            <td class="log-col-qtype truncate-cell"><span class="query-chip">${esc(row.qtype || "-")}</span></td>
+            <td class="log-col-rcode"><span class="badge ${badgeForRcode(row.rcode)}">${esc(row.rcode || "-")}</span></td>
             <td class="log-col-upstreams truncate-cell font-mono text-xs sm:text-sm">${esc(upstreams)}</td>
             <td class="log-col-latency">${fmtNum(row.latency_ms)}</td>
           </tr>
@@ -578,9 +665,9 @@ class RednsDashboard extends HTMLElement {
     const endIndex = Math.min(logs.page * logs.pageSize, logs.totalItems);
 
     return `
-      <section class="glass-panel w-full p-4">
+      <section class="glass-panel dashboard-panel w-full p-4 sm:p-5">
         ${header}
-        <div class="mb-3 flex flex-col gap-2 text-sm text-ink-500 sm:flex-row sm:items-center sm:justify-between">
+        <div class="section-meta mb-3 flex flex-col gap-2 text-sm text-ink-500 sm:flex-row sm:items-center sm:justify-between">
           <p>Showing <span class="font-semibold text-ink-900">${fmtNum(startIndex)}</span> to <span class="font-semibold text-ink-900">${fmtNum(endIndex)}</span> of <span class="font-semibold text-ink-900">${fmtNum(logs.totalItems)}</span> matching queries.</p>
           <p>Page <span class="font-semibold text-ink-900">${fmtNum(logs.page)}</span> of <span class="font-semibold text-ink-900">${fmtNum(logs.totalPages)}</span></p>
         </div>
@@ -617,6 +704,7 @@ class RednsDashboard extends HTMLElement {
     }
 
     const rows = Array.isArray(log.result_rows) ? log.result_rows : [];
+    const emptyNoError = String(log.rcode || "").toLowerCase() === "noerror" && rows.length === 0;
     const rendered = rows.length
       ? rows
           .map(
@@ -633,7 +721,7 @@ class RednsDashboard extends HTMLElement {
           .join("")
       : `
           <tr>
-            <td colspan="2" class="text-ink-400">No answer rows captured for this query.</td>
+            <td colspan="2" class="text-ink-400">${emptyNoError ? "Empty" : "No answer rows captured for this query."}</td>
           </tr>
         `;
 
@@ -642,15 +730,18 @@ class RednsDashboard extends HTMLElement {
         <div class="modal-card" data-modal-card>
           <div class="flex items-center justify-between border-b border-slate-200 px-5 py-4">
             <div>
-              <h3 class="text-lg font-semibold text-ink-900">Query Result Details</h3>
-              <p class="mt-1 text-sm text-ink-500">${esc(log.qname || "-")} (${esc(log.qtype || "-")})</p>
+              <h3 class="modal-title">Query Result Details</h3>
+              <div class="mt-1 flex flex-wrap items-center gap-2 text-sm text-ink-500">
+                <span class="font-mono">${esc(log.qname || "-")}</span>
+                <span class="query-chip">${esc(log.qtype || "-")}</span>
+              </div>
             </div>
             <button class="pagination-button" data-close-modal>Close</button>
           </div>
           <div class="space-y-3 px-5 py-4 text-sm text-ink-500">
             <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
               <div><span class="font-semibold text-ink-700">Client:</span> ${esc(log.client_ip || "-")}</div>
-              <div><span class="font-semibold text-ink-700">Protocol:</span> ${esc(log.protocol || "-")}</div>
+              <div><span class="font-semibold text-ink-700">Protocol:</span> ${esc(fmtTransport(log.protocol))}</div>
               <div><span class="font-semibold text-ink-700">RCode:</span> ${esc(log.rcode || "-")}</div>
               <div><span class="font-semibold text-ink-700">Latency:</span> ${fmtNum(log.latency_ms)} ms</div>
             </div>
@@ -687,10 +778,9 @@ class RednsDashboard extends HTMLElement {
     });
 
     const header = `
-      <div class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div class="section-head mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 class="text-xl font-semibold text-ink-900">Client Statistics</h2>
-          <p class="mt-1 text-sm text-ink-500">Source-IP aggregates computed directly from the SQLite log store.</p>
+          <h2 class="section-title">Client Statistics</h2>
         </div>
         <select class="control" data-client-sort-key>
           ${this.selectOptions(this.state.clientSortKey, [["query_total", "Sort by query total"], ["ip", "Sort by IP address"]])}
@@ -700,7 +790,7 @@ class RednsDashboard extends HTMLElement {
 
     if (!items.length && !this.state.loading) {
       return `
-        <section class="glass-panel w-full p-4">
+        <section class="glass-panel dashboard-panel w-full p-4 sm:p-5">
           ${header}
           ${this.emptyState("No client statistics yet.")}
         </section>
@@ -729,7 +819,7 @@ class RednsDashboard extends HTMLElement {
       .join("");
 
     return `
-      <section class="glass-panel w-full p-4">
+      <section class="glass-panel dashboard-panel w-full p-4 sm:p-5">
         ${header}
         <div class="table-shell">
           <table class="table-base">
@@ -761,7 +851,7 @@ class RednsDashboard extends HTMLElement {
     }
 
     return `
-      <div class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div class="pagination-wrap mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div class="flex flex-wrap items-center gap-2">
           <button class="pagination-button" data-log-page="1" ${page <= 1 ? "disabled" : ""}>First</button>
           <button class="pagination-button" data-log-page="${prev}" ${page <= 1 ? "disabled" : ""}>Previous</button>
@@ -784,7 +874,7 @@ class RednsDashboard extends HTMLElement {
 
   emptyState(message) {
     return `
-      <div class="table-shell px-6 py-16 text-center text-sm text-ink-500">
+      <div class="empty-state table-shell px-6 py-16 text-center text-sm text-ink-500">
         <p class="text-base font-medium text-ink-900">${esc(message)}</p>
       </div>
     `;
