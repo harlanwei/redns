@@ -383,6 +383,7 @@
                   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
                   <tr 
                     class="hover:bg-navy-50/50 transition-colors group {item.rcode.toLowerCase() === 'noerror' ? 'cursor-pointer' : ''}"
+                    in:fade={{ duration: 360 }}
                     onclick={() => { if (item.rcode.toLowerCase() === 'noerror') selectedLog = item; }}
                   >
                     <td class="w-[15%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-gray-500 truncate" title={new Date(item.ts_unix_ms).toLocaleString()}>
