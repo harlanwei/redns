@@ -300,13 +300,13 @@
 
 {#if selectedLog}
   <div class="fixed inset-0 z-50 overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true" transition:fade={{ duration: 150 }}>
-    <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+    <div class="flex items-end justify-center min-h-screen pt-4 px-2 pb-4 text-left sm:block sm:p-0 sm:text-center">
       <div class="fixed inset-0 bg-gray-900 bg-opacity-50 transition-opacity backdrop-blur-sm" aria-hidden="true" onclick={() => (selectedLog = null)}></div>
       <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-      <div class="inline-block align-bottom bg-white rounded-xl text-left overflow-hidden shadow-2xl transform transition-all sm:my-8 sm:align-middle sm:max-w-2xl sm:w-full border border-gray-200" transition:slide={{ duration: 200 }}>
+      <div class="inline-block w-full align-bottom bg-white rounded-xl text-left overflow-hidden shadow-2xl transform transition-all sm:my-8 sm:align-middle sm:max-w-2xl sm:w-full border border-gray-200" transition:slide={{ duration: 200 }}>
         <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
           <div class="sm:flex sm:items-start">
-            <div class="mt-3 text-center sm:mt-0 sm:text-left w-full">
+            <div class="mt-3 text-left sm:mt-0 w-full">
               <h3 class="text-xl leading-6 font-bold text-navy-900 flex items-center gap-2" id="modal-title">
                 Query Results
               </h3>
@@ -358,8 +358,8 @@
                     {#each selectedLog?.result_rows || [] as row}
                       {@const parsed = parseAnswer(row)}
                       <tr class="hover:bg-gray-50">
-                        <td class="px-6 py-3 whitespace-nowrap text-sm text-gray-500 font-medium">{parsed.type}</td>
-                        <td class="px-6 py-3 text-sm text-navy-900 font-mono break-all">{parsed.value}</td>
+                        <td class="px-6 py-3 whitespace-nowrap text-left text-sm text-gray-500 font-medium">{parsed.type}</td>
+                        <td class="px-6 py-3 text-left text-sm text-navy-900 font-mono break-all">{parsed.value}</td>
                       </tr>
                     {/each}
                     {#if (selectedLog?.result_rows || []).length === 0}
