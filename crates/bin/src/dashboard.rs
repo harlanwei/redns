@@ -103,16 +103,70 @@ impl Default for LogsQuery {
 #[derive(Debug, Clone)]
 pub struct DashboardStore {
     db_path: Arc<String>,
+    log_tx: tokio::sync::mpsc::Sender<NewDnsLogEntry>,
 }
 
 impl DashboardStore {
     pub fn new(db_path: impl Into<String>) -> Result<Self, DynError> {
         let db_path = db_path.into();
         ensure_sqlite_file_exists(&db_path)?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<NewDnsLogEntry>(10240);
         let store = Self {
-            db_path: Arc::new(db_path),
+            db_path: Arc::new(db_path.clone()),
+            log_tx: tx,
         };
         store.init()?;
+
+        let path = store.db_path.clone();
+        tokio::spawn(async move {
+            let mut batch = Vec::new();
+            loop {
+                let entry_opt = rx.recv().await;
+                match entry_opt {
+                    Some(e) => {
+                        batch.push(e);
+                        while batch.len() < 100 {
+                            if let Ok(e) = rx.try_recv() {
+                                batch.push(e);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    None => break,
+                }
+
+                let entries = std::mem::take(&mut batch);
+                let path_clone = path.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut conn) = Self::open_connection(&path_clone) {
+                        if let Ok(tx) = conn.transaction() {
+                            for entry in entries {
+                                let _ = tx.execute(
+                                    "INSERT INTO dns_logs (
+                                        ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms
+                                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                    params![
+                                        entry.ts_unix_ms as i64,
+                                        entry.client_ip,
+                                        entry.protocol,
+                                        entry.qname,
+                                        entry.qtype,
+                                        entry.rcode,
+                                        entry.result,
+                                        entry.result_rows_json,
+                                        entry.upstreams_json,
+                                        entry.latency_ms as i64,
+                                    ],
+                                );
+                            }
+                            let _ = tx.commit();
+                        }
+                    }
+                }).await;
+            }
+        });
+
         Ok(store)
     }
 
@@ -181,30 +235,9 @@ impl DashboardStore {
     }
 
     async fn record(&self, entry: NewDnsLogEntry) -> Result<(), DynError> {
-        let path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), DynError> {
-            let conn = Self::open_connection(&path)?;
-            conn.execute(
-                "INSERT INTO dns_logs (
-                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    entry.ts_unix_ms as i64,
-                    entry.client_ip,
-                    entry.protocol,
-                    entry.qname,
-                    entry.qtype,
-                    entry.rcode,
-                    entry.result,
-                    entry.result_rows_json,
-                    entry.upstreams_json,
-                    entry.latency_ms as i64,
-                ],
-            )?;
-            Ok(())
+        self.log_tx.try_send(entry).map_err(|e| -> DynError {
+            format!("dashboard log channel error: {e}").into()
         })
-        .await
-        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
     }
 
     pub async fn fetch_logs(&self, query: LogsQuery) -> Result<PaginatedLogsResponse, DynError> {
@@ -358,7 +391,7 @@ impl DashboardStore {
                 params![cutoff_ms as i64],
             )? as u64;
             if deleted > 0 {
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
             }
             Ok(deleted)
         })
@@ -923,6 +956,9 @@ mod tests {
             .record(sample_entry(cutoff_ms + 1, "new.example"))
             .await
             .expect("insert new row");
+
+        // Wait for background worker to process the logs
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let deleted = store
             .prune_expired_logs_at(UNIX_EPOCH + Duration::from_millis(now_ms))
