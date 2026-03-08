@@ -523,6 +523,8 @@ pub struct DashboardState {
     pub upstreams: Arc<[Arc<UpstreamWrapper>]>,
     pub store: Arc<DashboardStore>,
     pub static_dir: String,
+    pub mmdb_city: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
+    pub mmdb_asn: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
 }
 
 pub async fn serve_dashboard(
@@ -581,6 +583,76 @@ async fn handle_dashboard_request(
                 body.as_bytes(),
             )
             .await?;
+        }
+        ("GET", "/api/geoip") => {
+            let ip_str = query.get("ip").map(|s| s.as_str()).unwrap_or("");
+            if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                let mut city = None;
+                let mut asn = None;
+                
+                let is_private = match ip {
+                    std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+                    std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_loopback(),
+                };
+
+                if is_private {
+                    city = Some("Private Network".to_string());
+                } else {
+                    if let Some(ref db) = state.mmdb_city {
+                        if let Ok(lookup) = db.lookup(ip) {
+                            if let Ok(Some(city_data)) = lookup.decode::<maxminddb::geoip2::City>() {
+                                let c = city_data.city.names.english;
+                                let s = city_data.subdivisions.get(0).and_then(|sd| sd.names.english);
+                                let co = city_data.country.names.english;
+                                
+                                let mut parts = Vec::new();
+                                if let Some(name) = c { 
+                                    parts.push(name); 
+                                }
+                                if let Some(name) = s { 
+                                    if !parts.contains(&name) {
+                                        parts.push(name); 
+                                    }
+                                }
+                                if let Some(name) = co { 
+                                    if !parts.contains(&name) {
+                                        parts.push(name); 
+                                    }
+                                }
+                                
+                                if !parts.is_empty() {
+                                    city = Some(parts.join(", "));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref db) = state.mmdb_asn {
+                        if let Ok(lookup) = db.lookup(ip) {
+                            if let Ok(Some(asn_data)) = lookup.decode::<maxminddb::geoip2::Asn>() {
+                                let org = asn_data.autonomous_system_organization;
+                                let num = asn_data.autonomous_system_number;
+                                match (num, org) {
+                                    (Some(n), Some(o)) => asn = Some(format!("{} (AS{})", o, n)),
+                                    (Some(n), None) => asn = Some(format!("AS{}", n)),
+                                    (None, Some(o)) => asn = Some(o.to_string()),
+                                    (None, None) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                let body = serde_json::json!({ "city": city, "asn": asn });
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &serde_json::to_vec(&body)?,
+                )
+                .await?;
+            } else {
+                write_response(&mut stream, "400 Bad Request", "text/plain", b"Invalid IP").await?;
+            }
         }
         ("GET", "/api/logs") => {
             let logs_query = logs_query_from_params(&query);

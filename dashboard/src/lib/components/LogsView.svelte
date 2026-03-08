@@ -15,6 +15,29 @@
   let autoRefresh = $state(false);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
   let selectedLog = $state<DnsLogEntry | null>(null);
+  let geoipData = $state<Record<string, { city: string | null; asn: string | null }>>({});
+
+  $effect(() => {
+    if (selectedLog) {
+      geoipData = {};
+      const ipsToFetch = new Set<string>();
+      if (selectedLog.client_ip) ipsToFetch.add(selectedLog.client_ip);
+      for (const row of selectedLog.result_rows || []) {
+        const parsed = parseAnswer(row);
+        if (parsed.type === 'A' || parsed.type === 'AAAA') {
+          ipsToFetch.add(parsed.value);
+        }
+      }
+      for (const ip of ipsToFetch) {
+        fetch(`/api/geoip?ip=${encodeURIComponent(ip)}`)
+          .then((res) => res.json())
+          .then((data) => {
+            geoipData[ip] = data;
+          })
+          .catch((err) => console.error('Failed to fetch geoip for', ip, err));
+      }
+    }
+  });
 
   function getErrorMessage(err: unknown, fallback: string) {
     if (err instanceof Error && err.message) return err.message;
@@ -324,9 +347,28 @@
                 </div>
                 <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center border-b border-gray-200 pb-2">
                   <div class="text-gray-500 font-medium mb-1 sm:mb-0">Client</div>
-                  <div class="font-medium text-navy-900 text-left sm:text-right">{selectedLog?.client_ip} <span class="text-gray-400 text-xs font-normal">({formatProtocol(selectedLog?.protocol || '')})</span></div>
-                </div>
-                <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center border-b border-gray-200 pb-2">
+                  <div class="text-left sm:text-right">
+                    <div class="font-medium text-navy-900">{selectedLog?.client_ip} <span class="text-gray-400 text-xs font-normal">({formatProtocol(selectedLog?.protocol || '')})</span></div>
+                    {#if selectedLog && geoipData[selectedLog?.client_ip || '']}
+                      {#if geoipData[selectedLog?.client_ip || '']?.city || geoipData[selectedLog?.client_ip || '']?.asn}
+                        <div class="mt-1 flex flex-wrap sm:justify-end gap-2 text-xs font-sans">
+                          {#if geoipData[selectedLog?.client_ip || '']?.city}
+                            <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-100">
+                              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                              {geoipData[selectedLog?.client_ip || '']?.city}
+                            </span>
+                          {/if}
+                          {#if geoipData[selectedLog?.client_ip || '']?.asn}
+                            <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-100">
+                              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                              {geoipData[selectedLog?.client_ip || '']?.asn}
+                            </span>
+                          {/if}
+                        </div>
+                      {/if}
+                    {/if}
+                  </div>
+                </div>                <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center border-b border-gray-200 pb-2">
                   <div class="text-gray-500 font-medium mb-1 sm:mb-0">Status</div>
                   <div class="text-left sm:text-right">
                     <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold {selectedLog?.rcode?.toLowerCase() === 'noerror' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}">
@@ -359,7 +401,27 @@
                       {@const parsed = parseAnswer(row)}
                       <tr class="hover:bg-gray-50">
                         <td class="px-6 py-3 whitespace-nowrap text-left text-sm text-gray-500 font-medium">{parsed.type}</td>
-                        <td class="px-6 py-3 text-left text-sm text-navy-900 font-mono break-all">{parsed.value}</td>
+                        <td class="px-6 py-3 text-left text-sm text-navy-900 font-mono break-all">
+                          {parsed.value}
+                          {#if (parsed.type === 'A' || parsed.type === 'AAAA') && geoipData[parsed.value]}
+                            {#if geoipData[parsed.value]?.city || geoipData[parsed.value]?.asn}
+                              <div class="mt-1 flex flex-wrap gap-2 text-xs font-sans">
+                                {#if geoipData[parsed.value]?.city}
+                                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-100">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                                    {geoipData[parsed.value]?.city}
+                                  </span>
+                                {/if}
+                                {#if geoipData[parsed.value]?.asn}
+                                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-100">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                                    {geoipData[parsed.value]?.asn}
+                                  </span>
+                                {/if}
+                              </div>
+                            {/if}
+                          {/if}
+                        </td>
                       </tr>
                     {/each}
                     {#if (selectedLog?.result_rows || []).length === 0}

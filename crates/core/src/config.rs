@@ -98,6 +98,12 @@ pub struct DashboardConfig {
     /// Directory to serve static frontend files from. Defaults to "./dashboard/dist".
     #[serde(default)]
     pub static_dir: Option<String>,
+    /// Path to MaxMind GeoLite2 City database.
+    #[serde(default)]
+    pub mmdb_city: Option<String>,
+    /// Path to MaxMind GeoLite2 ASN database.
+    #[serde(default)]
+    pub mmdb_asn: Option<String>,
 }
 
 // ── Sequence Rule Config ─────────────────────────────────────────

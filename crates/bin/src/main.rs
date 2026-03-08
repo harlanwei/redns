@@ -678,11 +678,45 @@ async fn run_server(
                         "dashboard/dist".to_string()
                     }
                 });
+                let mmdb_city = cfg.dashboard.mmdb_city.as_ref()
+                    .map(|s| s.as_str())
+                    .or_else(|| {
+                        if std::path::Path::new("GeoLite2-City.mmdb").exists() {
+                            Some("GeoLite2-City.mmdb")
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|path| {
+                        maxminddb::Reader::open_readfile(path).map(Arc::new).map_err(|e| {
+                            warn!(error = %e, path = %path, "failed to load mmdb_city");
+                            e
+                        }).ok()
+                    });
+
+                let mmdb_asn = cfg.dashboard.mmdb_asn.as_ref()
+                    .map(|s| s.as_str())
+                    .or_else(|| {
+                        if std::path::Path::new("GeoLite2-ASN.mmdb").exists() {
+                            Some("GeoLite2-ASN.mmdb")
+                        } else {
+                            None
+                        }
+                    })
+                    .and_then(|path| {
+                        maxminddb::Reader::open_readfile(path).map(Arc::new).map_err(|e| {
+                            warn!(error = %e, path = %path, "failed to load mmdb_asn");
+                            e
+                        }).ok()
+                    });
+
                 let state = dashboard::DashboardState {
                     api_http: cfg.api.http.clone(),
                     upstreams: all_upstreams.clone(),
                     store: dashboard_store.clone(),
                     static_dir,
+                    mmdb_city,
+                    mmdb_asn,
                 };
                 let c = cancel.clone();
                 tokio::spawn(async move {
