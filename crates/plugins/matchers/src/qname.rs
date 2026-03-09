@@ -35,17 +35,9 @@ impl QnameMatcher {
     /// "&blocklist.txt domain:extra.com"  — file + inline
     /// ```
     pub fn from_str_args(s: &str) -> PluginResult<Self> {
-        let mut ds = DomainSet::new();
-        for part in s.split_whitespace() {
-            if let Some(path) = part.strip_prefix('&') {
-                ds.load_file(path)?;
-            } else {
-                if let Err(e) = ds.add_expression(part) {
-                    tracing::warn!(error = %e, exp = part, "skipping invalid domain expression");
-                }
-            }
-        }
-        Ok(Self { ds })
+        Ok(Self {
+            ds: DomainSet::from_str_args(s)?,
+        })
     }
 }
 
@@ -127,6 +119,25 @@ mod tests {
         assert!(m.match_ctx(&make_ctx("example.com.")).unwrap());
         assert!(m.match_ctx(&make_ctx("sub.example.com.")).unwrap());
         assert!(m.match_ctx(&make_ctx("test.org.")).unwrap());
+        assert!(!m.match_ctx(&make_ctx("other.com.")).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn yaml_scalar_file_arg_loading() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("redns_qname_yaml_scalar_file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("domains.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "example.com").unwrap();
+        drop(f);
+
+        let arg = format!("files: {}\n", path.display());
+        let m = QnameMatcher::from_str_args(&arg).unwrap();
+        assert!(m.match_ctx(&make_ctx("sub.example.com.")).unwrap());
         assert!(!m.match_ctx(&make_ctx("other.com.")).unwrap());
 
         std::fs::remove_dir_all(&dir).ok();

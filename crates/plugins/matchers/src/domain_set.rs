@@ -93,10 +93,53 @@ pub struct DomainSet {
 /// YAML args for domain_set plugin.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct DomainSetArgs {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_vec")]
     pub exps: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_vec")]
     pub files: Vec<String>,
+}
+
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrVec;
+
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or a list of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
 
 impl DomainSet {
@@ -335,5 +378,23 @@ mod tests {
         ds.add_expression("example.com").unwrap();
         assert!(ds.match_ctx(&make_ctx("sub.example.com.")).unwrap());
         assert!(!ds.match_ctx(&make_ctx("other.com.")).unwrap());
+    }
+
+    #[test]
+    fn yaml_scalar_file_arg_loads_domains() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("redns_domain_set_yaml_scalar_file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("domains.txt");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "example.com").unwrap();
+        drop(file);
+
+        let args = format!("files: {}\n", path.display());
+        let ds = DomainSet::from_str_args(&args).unwrap();
+        assert!(ds.matches_domain("www.example.com."));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
