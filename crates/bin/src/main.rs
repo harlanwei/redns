@@ -134,7 +134,9 @@ fn register_builtins(builder: &mut ChainBuilder) {
     );
     builder.register_rec_exec(
         "reject",
-        Box::new(|_| Ok(Box::new(ActionReject) as Box<dyn RecursiveExecutable>)),
+        Box::new(|args| {
+            Ok(Box::new(ActionReject::from_str_args(args)?) as Box<dyn RecursiveExecutable>)
+        }),
     );
 
     // ── Simple Executables ───────────────────────────────────────

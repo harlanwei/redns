@@ -35,8 +35,27 @@ impl RecursiveExecutable for ActionAccept {
     }
 }
 
-/// Sets a REFUSED response and stops execution.
-pub struct ActionReject;
+/// Sets a response with the configured rcode and stops execution.
+pub struct ActionReject {
+    rcode: ResponseCode,
+}
+
+impl ActionReject {
+    pub fn from_str_args(s: &str) -> PluginResult<Self> {
+        let s = s.trim();
+        let rcode = if s.is_empty() {
+            ResponseCode::Refused
+        } else {
+            let value =
+                s.parse::<u16>()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("reject expects an integer rcode, got '{}': {}", s, e).into()
+                    })?;
+            value.into()
+        };
+        Ok(Self { rcode })
+    }
+}
 
 #[async_trait]
 impl RecursiveExecutable for ActionReject {
@@ -44,7 +63,7 @@ impl RecursiveExecutable for ActionReject {
         let mut resp = Message::new();
         resp.set_id(ctx.query().id());
         resp.set_message_type(MessageType::Response);
-        resp.set_response_code(ResponseCode::Refused);
+        resp.set_response_code(self.rcode);
         ctx.set_response(Some(resp));
         Ok(())
     }
@@ -161,13 +180,31 @@ mod tests {
     async fn reject_sets_response() {
         let chain = vec![ChainNode {
             matchers: vec![],
-            executor: NodeExecutor::Recursive(Box::new(ActionReject)),
+            executor: NodeExecutor::Recursive(Box::new(ActionReject::from_str_args("").unwrap())),
         }];
         let seq = Sequence::new(chain);
         let mut ctx = Context::new(make_query());
         seq.exec(&mut ctx).await.unwrap();
         let resp = ctx.response().expect("should have response");
         assert_eq!(resp.response_code(), ResponseCode::Refused);
+    }
+
+    #[tokio::test]
+    async fn reject_uses_explicit_rcode() {
+        let chain = vec![ChainNode {
+            matchers: vec![],
+            executor: NodeExecutor::Recursive(Box::new(ActionReject::from_str_args("3").unwrap())),
+        }];
+        let seq = Sequence::new(chain);
+        let mut ctx = Context::new(make_query());
+        seq.exec(&mut ctx).await.unwrap();
+        let resp = ctx.response().expect("should have response");
+        assert_eq!(u16::from(resp.response_code()), 3);
+    }
+
+    #[test]
+    fn reject_rejects_non_integer_args() {
+        assert!(ActionReject::from_str_args("not-an-int").is_err());
     }
 
     #[tokio::test]
