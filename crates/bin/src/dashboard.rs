@@ -235,9 +235,9 @@ impl DashboardStore {
     }
 
     async fn record(&self, entry: NewDnsLogEntry) -> Result<(), DynError> {
-        self.log_tx.try_send(entry).map_err(|e| -> DynError {
-            format!("dashboard log channel error: {e}").into()
-        })
+        self.log_tx
+            .try_send(entry)
+            .map_err(|e| -> DynError { format!("dashboard log channel error: {e}").into() })
     }
 
     pub async fn fetch_logs(&self, query: LogsQuery) -> Result<PaginatedLogsResponse, DynError> {
@@ -589,10 +589,12 @@ async fn handle_dashboard_request(
             if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
                 let mut city = None;
                 let mut asn = None;
-                
+
                 let is_private = match ip {
                     std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
-                    std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_loopback(),
+                    std::net::IpAddr::V6(v6) => {
+                        (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_loopback()
+                    }
                 };
 
                 if is_private {
@@ -600,26 +602,30 @@ async fn handle_dashboard_request(
                 } else {
                     if let Some(ref db) = state.mmdb_city {
                         if let Ok(lookup) = db.lookup(ip) {
-                            if let Ok(Some(city_data)) = lookup.decode::<maxminddb::geoip2::City>() {
+                            if let Ok(Some(city_data)) = lookup.decode::<maxminddb::geoip2::City>()
+                            {
                                 let c = city_data.city.names.english;
-                                let s = city_data.subdivisions.get(0).and_then(|sd| sd.names.english);
+                                let s = city_data
+                                    .subdivisions
+                                    .get(0)
+                                    .and_then(|sd| sd.names.english);
                                 let co = city_data.country.names.english;
-                                
+
                                 let mut parts = Vec::new();
-                                if let Some(name) = c { 
-                                    parts.push(name); 
+                                if let Some(name) = c {
+                                    parts.push(name);
                                 }
-                                if let Some(name) = s { 
+                                if let Some(name) = s {
                                     if !parts.contains(&name) {
-                                        parts.push(name); 
+                                        parts.push(name);
                                     }
                                 }
-                                if let Some(name) = co { 
+                                if let Some(name) = co {
                                     if !parts.contains(&name) {
-                                        parts.push(name); 
+                                        parts.push(name);
                                     }
                                 }
-                                
+
                                 if !parts.is_empty() {
                                     city = Some(parts.join(", "));
                                 }
@@ -641,7 +647,7 @@ async fn handle_dashboard_request(
                         }
                     }
                 }
-                
+
                 let body = serde_json::json!({ "city": city, "asn": asn });
                 write_response(
                     &mut stream,
