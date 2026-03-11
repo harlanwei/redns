@@ -133,9 +133,9 @@ impl DnsHandler for EntryHandler {
         if served_from_cache
             && let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
             && let Ok(mut selected) = selected_upstreams.lock()
-            && !selected.iter().any(|name| name == "<cached>")
+            && !selected.iter().any(|name| name == "__C__")
         {
-            selected.push("<cached>".to_string());
+            selected.push("__C__".to_string());
         }
 
         debug!(

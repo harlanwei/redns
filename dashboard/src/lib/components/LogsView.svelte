@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { fade, slide } from 'svelte/transition';
   import type { DnsLogEntry, PaginatedLogsResponse } from '../types/dashboard';
-  import { formatProtocol, formatRelativeTime, parseAnswer } from '../utils/dashboard';
+  import { formatProtocol, formatRelativeTime, parseAnswer, formatUpstream } from '../utils/dashboard';
   import ErrorAlert from './ErrorAlert.svelte';
 
   let logsResponse = $state<PaginatedLogsResponse | null>(null);
@@ -380,10 +380,18 @@
                   <div class="text-gray-500 font-medium mb-1 sm:mb-0">Latency</div>
                   <div class="font-medium text-navy-900 text-left sm:text-right">{selectedLog?.latency_ms} <span class="text-gray-400 text-xs font-normal">ms</span></div>
                 </div>
-                {#if selectedLog?.upstreams && selectedLog.upstreams.length > 0}
+                {#if (selectedLog?.upstreams?.length ?? 0) > 0}
                   <div class="flex flex-col sm:flex-row sm:justify-between sm:items-start">
                     <div class="text-gray-500 font-medium mb-1 sm:mb-0 mt-1">Upstreams</div>
-                    <div class="font-medium text-navy-900 text-left sm:text-right max-w-full sm:max-w-[70%] break-words">{selectedLog.upstreams.join(', ')}</div>
+                    <div class="flex flex-wrap gap-1 justify-end">
+                      {#each selectedLog?.upstreams ?? [] as upstream}
+                        {#if upstream === '__C__'}
+                          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-cyan-50 text-cyan-700 ring-1 ring-inset ring-cyan-600/20">System Cache</span>
+                        {:else}
+                          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-gray-100 text-gray-700 ring-1 ring-inset ring-gray-500/10">{formatUpstream(upstream)}</span>
+                        {/if}
+                      {/each}
+                    </div>
                   </div>
                 {/if}
               </div>

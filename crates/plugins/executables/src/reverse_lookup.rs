@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
@@ -199,6 +200,7 @@ impl RecursiveExecutable for ReverseLookup {
         // Try to handle PTR from cache.
         if let Some(resp) = self.try_respond_ptr(ctx.query()) {
             ctx.set_response(Some(resp));
+            ctx.set_mark(MARK_CACHE_HIT);
             return Ok(());
         }
 

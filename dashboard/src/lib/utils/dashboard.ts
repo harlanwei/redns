@@ -47,3 +47,8 @@ export function sortUpstreams(upstreams: UpstreamMetrics[], sortCol: UpstreamSor
     return sortAsc ? cmp : -cmp;
   });
 }
+
+export function formatUpstream(name: string): string {
+  if (name === '__C__') return 'System Cache';
+  return name;
+}
