@@ -11,6 +11,8 @@ use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -21,6 +23,9 @@ const DEFAULT_CACHE_SIZE: usize = 1024;
 
 /// Default lazy cache TTL (serve stale for this long while refreshing).
 const DEFAULT_LAZY_TTL: Duration = Duration::from_secs(30);
+
+/// Number of shards for the cache to reduce lock contention.
+const CACHE_SHARDS: usize = 32;
 
 /// A cached DNS response entry.
 struct CachedEntry {
@@ -87,9 +92,10 @@ fn adjust_ttl(msg: &mut Message, remaining: u32) {
 
 /// In-memory LRU DNS cache.
 ///
-/// Uses `lru::LruCache` for proper bounded eviction (replaces HashMap).
+/// Uses `lru::LruCache` for proper bounded eviction.
+/// Sharded to reduce lock contention across threads.
 pub struct Cache {
-    store: Mutex<LruCache<String, CachedEntry>>,
+    shards: Vec<Mutex<LruCache<String, CachedEntry>>>,
     lazy_ttl: Duration,
 }
 
@@ -100,14 +106,27 @@ impl Cache {
         } else {
             max_size
         };
-        Self {
-            store: Mutex::new(LruCache::new(NonZeroUsize::new(cap).unwrap())),
-            lazy_ttl,
+
+        let shard_cap = (cap / CACHE_SHARDS).max(4);
+        let mut shards = Vec::with_capacity(CACHE_SHARDS);
+        for _ in 0..CACHE_SHARDS {
+            shards.push(Mutex::new(
+                LruCache::new(NonZeroUsize::new(shard_cap).unwrap()),
+            ));
         }
+
+        Self { shards, lazy_ttl }
     }
 
     pub fn default_cache() -> Self {
         Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL)
+    }
+
+    fn get_shard(&self, key: &str) -> &Mutex<LruCache<String, CachedEntry>> {
+        let mut s = DefaultHasher::new();
+        key.hash(&mut s);
+        let hash = s.finish();
+        &self.shards[(hash as usize) % CACHE_SHARDS]
     }
 }
 
@@ -125,7 +144,8 @@ impl RecursiveExecutable for Cache {
 
         // Check cache.
         {
-            let mut store = self.store.lock().await;
+            let shard = self.get_shard(&key);
+            let mut store = shard.lock().await;
             if let Some(entry) = store.get(&key) {
                 if !entry.is_expired() {
                     // Fresh hit.
@@ -163,7 +183,8 @@ impl RecursiveExecutable for Cache {
                 let ttl = min_ttl(resp);
                 if ttl > 0 {
                     if let Ok(bytes) = resp.to_vec() {
-                        let mut store = self.store.lock().await;
+                        let shard = self.get_shard(&key);
+                        let mut store = shard.lock().await;
                         // LruCache automatically evicts oldest when at capacity.
                         store.put(
                             key,
