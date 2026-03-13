@@ -222,10 +222,19 @@ impl RecursiveExecutable for Cache {
 impl Cache {
     async fn store_entry(&self, key: &str, ctx: &Context) {
         if let Some(resp) = ctx.response() {
-            if resp.response_code() == hickory_proto::op::ResponseCode::NoError
-                || resp.response_code() == hickory_proto::op::ResponseCode::NXDomain
-            {
-                let ttl = min_ttl(resp);
+            let rcode = resp.response_code();
+            let is_negative = rcode == hickory_proto::op::ResponseCode::NXDomain
+                || rcode == hickory_proto::op::ResponseCode::ServFail;
+
+            if rcode == hickory_proto::op::ResponseCode::NoError || is_negative {
+                let mut ttl = min_ttl(resp);
+
+                if rcode == hickory_proto::op::ResponseCode::NXDomain {
+                    ttl = ttl.min(30);
+                } else if rcode == hickory_proto::op::ResponseCode::ServFail {
+                    ttl = ttl.min(5);
+                }
+
                 if ttl > 0 {
                     if let Ok(bytes) = resp.to_vec() {
                         let shard = self.get_shard(key);
