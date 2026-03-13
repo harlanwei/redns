@@ -23,7 +23,7 @@ const MAX_UDP_SIZE: usize = 4096;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default idle timeout for pooled connections.
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum idle connections in pool.
 const MAX_IDLE_CONNS: usize = 4;
