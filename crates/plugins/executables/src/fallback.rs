@@ -103,7 +103,9 @@ impl Executable for Fallback {
         // Create a fresh context for each branch from the same query.
         let query = ctx.query().clone();
         let mut ctx_primary = Context::new(query.clone());
+        ctx_primary.server_meta = ctx.server_meta.clone();
         let mut ctx_secondary = Context::new(query);
+        ctx_secondary.server_meta = ctx.server_meta.clone();
 
         let primary = self.primary.clone();
         let secondary = self.secondary.clone();

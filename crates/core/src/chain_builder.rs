@@ -291,7 +291,7 @@ impl RecursiveExecutable for ArcRecExec {
     async fn exec_recursive(
         &self,
         ctx: &mut crate::context::Context,
-        next: crate::sequence::ChainWalker<'_>,
+        next: crate::sequence::ChainWalker,
     ) -> PluginResult<()> {
         self.0.exec_recursive(ctx, next).await
     }

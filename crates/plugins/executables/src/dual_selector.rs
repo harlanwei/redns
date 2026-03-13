@@ -55,7 +55,7 @@ impl RecursiveExecutable for DualSelector {
     async fn exec_recursive(
         &self,
         ctx: &mut Context,
-        mut next: ChainWalker<'_>,
+        mut next: ChainWalker,
     ) -> PluginResult<()> {
         let qtype = match ctx.question() {
             Some(q) => q.query_type(),

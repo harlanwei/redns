@@ -39,7 +39,7 @@ impl RecursiveExecutable for QuerySummary {
     async fn exec_recursive(
         &self,
         ctx: &mut Context,
-        mut next: ChainWalker<'_>,
+        mut next: ChainWalker,
     ) -> PluginResult<()> {
         let result = next.exec_next(ctx).await;
         let question = ctx

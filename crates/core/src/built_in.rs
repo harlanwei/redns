@@ -30,7 +30,7 @@ pub struct ActionAccept;
 
 #[async_trait]
 impl RecursiveExecutable for ActionAccept {
-    async fn exec_recursive(&self, _ctx: &mut Context, _next: ChainWalker<'_>) -> PluginResult<()> {
+    async fn exec_recursive(&self, _ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
         Ok(()) // drop `next`
     }
 }
@@ -59,7 +59,7 @@ impl ActionReject {
 
 #[async_trait]
 impl RecursiveExecutable for ActionReject {
-    async fn exec_recursive(&self, ctx: &mut Context, _next: ChainWalker<'_>) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
         let mut resp = Message::new();
         resp.set_id(ctx.query().id());
         resp.set_message_type(MessageType::Response);
@@ -69,12 +69,14 @@ impl RecursiveExecutable for ActionReject {
     }
 }
 
+use std::sync::Arc;
+
 /// Skips the rest of the current chain and returns to the `jump_back` point.
 pub struct ActionReturn;
 
 #[async_trait]
 impl RecursiveExecutable for ActionReturn {
-    async fn exec_recursive(&self, ctx: &mut Context, next: ChainWalker<'_>) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, next: ChainWalker) -> PluginResult<()> {
         if let Some(mut jb) = next.into_jump_back() {
             return jb.exec_next(ctx).await;
         }
@@ -84,26 +86,26 @@ impl RecursiveExecutable for ActionReturn {
 
 /// Transfers execution to a target chain, saving a return point.
 pub struct ActionJump {
-    pub target: &'static [crate::sequence::ChainNode],
+    pub target: Arc<[crate::sequence::ChainNode]>,
 }
 
 #[async_trait]
 impl RecursiveExecutable for ActionJump {
-    async fn exec_recursive(&self, ctx: &mut Context, next: ChainWalker<'_>) -> PluginResult<()> {
-        let mut walker = ChainWalker::new(self.target, Some(Box::new(next)));
+    async fn exec_recursive(&self, ctx: &mut Context, next: ChainWalker) -> PluginResult<()> {
+        let mut walker = ChainWalker::new(Arc::clone(&self.target), Some(Box::new(next)));
         walker.exec_next(ctx).await
     }
 }
 
 /// Transfers execution to a target chain, **without** saving a return point.
 pub struct ActionGoto {
-    pub target: &'static [crate::sequence::ChainNode],
+    pub target: Arc<[crate::sequence::ChainNode]>,
 }
 
 #[async_trait]
 impl RecursiveExecutable for ActionGoto {
-    async fn exec_recursive(&self, ctx: &mut Context, _next: ChainWalker<'_>) -> PluginResult<()> {
-        let mut walker = ChainWalker::new(self.target, None);
+    async fn exec_recursive(&self, ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
+        let mut walker = ChainWalker::new(Arc::clone(&self.target), None);
         walker.exec_next(ctx).await
     }
 }

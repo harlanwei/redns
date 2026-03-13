@@ -60,7 +60,7 @@ impl RecursiveExecutable for Redirect {
     async fn exec_recursive(
         &self,
         ctx: &mut Context,
-        mut next: ChainWalker<'_>,
+        mut next: ChainWalker,
     ) -> PluginResult<()> {
         let question = match ctx.question() {
             Some(q) => q.clone(),

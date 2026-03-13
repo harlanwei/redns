@@ -195,7 +195,7 @@ impl RecursiveExecutable for ReverseLookup {
     async fn exec_recursive(
         &self,
         ctx: &mut Context,
-        mut next: ChainWalker<'_>,
+        mut next: ChainWalker,
     ) -> PluginResult<()> {
         // Try to handle PTR from cache.
         if let Some(resp) = self.try_respond_ptr(ctx.query()) {

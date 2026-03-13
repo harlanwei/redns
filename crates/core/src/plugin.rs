@@ -46,7 +46,7 @@ pub trait Executable: Send + Sync {
 #[async_trait]
 pub trait RecursiveExecutable: Send + Sync {
     /// Executes with access to the remaining chain via `next`.
-    async fn exec_recursive(&self, ctx: &mut Context, next: ChainWalker<'_>) -> PluginResult<()>;
+    async fn exec_recursive(&self, ctx: &mut Context, next: ChainWalker) -> PluginResult<()>;
 }
 
 /// A matcher that negates another matcher's result.

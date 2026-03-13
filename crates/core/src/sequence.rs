@@ -28,6 +28,8 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::debug;
 
+use std::sync::Arc;
+
 /// The executor stored inside a [`ChainNode`].
 pub enum NodeExecutor {
     /// A simple executable.
@@ -51,15 +53,16 @@ pub struct ChainNode {
 ///
 /// Supports `jump` (with return) and `goto` (without return) semantics
 /// via the `jump_back` field.
-pub struct ChainWalker<'a> {
+#[derive(Clone)]
+pub struct ChainWalker {
     pos: usize,
-    chain: &'a [ChainNode],
-    jump_back: Option<Box<ChainWalker<'a>>>,
+    chain: Arc<[ChainNode]>,
+    jump_back: Option<Box<ChainWalker>>,
 }
 
-impl<'a> ChainWalker<'a> {
+impl ChainWalker {
     /// Creates a new walker starting at position 0.
-    pub fn new(chain: &'a [ChainNode], jump_back: Option<Box<ChainWalker<'a>>>) -> Self {
+    pub fn new(chain: Arc<[ChainNode]>, jump_back: Option<Box<ChainWalker>>) -> Self {
         Self {
             pos: 0,
             chain,
@@ -69,7 +72,7 @@ impl<'a> ChainWalker<'a> {
 
     /// Consumes this walker and returns its `jump_back` walker (if any).
     /// Used by `ActionReturn` to skip the rest of the current chain.
-    pub fn into_jump_back(self) -> Option<Box<ChainWalker<'a>>> {
+    pub fn into_jump_back(self) -> Option<Box<ChainWalker>> {
         self.jump_back
     }
 
@@ -111,7 +114,7 @@ impl<'a> ChainWalker<'a> {
                         debug!(node = idx, kind = "recursive", "executing node");
                         let next = ChainWalker {
                             pos: self.pos + 1,
-                            chain: self.chain,
+                            chain: Arc::clone(&self.chain),
                             jump_back: self.jump_back.take(),
                         };
                         return re.exec_recursive(ctx, next).await;
@@ -131,23 +134,23 @@ impl<'a> ChainWalker<'a> {
 
 /// A complete sequence that owns its chain nodes.
 pub struct Sequence {
-    chain: Vec<ChainNode>,
+    chain: Arc<[ChainNode]>,
 }
 
 impl Sequence {
     /// Creates a new sequence from a list of chain nodes.
     pub fn new(chain: Vec<ChainNode>) -> Self {
-        Self { chain }
+        Self { chain: chain.into() }
     }
 
     /// Returns a reference to the chain for `jump`/`goto` targets.
-    pub fn chain(&self) -> &[ChainNode] {
-        &self.chain
+    pub fn chain(&self) -> Arc<[ChainNode]> {
+        Arc::clone(&self.chain)
     }
 
     /// Executes the entire sequence against the given context.
     pub async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-        let mut walker = ChainWalker::new(&self.chain, None);
+        let mut walker = ChainWalker::new(Arc::clone(&self.chain), None);
         walker.exec_next(ctx).await
     }
 }
@@ -155,7 +158,7 @@ impl Sequence {
 #[async_trait::async_trait]
 impl Executable for Sequence {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-        let mut walker = ChainWalker::new(&self.chain, None);
+        let mut walker = ChainWalker::new(Arc::clone(&self.chain), None);
         walker.exec_next(ctx).await
     }
 }
@@ -207,7 +210,7 @@ mod tests {
         async fn exec_recursive(
             &self,
             _ctx: &mut Context,
-            _next: ChainWalker<'_>,
+            _next: ChainWalker,
         ) -> PluginResult<()> {
             Ok(()) // drop `next` — stops chain
         }

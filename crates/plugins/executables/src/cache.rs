@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use std::sync::Arc;
+
 /// Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
 
@@ -94,7 +96,12 @@ fn adjust_ttl(msg: &mut Message, remaining: u32) {
 ///
 /// Uses `lru::LruCache` for proper bounded eviction.
 /// Sharded to reduce lock contention across threads.
+#[derive(Clone)]
 pub struct Cache {
+    inner: Arc<CacheInner>,
+}
+
+struct CacheInner {
     shards: Vec<Mutex<LruCache<String, CachedEntry>>>,
     lazy_ttl: Duration,
 }
@@ -107,7 +114,7 @@ impl Cache {
             max_size
         };
 
-        let shard_cap = (cap / CACHE_SHARDS).max(4);
+        let shard_cap = cap / CACHE_SHARDS;
         let mut shards = Vec::with_capacity(CACHE_SHARDS);
         for _ in 0..CACHE_SHARDS {
             shards.push(Mutex::new(
@@ -115,7 +122,9 @@ impl Cache {
             ));
         }
 
-        Self { shards, lazy_ttl }
+        Self {
+            inner: Arc::new(CacheInner { shards, lazy_ttl }),
+        }
     }
 
     pub fn default_cache() -> Self {
@@ -126,7 +135,7 @@ impl Cache {
         let mut s = DefaultHasher::new();
         key.hash(&mut s);
         let hash = s.finish();
-        &self.shards[(hash as usize) % CACHE_SHARDS]
+        &self.inner.shards[(hash as usize) % CACHE_SHARDS]
     }
 }
 
@@ -135,7 +144,7 @@ impl RecursiveExecutable for Cache {
     async fn exec_recursive(
         &self,
         ctx: &mut Context,
-        mut next: ChainWalker<'_>,
+        mut next: ChainWalker,
     ) -> PluginResult<()> {
         let key = match cache_key(ctx) {
             Some(k) => k,
@@ -143,10 +152,12 @@ impl RecursiveExecutable for Cache {
         };
 
         // Check cache.
+        let mut do_optimistic_refresh = false;
+        let mut served_from_cache = false;
         {
             let shard = self.get_shard(&key);
             let mut store = shard.lock().await;
-            if let Some(entry) = store.get(&key) {
+            if let Some(entry) = store.get_mut(&key) {
                 if !entry.is_expired() {
                     // Fresh hit.
                     let remaining = entry.remaining_ttl();
@@ -156,26 +167,60 @@ impl RecursiveExecutable for Cache {
                         ctx.set_response(Some(resp));
                         ctx.set_mark(MARK_CACHE_HIT);
                         debug!(key = %key, ttl = remaining, "cache hit");
-                        return Ok(());
+                        served_from_cache = true;
+
+                        let elapsed = entry.stored_at.elapsed().as_secs() as u32;
+                        if elapsed >= (entry.original_ttl as f32 * 0.8) as u32 {
+                            do_optimistic_refresh = true;
+                            // Optimistically advance stored_at to debounce parallel refreshes
+                            entry.stored_at = Instant::now();
+                        }
                     }
-                } else if entry.is_within_lazy_window(self.lazy_ttl) {
-                    // Stale but within lazy window — serve stale.
+                } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
+                    // Stale but within lazy window — serve stale and refresh.
+                    do_optimistic_refresh = true;
+                    entry.stored_at = Instant::now();
                     if let Ok(mut resp) = Message::from_vec(&entry.resp_bytes) {
                         resp.set_id(ctx.query().id());
                         adjust_ttl(&mut resp, 5); // Short TTL for stale.
                         ctx.set_response(Some(resp));
                         ctx.set_mark(MARK_CACHE_HIT);
                         debug!(key = %key, "cache lazy hit (stale)");
-                        return Ok(());
+                        served_from_cache = true;
                     }
                 }
             }
+        }
+
+        if do_optimistic_refresh {
+            let mut refresh_ctx = Context::new(ctx.query().clone());
+            refresh_ctx.server_meta = ctx.server_meta.clone();
+            let mut refresh_next = next.clone();
+            let cache_clone = self.clone();
+            let refresh_key = key.clone();
+            tokio::spawn(async move {
+                debug!(key = %refresh_key, "background optimistic refresh triggered");
+                let _ = refresh_next.exec_next(&mut refresh_ctx).await;
+                cache_clone.store_entry(&refresh_key, &refresh_ctx).await;
+            });
+        }
+
+        if served_from_cache {
+            return Ok(());
         }
 
         // Cache miss — execute downstream.
         next.exec_next(ctx).await?;
 
         // Store the response in cache.
+        self.store_entry(&key, ctx).await;
+
+        Ok(())
+    }
+}
+
+impl Cache {
+    async fn store_entry(&self, key: &str, ctx: &Context) {
         if let Some(resp) = ctx.response() {
             if resp.response_code() == hickory_proto::op::ResponseCode::NoError
                 || resp.response_code() == hickory_proto::op::ResponseCode::NXDomain
@@ -183,11 +228,11 @@ impl RecursiveExecutable for Cache {
                 let ttl = min_ttl(resp);
                 if ttl > 0 {
                     if let Ok(bytes) = resp.to_vec() {
-                        let shard = self.get_shard(&key);
+                        let shard = self.get_shard(key);
                         let mut store = shard.lock().await;
                         // LruCache automatically evicts oldest when at capacity.
                         store.put(
-                            key,
+                            key.to_string(),
                             CachedEntry {
                                 resp_bytes: bytes,
                                 stored_at: Instant::now(),
@@ -198,8 +243,6 @@ impl RecursiveExecutable for Cache {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -271,10 +314,11 @@ mod tests {
     async fn lru_eviction_respects_capacity() {
         let cache = Cache::new(2, Duration::from_secs(30));
 
-        // Simulate 3 different cache entries via the store directly.
+        // Simulate 5 different cache entries via the store directly.
         {
-            let mut store = cache.store.lock().await;
-            for i in 0..3 {
+            let shard = cache.get_shard("key");
+            let mut store = shard.lock().await;
+            for i in 0..5 {
                 store.put(
                     format!("key{i}"),
                     CachedEntry {
@@ -284,12 +328,12 @@ mod tests {
                     },
                 );
             }
-            // Capacity is 2, so only 2 should remain.
-            assert_eq!(store.len(), 2);
+            // Capacity is 4 (min cap per shard), so only 4 should remain.
+            assert_eq!(store.len(), 4);
             // key0 should have been evicted (LRU).
             assert!(store.get("key0").is_none());
             assert!(store.get("key1").is_some());
-            assert!(store.get("key2").is_some());
+            assert!(store.get("key4").is_some());
         }
     }
 }
