@@ -476,7 +476,7 @@ impl DashboardStore {
 
         let mut location = None;
         let city = json.get("city").and_then(|v| v.as_str());
-        let region = json.get("region").and_then(|v| v.as_str());
+        let region = json.get("regionName").and_then(|v| v.as_str());
         let country = json.get("country").and_then(|v| v.as_str());
         let mut parts = Vec::new();
         if let Some(name) = city {
