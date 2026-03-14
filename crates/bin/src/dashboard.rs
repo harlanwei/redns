@@ -11,6 +11,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GeoIpData {
+    pub city: Option<String>,
+    pub asn: Option<String>,
+    pub isp: Option<String>,
+    pub proxy: Option<bool>,
+    pub hosting: Option<bool>,
+}
+
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const DNS_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -190,6 +199,16 @@ impl DashboardStore {
             CREATE INDEX IF NOT EXISTS idx_dns_logs_ts ON dns_logs(ts_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_client ON dns_logs(client_ip);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_qname ON dns_logs(qname);
+
+            CREATE TABLE IF NOT EXISTS geoip_cache (
+                ip TEXT PRIMARY KEY,
+                city TEXT,
+                asn TEXT,
+                isp TEXT,
+                proxy INTEGER,
+                hosting INTEGER,
+                expires_at INTEGER NOT NULL
+            );
             ",
         )?;
         Self::ensure_migrations(&conn)?;
@@ -208,6 +227,15 @@ impl DashboardStore {
                 "ALTER TABLE dns_logs ADD COLUMN upstreams_json TEXT NOT NULL DEFAULT '[]'",
                 [],
             )?;
+        }
+        if !Self::has_column(conn, "geoip_cache", "isp")? {
+            conn.execute("ALTER TABLE geoip_cache ADD COLUMN isp TEXT", [])?;
+        }
+        if !Self::has_column(conn, "geoip_cache", "proxy")? {
+            conn.execute("ALTER TABLE geoip_cache ADD COLUMN proxy INTEGER", [])?;
+        }
+        if !Self::has_column(conn, "geoip_cache", "hosting")? {
+            conn.execute("ALTER TABLE geoip_cache ADD COLUMN hosting INTEGER", [])?;
         }
         Ok(())
     }
@@ -398,6 +426,138 @@ impl DashboardStore {
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
     }
+
+    pub async fn get_geoip(&self, ip: &str) -> Result<GeoIpData, DynError> {
+        let path = self.db_path.clone();
+        let ip_owned = ip.to_string();
+
+        let cached: Option<GeoIpData> = tokio::task::spawn_blocking({
+            let path = path.clone();
+            let ip_owned = ip_owned.clone();
+            move || -> Result<Option<GeoIpData>, DynError> {
+                let conn = Self::open_connection(&path)?;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let mut stmt = conn.prepare("SELECT city, asn, isp, proxy, hosting, expires_at FROM geoip_cache WHERE ip = ?1")?;
+                let mut rows = stmt.query(params![ip_owned])?;
+
+                if let Some(row) = rows.next()? {
+                    let expires_at: i64 = row.get(5)?;
+                    if now < expires_at {
+                        let city: Option<String> = row.get(0)?;
+                        let asn: Option<String> = row.get(1)?;
+                        let isp: Option<String> = row.get(2)?;
+                        let proxy: Option<bool> = row.get(3)?;
+                        let hosting: Option<bool> = row.get(4)?;
+                        return Ok(Some(GeoIpData { city, asn, isp, proxy, hosting }));
+                    }
+                }
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| -> DynError { format!("geoip sqlite read join failed: {e}").into() })??;
+
+        if let Some(res) = cached {
+            return Ok(res);
+        }
+
+        // Cache miss or expired, fetch from API
+        let url = format!(
+            "http://ip-api.com/json/{}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query,proxy,hosting",
+            ip
+        );
+        let resp = reqwest::get(&url).await?;
+        let text = resp.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+
+        let mut location = None;
+        let city = json.get("city").and_then(|v| v.as_str());
+        let region = json.get("region").and_then(|v| v.as_str());
+        let country = json.get("country").and_then(|v| v.as_str());
+        let mut parts = Vec::new();
+        if let Some(name) = city {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed);
+            }
+        }
+        if let Some(name) = region {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !parts.contains(&trimmed) {
+                parts.push(trimmed);
+            }
+        }
+        if let Some(name) = country {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !parts.contains(&trimmed) {
+                parts.push(trimmed);
+            }
+        }
+        if !parts.is_empty() {
+            location = Some(parts.join(", "));
+        }
+
+        let asn = json
+            .get("as")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let isp = json
+            .get("isp")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let proxy = json.get("proxy").and_then(|v| v.as_bool());
+        let hosting = json.get("hosting").and_then(|v| v.as_bool());
+
+        let res = GeoIpData {
+            city: location,
+            asn,
+            isp,
+            proxy,
+            hosting,
+        };
+
+        // Save to cache (30 days expiration)
+        let c_res = res.clone();
+        let ip_owned_2 = ip_owned.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), DynError> {
+            let conn = Self::open_connection(&path)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let expires_at = now + (30 * 24 * 60 * 60);
+
+            conn.execute(
+                "INSERT INTO geoip_cache (ip, city, asn, isp, proxy, hosting, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(ip) DO UPDATE SET
+                 city = excluded.city,
+                 asn = excluded.asn,
+                 isp = excluded.isp,
+                 proxy = excluded.proxy,
+                 hosting = excluded.hosting,
+                 expires_at = excluded.expires_at",
+                params![
+                    ip_owned_2,
+                    c_res.city,
+                    c_res.asn,
+                    c_res.isp,
+                    c_res.proxy,
+                    c_res.hosting,
+                    expires_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| -> DynError { format!("geoip sqlite write join failed: {e}").into() })??;
+
+        Ok(res)
+    }
 }
 
 pub async fn run_log_retention(store: Arc<DashboardStore>, cancel: CancellationToken) {
@@ -523,8 +683,6 @@ pub struct DashboardState {
     pub upstreams: Arc<[Arc<UpstreamWrapper>]>,
     pub store: Arc<DashboardStore>,
     pub static_dir: String,
-    pub mmdb_city: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
-    pub mmdb_asn: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
 }
 
 pub async fn serve_dashboard(
@@ -597,8 +755,13 @@ async fn handle_dashboard_request(
         ("GET", "/api/geoip") => {
             let ip_str = query.get("ip").map(|s| s.as_str()).unwrap_or("");
             if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                let mut city = None;
-                let mut asn = None;
+                let mut geoip = GeoIpData {
+                    city: None,
+                    asn: None,
+                    isp: None,
+                    proxy: None,
+                    hosting: None,
+                };
 
                 let is_private = match ip {
                     std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
@@ -608,57 +771,19 @@ async fn handle_dashboard_request(
                 };
 
                 if is_private {
-                    city = Some("Private Network".to_string());
+                    geoip.city = Some("Private Network".to_string());
                 } else {
-                    if let Some(ref db) = state.mmdb_city {
-                        if let Ok(lookup) = db.lookup(ip) {
-                            if let Ok(Some(city_data)) = lookup.decode::<maxminddb::geoip2::City>()
-                            {
-                                let c = city_data.city.names.english;
-                                let s = city_data
-                                    .subdivisions
-                                    .get(0)
-                                    .and_then(|sd| sd.names.english);
-                                let co = city_data.country.names.english;
-
-                                let mut parts = Vec::new();
-                                if let Some(name) = c {
-                                    parts.push(name);
-                                }
-                                if let Some(name) = s {
-                                    if !parts.contains(&name) {
-                                        parts.push(name);
-                                    }
-                                }
-                                if let Some(name) = co {
-                                    if !parts.contains(&name) {
-                                        parts.push(name);
-                                    }
-                                }
-
-                                if !parts.is_empty() {
-                                    city = Some(parts.join(", "));
-                                }
-                            }
+                    match state.store.get_geoip(&ip.to_string()).await {
+                        Ok(g) => {
+                            geoip = g;
                         }
-                    }
-                    if let Some(ref db) = state.mmdb_asn {
-                        if let Ok(lookup) = db.lookup(ip) {
-                            if let Ok(Some(asn_data)) = lookup.decode::<maxminddb::geoip2::Asn>() {
-                                let org = asn_data.autonomous_system_organization;
-                                let num = asn_data.autonomous_system_number;
-                                match (num, org) {
-                                    (Some(n), Some(o)) => asn = Some(format!("{} (AS{})", o, n)),
-                                    (Some(n), None) => asn = Some(format!("AS{}", n)),
-                                    (None, Some(o)) => asn = Some(o.to_string()),
-                                    (None, None) => {}
-                                }
-                            }
+                        Err(e) => {
+                            warn!(error = %e, ip = %ip_str, "failed to get geoip");
                         }
                     }
                 }
 
-                let body = serde_json::json!({ "city": city, "asn": asn });
+                let body = serde_json::json!(geoip);
                 write_response(
                     &mut stream,
                     "200 OK",

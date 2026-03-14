@@ -862,12 +862,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
-name = "ipnetwork"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
-
-[[package]]
 name = "iri-string"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -993,19 +987,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
-]
-
-[[package]]
-name = "maxminddb"
-version = "0.27.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76371bd37ce742f8954daabd0fde7f1594ee43ac2200e20c003ba5c3d65e2192"
-dependencies = [
- "ipnetwork",
- "log",
- "memchr",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1283,12 +1264,12 @@ dependencies = [
  "bc-mimalloc",
  "clap",
  "hickory-proto",
- "maxminddb",
  "mediatype",
  "mime_guess",
  "redns-core",
  "redns-executables",
  "redns-matchers",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde-saphyr",

@@ -26,7 +26,7 @@ hickory-proto = { version = "0.25", default-features = false, features = ["std"]
 rusqlite = { version = "0.38", features = ["bundled"] }
 mediatype = "0.21.0"
 mime_guess = "2.0.5"
-maxminddb = "0.27.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [target.'cfg(unix)'.dependencies]
 bc-mimalloc = { version = "0.1.48", features = ["v3"] }

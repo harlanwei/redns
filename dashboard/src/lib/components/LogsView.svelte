@@ -15,7 +15,7 @@
   let autoRefresh = $state(false);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
   let selectedLog = $state<DnsLogEntry | null>(null);
-  let geoipData = $state<Record<string, { city: string | null; asn: string | null }>>({});
+  let geoipData = $state<Record<string, { city: string | null; asn: string | null; isp: string | null; proxy: boolean | null; hosting: boolean | null }>>({});
 
   $effect(() => {
     if (selectedLog) {
@@ -350,7 +350,7 @@
                   <div class="text-left sm:text-right">
                     <div class="font-medium text-navy-900">{selectedLog?.client_ip} <span class="text-gray-400 text-xs font-normal">({formatProtocol(selectedLog?.protocol || '')})</span></div>
                     {#if selectedLog && geoipData[selectedLog?.client_ip || '']}
-                      {#if geoipData[selectedLog?.client_ip || '']?.city || geoipData[selectedLog?.client_ip || '']?.asn}
+                      {#if geoipData[selectedLog?.client_ip || '']?.city || geoipData[selectedLog?.client_ip || '']?.asn || geoipData[selectedLog?.client_ip || '']?.isp || geoipData[selectedLog?.client_ip || '']?.proxy || geoipData[selectedLog?.client_ip || '']?.hosting}
                         <div class="mt-1 flex flex-wrap sm:justify-end gap-2 text-xs font-sans">
                           {#if geoipData[selectedLog?.client_ip || '']?.city}
                             <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-100">
@@ -362,6 +362,24 @@
                             <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-100">
                               <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
                               {geoipData[selectedLog?.client_ip || '']?.asn}
+                            </span>
+                          {/if}
+                          {#if geoipData[selectedLog?.client_ip || '']?.isp}
+                            <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-100">
+                              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                              {geoipData[selectedLog?.client_ip || '']?.isp}
+                            </span>
+                          {/if}
+                          {#if geoipData[selectedLog?.client_ip || '']?.proxy}
+                            <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-red-50 text-red-700 border border-red-100">
+                              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"></path></svg>
+                              Proxy
+                            </span>
+                          {/if}
+                          {#if geoipData[selectedLog?.client_ip || '']?.hosting}
+                            <span class="inline-flex items-center gap-1 px-1 py-0.5 rounded-md bg-orange-50 text-orange-700 border border-orange-100">
+                              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                              Hosting
                             </span>
                           {/if}
                         </div>
@@ -412,7 +430,7 @@
                         <td class="px-6 py-3 text-left text-sm text-navy-900 font-mono break-all">
                           {parsed.value}
                           {#if (parsed.type === 'A' || parsed.type === 'AAAA') && geoipData[parsed.value]}
-                            {#if geoipData[parsed.value]?.city || geoipData[parsed.value]?.asn}
+                            {#if geoipData[parsed.value]?.city || geoipData[parsed.value]?.asn || geoipData[parsed.value]?.isp || geoipData[parsed.value]?.proxy || geoipData[parsed.value]?.hosting}
                               <div class="mt-1 flex flex-wrap gap-2 text-xs font-sans">
                                 {#if geoipData[parsed.value]?.city}
                                   <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-100">
@@ -424,6 +442,24 @@
                                   <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-100">
                                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
                                     {geoipData[parsed.value]?.asn}
+                                  </span>
+                                {/if}
+                                {#if geoipData[parsed.value]?.isp}
+                                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-100">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                    {geoipData[parsed.value]?.isp}
+                                  </span>
+                                {/if}
+                                {#if geoipData[parsed.value]?.proxy}
+                                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-red-50 text-red-700 border border-red-100">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"></path></svg>
+                                    Proxy
+                                  </span>
+                                {/if}
+                                {#if geoipData[parsed.value]?.hosting}
+                                  <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-orange-50 text-orange-700 border border-orange-100">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                                    Hosting
                                   </span>
                                 {/if}
                               </div>
