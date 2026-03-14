@@ -114,6 +114,7 @@ pub struct DashboardStore {
     db_path: Arc<String>,
     log_tx: tokio::sync::mpsc::Sender<NewDnsLogEntry>,
     inflight_geoip: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    http_client: reqwest::Client,
 }
 
 impl DashboardStore {
@@ -125,6 +126,7 @@ impl DashboardStore {
             db_path: Arc::new(db_path.clone()),
             log_tx: tx,
             inflight_geoip: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            http_client: reqwest::Client::new(),
         };
         store.init()?;
 
@@ -535,7 +537,7 @@ impl DashboardStore {
 
         // Cache miss or expired, fetch from API
         let url = format!("http://ip-api.com/json/{}", normalized_ip);
-        let resp = reqwest::get(&url).await?;
+        let resp = self.http_client.get(&url).send().await?;
         let text = resp.text().await?;
         let json: serde_json::Value = serde_json::from_str(&text)?;
 
