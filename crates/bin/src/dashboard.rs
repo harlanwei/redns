@@ -498,7 +498,7 @@ impl DashboardStore {
 
         if let Some(notify) = notify {
             notify.notified().await;
-            
+
             // Retry reading from cache after another task completed it
             let path = self.db_path.clone();
             let ip_owned = ip_owned.clone();
@@ -527,17 +527,14 @@ impl DashboardStore {
             })
             .await
             .map_err(|e| -> DynError { format!("geoip sqlite retry join failed: {e}").into() })??;
-            
+
             if let Some(res) = retry_cached {
                 return Ok(res);
             }
         } // Otherwise proceed with the request
-        
+
         // Cache miss or expired, fetch from API
-        let url = format!(
-            "http://ip-api.com/json/{}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query,proxy,hosting",
-            normalized_ip
-        );
+        let url = format!("http://ip-api.com/json/{}", normalized_ip);
         let resp = reqwest::get(&url).await?;
         let text = resp.text().await?;
         let json: serde_json::Value = serde_json::from_str(&text)?;
@@ -547,20 +544,20 @@ impl DashboardStore {
         let region = json.get("regionName").and_then(|v| v.as_str());
         let country = json.get("country").and_then(|v| v.as_str());
         let mut parts = Vec::new();
-        if let Some(name) = city {
-            let trimmed = name.trim();
+        if let Some(city) = city {
+            let trimmed = city.trim();
             if !trimmed.is_empty() {
                 parts.push(trimmed);
             }
         }
-        if let Some(name) = region {
-            let trimmed = name.trim();
+        if let Some(region) = region {
+            let trimmed = region.trim();
             if !trimmed.is_empty() && !parts.contains(&trimmed) {
                 parts.push(trimmed);
             }
         }
-        if let Some(name) = country {
-            let trimmed = name.trim();
+        if let Some(country) = country {
+            let trimmed = country.trim();
             if !trimmed.is_empty() && !parts.contains(&trimmed) {
                 parts.push(trimmed);
             }
@@ -589,7 +586,7 @@ impl DashboardStore {
         };
 
         // Save to cache (30 days expiration) using the normalized IP string (subnet for IPv6)
-        let c_res = res.clone();
+        let record = res.clone();
         let ip_owned = normalized_ip.clone();
         tokio::task::spawn_blocking(move || -> Result<(), DynError> {
             let conn = Self::open_connection(&path)?;
@@ -611,11 +608,11 @@ impl DashboardStore {
                  expires_at = excluded.expires_at",
                 params![
                     ip_owned,
-                    c_res.city,
-                    c_res.asn,
-                    c_res.isp,
-                    c_res.proxy,
-                    c_res.hosting,
+                    record.city,
+                    record.asn,
+                    record.isp,
+                    record.proxy,
+                    record.hosting,
                     expires_at
                 ],
             )?;
@@ -635,7 +632,7 @@ impl DashboardStore {
     }
 }
 
-pub async fn run_log_retention(store: Arc<DashboardStore>, cancel: CancellationToken) {
+async fn trigger_log_prune(store: Arc<DashboardStore>) {
     match store.prune_expired_logs().await {
         Ok(deleted) if deleted > 0 => {
             info!(
@@ -646,18 +643,15 @@ pub async fn run_log_retention(store: Arc<DashboardStore>, cancel: CancellationT
         Ok(_) => {}
         Err(error) => warn!(error = %error, "failed to prune expired DNS log rows"),
     }
+}
 
+pub async fn run_log_retention(store: Arc<DashboardStore>, cancel: CancellationToken) {
+    trigger_log_prune(store.clone()).await;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(DNS_LOG_PRUNE_INTERVAL) => {
-                match store.prune_expired_logs().await {
-                    Ok(deleted) if deleted > 0 => {
-                        info!(deleted, "pruned expired DNS log rows from dashboard sqlite store");
-                    }
-                    Ok(_) => {}
-                    Err(error) => warn!(error = %error, "failed to prune expired DNS log rows"),
-                }
+                trigger_log_prune(store.clone()).await;
             }
         }
     }
