@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 // ── Constants ───────────────────────────────────────────────────
@@ -26,6 +26,20 @@ const NOISE_FACTOR: f64 = 0.125;
 const ERROR_PENALTY_MULT: f64 = 8.0;
 const DEFAULT_LATENCY: f64 = 10.0;
 const MAX_CNAME_FOLLOW: usize = 16;
+const HEDGE_DELAY_MULT: f64 = 1.5;
+const HEDGE_DELAY_MIN_MS: u64 = 15;
+const HEDGE_DELAY_MAX_MS: u64 = 120;
+
+fn hedge_delay_for(uw: &UpstreamWrapper) -> Duration {
+    let base_ms = uw.ema_latency() as f64;
+    let base_ms = if base_ms > 0.0 {
+        base_ms
+    } else {
+        DEFAULT_LATENCY
+    };
+    let delay_ms = (base_ms * HEDGE_DELAY_MULT).round() as u64;
+    Duration::from_millis(delay_ms.clamp(HEDGE_DELAY_MIN_MS, HEDGE_DELAY_MAX_MS))
+}
 
 fn dns_header_rcode(resp_wire: &[u8]) -> Option<u16> {
     if resp_wire.len() < 4 {
@@ -405,18 +419,55 @@ impl Forward {
         }
 
         let total = selected.len();
+        let hedge_delay = hedge_delay_for(selected[0].as_ref());
         let mut tasks = tokio::task::JoinSet::new();
+        let mut next_to_launch = 0usize;
 
-        for (sel_idx, u) in selected.iter().enumerate() {
+        let launch_next = |tasks: &mut tokio::task::JoinSet<_>,
+                           next_to_launch: &mut usize,
+                           query_bytes: &Arc<[u8]>,
+                           selected: &[Arc<UpstreamWrapper>]| {
+            if *next_to_launch >= selected.len() {
+                return false;
+            }
+            let sel_idx = *next_to_launch;
+            *next_to_launch += 1;
             let qb = query_bytes.clone();
-            let u = u.clone();
+            let u = selected[sel_idx].clone();
             tasks.spawn(async move { (sel_idx, u.exchange(&qb).await) });
-        }
+            true
+        };
+
+        launch_next(&mut tasks, &mut next_to_launch, &query_bytes, &selected);
 
         let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut responses_received = 0;
 
-        while let Some(join_result) = tasks.join_next().await {
+        while responses_received < total {
+            let join_result = if next_to_launch < total {
+                match tokio::time::timeout(hedge_delay, tasks.join_next()).await {
+                    Ok(Some(v)) => Some(v),
+                    Ok(None) => {
+                        if launch_next(&mut tasks, &mut next_to_launch, &query_bytes, &selected) {
+                            continue;
+                        }
+                        None
+                    }
+                    Err(_) => {
+                        if launch_next(&mut tasks, &mut next_to_launch, &query_bytes, &selected) {
+                            continue;
+                        }
+                        tasks.join_next().await
+                    }
+                }
+            } else {
+                tasks.join_next().await
+            };
+
+            let Some(join_result) = join_result else {
+                break;
+            };
+
             responses_received += 1;
             let is_last = responses_received >= total;
 
