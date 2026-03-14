@@ -1326,6 +1326,7 @@ dependencies = [
 name = "redns-executables"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "async-trait",
  "hickory-proto",
  "lru",

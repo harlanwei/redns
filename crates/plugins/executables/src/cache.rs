@@ -6,14 +6,15 @@
 
 use async_trait::async_trait;
 use hickory_proto::op::Message;
+use hickory_proto::rr::RecordType;
 use lru::LruCache;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
 use serde::Serialize;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::fmt;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -46,6 +47,19 @@ struct CachedEntry {
     original_ttl: u32,
 }
 
+/// Cache key: lowercased QNAME + QTYPE.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CacheKey {
+    qname: String,
+    qtype: RecordType,
+}
+
+impl fmt::Display for CacheKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.qname, self.qtype)
+    }
+}
+
 impl CachedEntry {
     fn remaining_ttl(&self) -> u32 {
         let elapsed = self.stored_at.elapsed().as_secs() as u32;
@@ -63,10 +77,12 @@ impl CachedEntry {
     }
 }
 
-/// Cache key: lowercased QNAME + QTYPE.
-fn cache_key(ctx: &Context) -> Option<String> {
-    ctx.question()
-        .map(|q| format!("{}:{}", q.name().to_ascii().to_lowercase(), q.query_type()))
+/// Build the cache key from DNS question data.
+fn cache_key(ctx: &Context) -> Option<CacheKey> {
+    ctx.question().map(|q| CacheKey {
+        qname: q.name().to_ascii().to_lowercase(),
+        qtype: q.query_type(),
+    })
 }
 
 /// Extract the minimum TTL from a DNS response message.
@@ -111,7 +127,8 @@ pub struct Cache {
 struct CacheInner {
     id: usize,
     shard_count: usize,
-    shards: Vec<Mutex<LruCache<String, CachedEntry>>>,
+    shards: Vec<Mutex<LruCache<CacheKey, CachedEntry>>>,
+    shard_hasher: ahash::RandomState,
     lazy_ttl: Duration,
 }
 
@@ -157,6 +174,7 @@ impl Cache {
             id,
             shard_count,
             shards,
+            shard_hasher: ahash::RandomState::new(),
             lazy_ttl,
         });
         register_cache(&inner);
@@ -167,8 +185,8 @@ impl Cache {
         Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL)
     }
 
-    fn get_shard(&self, key: &str) -> &Mutex<LruCache<String, CachedEntry>> {
-        let mut s = DefaultHasher::new();
+    fn get_shard(&self, key: &CacheKey) -> &Mutex<LruCache<CacheKey, CachedEntry>> {
+        let mut s = self.inner.shard_hasher.build_hasher();
         key.hash(&mut s);
         let hash = s.finish();
         &self.inner.shards[(hash as usize) % self.inner.shard_count]
@@ -303,7 +321,7 @@ impl RecursiveExecutable for Cache {
 }
 
 impl Cache {
-    async fn store_entry(&self, key: &str, ctx: &Context) {
+    async fn store_entry(&self, key: &CacheKey, ctx: &Context) {
         if let Some(resp) = ctx.response() {
             let rcode = resp.response_code();
             let is_negative = rcode == hickory_proto::op::ResponseCode::NXDomain
@@ -324,7 +342,7 @@ impl Cache {
                         let mut store = shard.lock().await;
                         // LruCache automatically evicts oldest when at capacity.
                         store.put(
-                            key.to_string(),
+                            key.clone(),
                             CachedEntry {
                                 resp_bytes: bytes,
                                 stored_at: Instant::now(),
@@ -408,11 +426,18 @@ mod tests {
 
         // Simulate 5 different cache entries via the store directly.
         {
-            let shard = cache.get_shard("key");
+            let shard_key = CacheKey {
+                qname: "key".to_string(),
+                qtype: RecordType::A,
+            };
+            let shard = cache.get_shard(&shard_key);
             let mut store = shard.lock().await;
             for i in 0..5 {
                 store.put(
-                    format!("key{i}"),
+                    CacheKey {
+                        qname: format!("key{i}"),
+                        qtype: RecordType::A,
+                    },
                     CachedEntry {
                         resp_bytes: vec![],
                         stored_at: Instant::now(),
@@ -423,10 +448,30 @@ mod tests {
             // Sharding is disabled for small caches, so capacity stays exact.
             assert_eq!(store.len(), 2);
             // key0 should have been evicted (LRU).
-            assert!(store.get("key0").is_none());
-            assert!(store.get("key1").is_none());
-            assert!(store.get("key3").is_some());
-            assert!(store.get("key4").is_some());
+            assert!(store
+                .get(&CacheKey {
+                    qname: "key0".to_string(),
+                    qtype: RecordType::A,
+                })
+                .is_none());
+            assert!(store
+                .get(&CacheKey {
+                    qname: "key1".to_string(),
+                    qtype: RecordType::A,
+                })
+                .is_none());
+            assert!(store
+                .get(&CacheKey {
+                    qname: "key3".to_string(),
+                    qtype: RecordType::A,
+                })
+                .is_some());
+            assert!(store
+                .get(&CacheKey {
+                    qname: "key4".to_string(),
+                    qtype: RecordType::A,
+                })
+                .is_some());
         }
     }
 

@@ -11,6 +11,7 @@ tracing = "0.1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["time", "sync", "rt"] }
 lru = "0.12"
+ahash = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "0.0", default-features = false }
 
