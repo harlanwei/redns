@@ -4,5 +4,14 @@ import tailwindcss from "@tailwindcss/vite"
 
 // https://vitejs.dev/config/
 export default defineConfig({
-    plugins: [svelte(), tailwindcss()]
+    plugins: [svelte(), tailwindcss()],
+    build: {
+        rollupOptions: {
+            output: {
+                entryFileNames: 'assets/[name].js',
+                chunkFileNames: 'assets/[name].js',
+                assetFileNames: 'assets/[name].[ext]',
+            }
+        }
+    }
 })
