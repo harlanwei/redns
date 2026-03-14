@@ -2,7 +2,7 @@
   import { slide } from 'svelte/transition';
   import type { TabId } from '../types/dashboard';
 
-  const tabs: TabId[] = ['logs', 'clients', 'upstreams'];
+  const tabs: TabId[] = ['logs', 'clients', 'cache', 'upstreams'];
 
   let { activeTab, onTabChange } = $props<{
     activeTab: TabId;

@@ -11,14 +11,15 @@ use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
+use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::debug;
-
-use std::sync::Arc;
 
 /// Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -28,6 +29,9 @@ const DEFAULT_LAZY_TTL: Duration = Duration::from_secs(30);
 
 /// Number of shards for the cache to reduce lock contention.
 const CACHE_SHARDS: usize = 32;
+
+static CACHE_REGISTRY: OnceLock<StdMutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
+static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// A cached DNS response entry.
 struct CachedEntry {
@@ -102,8 +106,24 @@ pub struct Cache {
 }
 
 struct CacheInner {
+    id: usize,
     shards: Vec<Mutex<LruCache<String, CachedEntry>>>,
     lazy_ttl: Duration,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheShardSnapshot {
+    pub index: usize,
+    pub entries: usize,
+    pub capacity: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheSnapshot {
+    pub id: usize,
+    pub total_entries: usize,
+    pub total_capacity: usize,
+    pub shards: Vec<CacheShardSnapshot>,
 }
 
 impl Cache {
@@ -122,9 +142,11 @@ impl Cache {
             ));
         }
 
-        Self {
-            inner: Arc::new(CacheInner { shards, lazy_ttl }),
-        }
+        let id = CACHE_ID.fetch_add(1, Ordering::Relaxed);
+
+        let inner = Arc::new(CacheInner { id, shards, lazy_ttl });
+        register_cache(&inner);
+        Self { inner }
     }
 
     pub fn default_cache() -> Self {
@@ -137,6 +159,55 @@ impl Cache {
         let hash = s.finish();
         &self.inner.shards[(hash as usize) % CACHE_SHARDS]
     }
+}
+
+fn cache_registry() -> &'static StdMutex<Vec<Weak<CacheInner>>> {
+    CACHE_REGISTRY.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+fn register_cache(inner: &Arc<CacheInner>) {
+    let registry = cache_registry();
+    let mut guard = registry.lock().unwrap();
+    guard.retain(|cache| cache.upgrade().is_some());
+    guard.push(Arc::downgrade(inner));
+}
+
+pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
+    let caches: Vec<Arc<CacheInner>> = {
+        let registry = cache_registry();
+        let mut guard = registry.lock().unwrap();
+        guard.retain(|cache| cache.upgrade().is_some());
+        guard.iter().filter_map(|cache| cache.upgrade()).collect()
+    };
+
+    let mut snapshots = Vec::with_capacity(caches.len());
+    for cache in caches {
+        let mut total_entries = 0usize;
+        let mut total_capacity = 0usize;
+        let mut shards = Vec::with_capacity(cache.shards.len());
+
+        for (index, shard) in cache.shards.iter().enumerate() {
+            let store = shard.lock().await;
+            let entries = store.len();
+            let capacity = store.cap().get();
+            total_entries += entries;
+            total_capacity += capacity;
+            shards.push(CacheShardSnapshot {
+                index,
+                entries,
+                capacity,
+            });
+        }
+
+        snapshots.push(CacheSnapshot {
+            id: cache.id,
+            total_entries,
+            total_capacity,
+            shards,
+        });
+    }
+
+    snapshots
 }
 
 #[async_trait]

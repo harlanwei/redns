@@ -3,6 +3,7 @@
   import LogsView from './lib/components/LogsView.svelte';
   import ClientsView from './lib/components/ClientsView.svelte';
   import UpstreamsView from './lib/components/UpstreamsView.svelte';
+  import CacheView from './lib/components/CacheView.svelte';
   import type { TabId } from './lib/types/dashboard';
 
   let activeTab = $state<TabId>('logs');
@@ -16,6 +17,8 @@
       <LogsView />
     {:else if activeTab === 'clients'}
       <ClientsView />
+    {:else if activeTab === 'cache'}
+      <CacheView />
     {:else if activeTab === 'upstreams'}
       <UpstreamsView />
     {/if}

@@ -824,6 +824,15 @@ async fn handle_api_request(
             body
         );
         stream.write_all(resp.as_bytes()).await?;
+    } else if method == "GET" && path == "/metrics/cache" {
+        let metrics = redns_executables::cache::cache_registry_snapshot().await;
+        let body = serde_json::to_string_pretty(&metrics)?;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).await?;
     } else {
         let body = "{\"error\":\"not found\"}";
         let resp = format!(

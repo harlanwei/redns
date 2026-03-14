@@ -1,4 +1,4 @@
-export type TabId = 'logs' | 'clients' | 'upstreams';
+export type TabId = 'logs' | 'clients' | 'cache' | 'upstreams';
 
 export type DnsLogEntry = {
   id: number;
@@ -69,3 +69,16 @@ export type UpstreamSortCol =
   | 'adopted_total'
   | 'final_selected_total'
   | 'rejected_rcode_total';
+
+export type CacheShardSnapshot = {
+  index: number;
+  entries: number;
+  capacity: number;
+};
+
+export type CacheSnapshot = {
+  id: number;
+  total_entries: number;
+  total_capacity: number;
+  shards: CacheShardSnapshot[];
+};

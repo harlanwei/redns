@@ -584,6 +584,16 @@ async fn handle_dashboard_request(
             )
             .await?;
         }
+        ("GET", "/api/cache") => {
+            let body = cache_metrics_json(&state).await?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await?;
+        }
         ("GET", "/api/geoip") => {
             let ip_str = query.get("ip").map(|s| s.as_str()).unwrap_or("");
             if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
@@ -763,6 +773,20 @@ async fn upstream_metrics_json(state: &DashboardState) -> Result<String, DynErro
     Ok(serde_json::to_string(&metrics)?)
 }
 
+async fn cache_metrics_json(state: &DashboardState) -> Result<String, DynError> {
+    if let Some(api_addr) = &state.api_http {
+        match fetch_cache_from_api(api_addr).await {
+            Ok(body) => return Ok(body),
+            Err(e) => {
+                warn!(error = %e, addr = %api_addr, "failed to fetch cache metrics from API");
+            }
+        }
+    }
+
+    let metrics = redns_executables::cache::cache_registry_snapshot().await;
+    Ok(serde_json::to_string(&metrics)?)
+}
+
 async fn fetch_upstreams_from_api(api_addr: &str) -> Result<String, DynError> {
     let mut stream = TcpStream::connect(api_addr)
         .await
@@ -772,6 +796,40 @@ async fn fetch_upstreams_from_api(api_addr: &str) -> Result<String, DynError> {
 
     let req = format!(
         "GET /metrics/upstreams HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        api_addr
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| -> DynError { format!("failed to send API request: {}", e).into() })?;
+
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| -> DynError { format!("failed to read API response: {}", e).into() })?;
+
+    let response = String::from_utf8_lossy(&bytes);
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| -> DynError { "invalid API response format".into() })?;
+    let status_line = headers.lines().next().unwrap_or("");
+    if !status_line.contains(" 200 ") {
+        return Err(format!("API returned non-200 status: {}", status_line).into());
+    }
+
+    Ok(body.to_string())
+}
+
+async fn fetch_cache_from_api(api_addr: &str) -> Result<String, DynError> {
+    let mut stream = TcpStream::connect(api_addr)
+        .await
+        .map_err(|e| -> DynError {
+            format!("failed to connect to API {}: {}", api_addr, e).into()
+        })?;
+
+    let req = format!(
+        "GET /metrics/cache HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         api_addr
     );
     stream
