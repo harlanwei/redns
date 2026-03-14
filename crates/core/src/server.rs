@@ -45,6 +45,8 @@ pub struct QueryMeta {
     pub server_name: Option<String>,
     /// Optional selected upstream collector for query observers.
     pub selected_upstreams: Option<Arc<Mutex<Vec<String>>>>,
+    /// Optional original DNS query wire bytes.
+    pub query_wire: Option<Arc<Vec<u8>>>,
 }
 
 /// A DNS handler that processes a query and returns a response.
@@ -96,6 +98,7 @@ impl DnsHandler for EntryHandler {
         ctx.server_meta.client_addr = meta.client_addr;
         ctx.server_meta.url_path = meta.url_path;
         ctx.server_meta.server_name = meta.server_name;
+        ctx.set_query_wire(meta.query_wire.clone());
         let result = self.entry.exec(&mut ctx).await;
         let elapsed = start.elapsed();
         let selected_upstream = if result.is_ok() && ctx.response().is_some() {

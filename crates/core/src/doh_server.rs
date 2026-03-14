@@ -131,7 +131,7 @@ async fn handle_doh_connection(
                         Some(encoded) => {
                             match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) {
                                 Ok(bytes) => match Message::from_vec(&bytes) {
-                                    Ok(msg) => Some(msg),
+                                    Ok(msg) => Some((msg, Arc::new(bytes))),
                                     Err(e) => {
                                         warn!(error = %e, "invalid DNS query in GET");
                                         send_http_error(&mut stream, 400, "Invalid DNS message")
@@ -192,7 +192,7 @@ async fn handle_doh_connection(
                 }
 
                 match Message::from_vec(&body) {
-                    Ok(msg) => Some(msg),
+                    Ok(msg) => Some((msg, Arc::new(body))),
                     Err(e) => {
                         warn!(error = %e, "invalid DNS query in POST body");
                         send_http_error(&mut stream, 400, "Invalid DNS message").await?;
@@ -206,7 +206,7 @@ async fn handle_doh_connection(
             }
         };
 
-        if let Some(query) = dns_query {
+        if let Some((query, query_wire)) = dns_query {
             let meta = QueryMeta {
                 protocol: Some("doh".to_string()),
                 from_udp: false,
@@ -214,6 +214,7 @@ async fn handle_doh_connection(
                 url_path: Some(request_path),
                 server_name: None,
                 selected_upstreams: None,
+                query_wire: Some(query_wire),
             };
 
             match handler.handle(query, meta).await {

@@ -391,7 +391,7 @@ impl Forward {
 
     async fn resolve_once(
         &self,
-        query_bytes: Arc<[u8]>,
+        query_bytes: Arc<Vec<u8>>,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let selected_indices = self.selector.select(self.concurrent);
         let selected: Vec<Arc<UpstreamWrapper>> = selected_indices
@@ -407,7 +407,7 @@ impl Forward {
 
         if selected.len() == 1 {
             let start = Instant::now();
-            let resp_bytes = selected[0].exchange(&query_bytes).await?;
+            let resp_bytes = selected[0].exchange(query_bytes.as_slice()).await?;
             debug!(upstream = %selected[0].name(), elapsed = ?start.elapsed(), "forward: upstream responded");
             let resp = Message::from_vec(&resp_bytes).map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -425,7 +425,7 @@ impl Forward {
 
         let launch_next = |tasks: &mut tokio::task::JoinSet<_>,
                            next_to_launch: &mut usize,
-                           query_bytes: &Arc<[u8]>,
+                           query_bytes: &Arc<Vec<u8>>,
                            selected: &[Arc<UpstreamWrapper>]| {
             if *next_to_launch >= selected.len() {
                 return false;
@@ -434,7 +434,7 @@ impl Forward {
             *next_to_launch += 1;
             let qb = query_bytes.clone();
             let u = selected[sel_idx].clone();
-            tasks.spawn(async move { (sel_idx, u.exchange(&qb).await) });
+            tasks.spawn(async move { (sel_idx, u.exchange(qb.as_slice()).await) });
             true
         };
 
@@ -532,6 +532,7 @@ impl Forward {
     async fn resolve_with_cname_chase(
         &self,
         query: &Message,
+        initial_query_wire: Option<Arc<Vec<u8>>>,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let question = query.queries().first().ok_or_else(
             || -> Box<dyn std::error::Error + Send + Sync> {
@@ -542,12 +543,15 @@ impl Forward {
         let qtype = question.query_type();
 
         if qtype == RecordType::CNAME {
-            let query_bytes: Arc<[u8]> = query
-                .to_vec()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("failed to serialize query: {e}").into()
-                })?
-                .into();
+            let query_bytes = if let Some(raw) = initial_query_wire {
+                raw
+            } else {
+                Arc::new(query.to_vec().map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("failed to serialize query: {e}").into()
+                    },
+                )?)
+            };
             return self.resolve_once(query_bytes).await;
         }
 
@@ -565,12 +569,23 @@ impl Forward {
                     "forward: query has no question".into()
                 })?;
 
-            let query_bytes: Arc<[u8]> = chase_query
-                .to_vec()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("failed to serialize query: {e}").into()
-                })?
-                .into();
+            let query_bytes = if depth == 0 {
+                if let Some(raw) = initial_query_wire.as_ref() {
+                    raw.clone()
+                } else {
+                    Arc::new(chase_query.to_vec().map_err(
+                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("failed to serialize query: {e}").into()
+                        },
+                    )?)
+                }
+            } else {
+                Arc::new(chase_query.to_vec().map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("failed to serialize query: {e}").into()
+                    },
+                )?)
+            };
 
             let (resp, upstream) = self.resolve_once(query_bytes).await?;
 
@@ -647,7 +662,9 @@ impl Executable for Forward {
             return Ok(());
         }
 
-        let (resp, selected_upstream) = self.resolve_with_cname_chase(ctx.query()).await?;
+        let (resp, selected_upstream) = self
+            .resolve_with_cname_chase(ctx.query(), ctx.query_wire().cloned())
+            .await?;
         ctx.store_value(KV_SELECTED_UPSTREAM, selected_upstream);
         ctx.set_response(Some(resp));
 

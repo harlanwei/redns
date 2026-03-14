@@ -81,6 +81,7 @@ pub async fn serve_tcp(
                             url_path: None,
                             server_name: None,
                             selected_upstreams: None,
+                            query_wire: Some(Arc::new(msg_buf)),
                         };
 
                         match handler.handle(query, meta).await {

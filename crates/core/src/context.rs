@@ -66,6 +66,9 @@ pub struct Context {
     /// The original EDNS0 OPT sent by the client (if any).
     client_edns: Option<Edns>,
 
+    /// Optional original query wire bytes as received by the server.
+    query_wire: Option<std::sync::Arc<Vec<u8>>>,
+
     /// The DNS response (may be `None` until a plugin sets it).
     response: Option<Message>,
 
@@ -104,6 +107,7 @@ impl Context {
             server_meta: ServerMeta::default(),
             query,
             client_edns,
+            query_wire: None,
             response: None,
             kv: HashMap::new(),
             marks: HashSet::new(),
@@ -140,6 +144,16 @@ impl Context {
     /// Returns the EDNS0 OPT sent by the client (may be `None`).
     pub fn client_edns(&self) -> Option<&Edns> {
         self.client_edns.as_ref()
+    }
+
+    /// Sets optional original query wire bytes captured by the ingress server.
+    pub fn set_query_wire(&mut self, wire: Option<std::sync::Arc<Vec<u8>>>) {
+        self.query_wire = wire;
+    }
+
+    /// Returns original query wire bytes when available.
+    pub fn query_wire(&self) -> Option<&std::sync::Arc<Vec<u8>>> {
+        self.query_wire.as_ref()
     }
 
     // ── Response ─────────────────────────────────────────────────

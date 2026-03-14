@@ -60,6 +60,7 @@ async fn udp_worker(
                     url_path: None,
                     server_name: None,
                     selected_upstreams: None,
+                    query_wire: None,
                 };
 
                 match handler.handle(query, meta).await {
