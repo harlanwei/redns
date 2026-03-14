@@ -120,6 +120,32 @@ fn bind_tcp_listener(addr: &str) -> io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
+fn parse_cache_size_arg(args: &str) -> usize {
+    #[derive(serde::Deserialize)]
+    struct CacheArgs {
+        #[serde(default)]
+        size: Option<usize>,
+    }
+
+    let args = args.trim();
+    if args.is_empty() {
+        // Set to zero here. The Cache plugin treats zero as "use default size" and will apply its own default.
+        return 0;
+    }
+
+    if let Ok(size) = args.parse::<usize>() {
+        return size;
+    }
+
+    if let Ok(cfg) = redns_core::config::deserialize_yaml_str::<CacheArgs>(args) {
+        if let Some(size) = cfg.size {
+            return size;
+        }
+    }
+
+    0
+}
+
 /// Registers all built-in matcher and executor factories on the given builder.
 fn register_builtins(builder: &mut ChainBuilder) {
     use redns_core::built_in::*;
@@ -182,7 +208,7 @@ fn register_builtins(builder: &mut ChainBuilder) {
     builder.register_rec_exec(
         "cache",
         Box::new(|args: &str| {
-            let size: usize = args.trim().parse().unwrap_or(1024);
+            let size = parse_cache_size_arg(args);
             Ok(
                 Box::new(Cache::new(size, std::time::Duration::from_secs(30)))
                     as Box<dyn RecursiveExecutable>,
@@ -743,7 +769,22 @@ async fn run_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_tcp_listener, bind_udp_socket};
+    use super::{bind_tcp_listener, bind_udp_socket, parse_cache_size_arg};
+
+    #[test]
+    fn cache_size_parses_plain_integer_arg() {
+        assert_eq!(parse_cache_size_arg("16384"), 16384);
+    }
+
+    #[test]
+    fn cache_size_parses_yaml_mapping_arg() {
+        assert_eq!(parse_cache_size_arg("size: 16384"), 16384);
+    }
+
+    #[test]
+    fn cache_size_defaults_when_arg_is_invalid() {
+        assert_eq!(parse_cache_size_arg("size: nope"), 1024);
+    }
 
     #[tokio::test]
     async fn udp_ipv4_and_ipv6_any_can_share_a_port() {
