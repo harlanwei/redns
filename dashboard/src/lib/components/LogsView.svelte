@@ -400,8 +400,8 @@
                 </div>
                 {#if (selectedLog?.upstreams?.length ?? 0) > 0}
                   <div class="flex flex-col sm:flex-row sm:justify-between sm:items-start">
-                    <div class="text-gray-500 font-medium mb-1 sm:mb-0 mt-1">Upstreams</div>
-                    <div class="flex flex-wrap gap-1 justify-end">
+                    <div class="text-gray-500 font-medium mb-1 sm:mb-0 mt-1">Upstream</div>
+                    <div class="flex flex-wrap gap-1">
                       {#each selectedLog?.upstreams ?? [] as upstream}
                         {#if upstream === '__C__'}
                           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-cyan-50 text-cyan-700 ring-1 ring-inset ring-cyan-600/20">System Cache</span>
