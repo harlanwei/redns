@@ -146,9 +146,9 @@ impl Cache {
         let shard_cap = std::cmp::max(1, cap.div_ceil(shard_count));
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Mutex::new(
-                LruCache::new(NonZeroUsize::new(shard_cap).unwrap()),
-            ));
+            shards.push(Mutex::new(LruCache::new(
+                NonZeroUsize::new(shard_cap).unwrap(),
+            )));
         }
 
         let id = CACHE_ID.fetch_add(1, Ordering::Relaxed);
@@ -226,11 +226,7 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
 
 #[async_trait]
 impl RecursiveExecutable for Cache {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         let key = match cache_key(ctx) {
             Some(k) => k,
             None => return next.exec_next(ctx).await,

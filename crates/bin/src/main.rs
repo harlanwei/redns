@@ -706,7 +706,10 @@ async fn run_server(
                         "dashboard/dist".to_string()
                     }
                 });
-                let mmdb_city = cfg.dashboard.mmdb_city.as_ref()
+                let mmdb_city = cfg
+                    .dashboard
+                    .mmdb_city
+                    .as_ref()
                     .map(|s| s.as_str())
                     .or_else(|| {
                         if std::path::Path::new("GeoLite2-City.mmdb").exists() {
@@ -716,13 +719,19 @@ async fn run_server(
                         }
                     })
                     .and_then(|path| {
-                        maxminddb::Reader::open_readfile(path).map(Arc::new).map_err(|e| {
-                            warn!(error = %e, path = %path, "failed to load mmdb_city");
-                            e
-                        }).ok()
+                        maxminddb::Reader::open_readfile(path)
+                            .map(Arc::new)
+                            .map_err(|e| {
+                                warn!(error = %e, path = %path, "failed to load mmdb_city");
+                                e
+                            })
+                            .ok()
                     });
 
-                let mmdb_asn = cfg.dashboard.mmdb_asn.as_ref()
+                let mmdb_asn = cfg
+                    .dashboard
+                    .mmdb_asn
+                    .as_ref()
                     .map(|s| s.as_str())
                     .or_else(|| {
                         if std::path::Path::new("GeoLite2-ASN.mmdb").exists() {
@@ -732,10 +741,13 @@ async fn run_server(
                         }
                     })
                     .and_then(|path| {
-                        maxminddb::Reader::open_readfile(path).map(Arc::new).map_err(|e| {
-                            warn!(error = %e, path = %path, "failed to load mmdb_asn");
-                            e
-                        }).ok()
+                        maxminddb::Reader::open_readfile(path)
+                            .map(Arc::new)
+                            .map_err(|e| {
+                                warn!(error = %e, path = %path, "failed to load mmdb_asn");
+                                e
+                            })
+                            .ok()
                     });
 
                 let state = dashboard::DashboardState {

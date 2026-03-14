@@ -1,8 +1,8 @@
 dashboard:
-	if [ ! -d dashboard/dist ]; then make -C dashboard; fi
+	make -C dashboard
 
 amd64-musl: dashboard
-	cargo build --release --target x86_64-unknown-linux-musl
+	RUSTFLAGS='-C target-cpu=x86-64-v3' cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 amd64: dashboard
 	RUSTFLAGS='-C target-cpu=x86-64-v3' cargo build --release --target x86_64-unknown-linux-gnu

@@ -57,11 +57,7 @@ impl Default for Redirect {
 
 #[async_trait]
 impl RecursiveExecutable for Redirect {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         let question = match ctx.question() {
             Some(q) => q.clone(),
             None => return next.exec_next(ctx).await,

@@ -36,11 +36,7 @@ impl Default for QuerySummary {
 
 #[async_trait]
 impl RecursiveExecutable for QuerySummary {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         let result = next.exec_next(ctx).await;
         let question = ctx
             .question()

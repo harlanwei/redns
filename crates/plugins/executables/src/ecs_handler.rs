@@ -109,11 +109,7 @@ impl EcsHandler {
 
 #[async_trait]
 impl RecursiveExecutable for EcsHandler {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         // Don't add ECS if query already has one.
         if Self::has_ecs(ctx.query()) {
             return next.exec_next(ctx).await;

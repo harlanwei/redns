@@ -84,11 +84,7 @@ pub struct MetricsSnapshot {
 
 #[async_trait]
 impl RecursiveExecutable for MetricsCollector {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         self.active_threads.fetch_add(1, Ordering::Relaxed);
         self.query_total.fetch_add(1, Ordering::Relaxed);
 

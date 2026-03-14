@@ -140,7 +140,9 @@ pub struct Sequence {
 impl Sequence {
     /// Creates a new sequence from a list of chain nodes.
     pub fn new(chain: Vec<ChainNode>) -> Self {
-        Self { chain: chain.into() }
+        Self {
+            chain: chain.into(),
+        }
     }
 
     /// Returns a reference to the chain for `jump`/`goto` targets.
@@ -207,11 +209,7 @@ mod tests {
     struct StopExec;
     #[async_trait]
     impl RecursiveExecutable for StopExec {
-        async fn exec_recursive(
-            &self,
-            _ctx: &mut Context,
-            _next: ChainWalker,
-        ) -> PluginResult<()> {
+        async fn exec_recursive(&self, _ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
             Ok(()) // drop `next` — stops chain
         }
     }

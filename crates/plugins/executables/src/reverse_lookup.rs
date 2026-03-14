@@ -192,11 +192,7 @@ fn parse_ptr_name(name: &str) -> Option<IpAddr> {
 
 #[async_trait]
 impl RecursiveExecutable for ReverseLookup {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         // Try to handle PTR from cache.
         if let Some(resp) = self.try_respond_ptr(ctx.query()) {
             ctx.set_response(Some(resp));

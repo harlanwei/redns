@@ -52,11 +52,7 @@ impl DualSelector {
 
 #[async_trait]
 impl RecursiveExecutable for DualSelector {
-    async fn exec_recursive(
-        &self,
-        ctx: &mut Context,
-        mut next: ChainWalker,
-    ) -> PluginResult<()> {
+    async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         let qtype = match ctx.question() {
             Some(q) => q.query_type(),
             None => return next.exec_next(ctx).await,
