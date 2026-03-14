@@ -521,6 +521,7 @@ impl DohUpstream {
         let mut builder = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(180))
             .pool_max_idle_per_host(4);
 
         match resolution {
