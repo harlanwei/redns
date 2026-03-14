@@ -37,8 +37,8 @@ static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// A cached DNS response entry.
 struct CachedEntry {
-    /// The cached response wire bytes.
-    resp_bytes: Vec<u8>,
+    /// Cached parsed DNS response.
+    resp: Message,
     /// Time this entry was stored.
     stored_at: Instant,
     /// Original minimum TTL of the response records.
@@ -258,7 +258,7 @@ impl RecursiveExecutable for Cache {
 
         // Check cache.
         let mut do_optimistic_refresh = false;
-        let mut cached_payload: Option<(Vec<u8>, u32, bool)> = None;
+        let mut cached_payload: Option<(Message, u32, bool)> = None;
         {
             let shard = self.get_shard(&key);
             let mut store = shard.lock().await;
@@ -266,7 +266,7 @@ impl RecursiveExecutable for Cache {
                 if !entry.is_expired() {
                     // Fresh hit.
                     let ttl = entry.remaining_ttl();
-                    cached_payload = Some((entry.resp_bytes.clone(), ttl, false));
+                    cached_payload = Some((entry.resp.clone(), ttl, false));
 
                     let elapsed = entry.stored_at.elapsed().as_secs() as u32;
                     if elapsed >= (entry.original_ttl as f32 * 0.8) as u32 {
@@ -278,25 +278,23 @@ impl RecursiveExecutable for Cache {
                     // Stale but within lazy window — serve stale and refresh.
                     do_optimistic_refresh = true;
                     entry.stored_at = Instant::now();
-                    cached_payload = Some((entry.resp_bytes.clone(), 1, true));
+                    cached_payload = Some((entry.resp.clone(), 1, true));
                 }
             }
         }
 
         let mut served_from_cache = false;
-        if let Some((resp_bytes, ttl, stale_hit)) = cached_payload {
-            if let Ok(mut resp) = Message::from_vec(&resp_bytes) {
-                resp.set_id(ctx.query().id());
-                adjust_ttl(&mut resp, ttl);
-                ctx.set_response(Some(resp));
-                ctx.set_mark(MARK_CACHE_HIT);
-                if stale_hit {
-                    debug!(key = %key, "cache lazy hit (stale)");
-                } else {
-                    debug!(key = %key, ttl = ttl, "cache hit");
-                }
-                served_from_cache = true;
+        if let Some((mut resp, ttl, stale_hit)) = cached_payload {
+            resp.set_id(ctx.query().id());
+            adjust_ttl(&mut resp, ttl);
+            ctx.set_response(Some(resp));
+            ctx.set_mark(MARK_CACHE_HIT);
+            if stale_hit {
+                debug!(key = %key, "cache lazy hit (stale)");
+            } else {
+                debug!(key = %key, ttl = ttl, "cache hit");
             }
+            served_from_cache = true;
         }
 
         if do_optimistic_refresh {
@@ -354,19 +352,17 @@ impl Cache {
                 }
 
                 if ttl > 0 {
-                    if let Ok(bytes) = resp.to_vec() {
-                        let shard = self.get_shard(key);
-                        let mut store = shard.lock().await;
-                        // LruCache automatically evicts oldest when at capacity.
-                        store.put(
-                            key.clone(),
-                            CachedEntry {
-                                resp_bytes: bytes,
-                                stored_at: Instant::now(),
-                                original_ttl: ttl,
-                            },
-                        );
-                    }
+                    let shard = self.get_shard(key);
+                    let mut store = shard.lock().await;
+                    // LruCache automatically evicts oldest when at capacity.
+                    store.put(
+                        key.clone(),
+                        CachedEntry {
+                            resp: resp.clone(),
+                            stored_at: Instant::now(),
+                            original_ttl: ttl,
+                        },
+                    );
                 }
             }
         }
@@ -486,7 +482,7 @@ mod tests {
                         qtype: RecordType::A,
                     },
                     CachedEntry {
-                        resp_bytes: vec![],
+                        resp: Message::new(),
                         stored_at: Instant::now(),
                         original_ttl: 300,
                     },
