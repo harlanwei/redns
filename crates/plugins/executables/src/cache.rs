@@ -13,6 +13,7 @@ use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -129,6 +130,7 @@ struct CacheInner {
     shard_count: usize,
     shards: Vec<Mutex<LruCache<CacheKey, CachedEntry>>>,
     shard_hasher: ahash::RandomState,
+    inflight_refreshes: Mutex<HashSet<CacheKey>>,
     lazy_ttl: Duration,
 }
 
@@ -175,6 +177,7 @@ impl Cache {
             shard_count,
             shards,
             shard_hasher: ahash::RandomState::new(),
+            inflight_refreshes: Mutex::new(HashSet::new()),
             lazy_ttl,
         });
         register_cache(&inner);
@@ -294,6 +297,13 @@ impl RecursiveExecutable for Cache {
         }
 
         if do_optimistic_refresh {
+            let mut inflight = self.inner.inflight_refreshes.lock().await;
+            let should_spawn_refresh = inflight.insert(key.clone());
+            drop(inflight);
+
+            if !should_spawn_refresh {
+                debug!(key = %key, "refresh already in-flight; skipping duplicate");
+            } else {
             let mut refresh_ctx = Context::new(ctx.query().clone());
             refresh_ctx.server_meta = ctx.server_meta.clone();
             let mut refresh_next = next.clone();
@@ -303,7 +313,11 @@ impl RecursiveExecutable for Cache {
                 debug!(key = %refresh_key, "background optimistic refresh triggered");
                 let _ = refresh_next.exec_next(&mut refresh_ctx).await;
                 cache_clone.store_entry(&refresh_key, &refresh_ctx).await;
+
+                let mut inflight = cache_clone.inner.inflight_refreshes.lock().await;
+                inflight.remove(&refresh_key);
             });
+            }
         }
 
         if served_from_cache {
@@ -364,6 +378,8 @@ mod tests {
     use redns_core::plugin::Executable;
     use redns_core::sequence::{ChainNode, NodeExecutor, Sequence};
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
 
     struct RespondWithTtl(u32);
     #[async_trait]
@@ -378,6 +394,34 @@ mod tests {
             resp.add_answer(Record::from_rdata(
                 q.name().clone(),
                 self.0,
+                RData::A(Ipv4Addr::new(1, 2, 3, 4).into()),
+            ));
+            ctx.set_response(Some(resp));
+            Ok(())
+        }
+    }
+
+    struct CountingDelayedResponder {
+        ttl: u32,
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl Executable for CountingDelayedResponder {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+
+            let q = ctx.question().unwrap().clone();
+            let mut resp = Message::new();
+            resp.set_id(ctx.query().id());
+            resp.set_message_type(MessageType::Response);
+            resp.set_response_code(ResponseCode::NoError);
+            resp.add_query(q.clone());
+            resp.add_answer(Record::from_rdata(
+                q.name().clone(),
+                self.ttl,
                 RData::A(Ipv4Addr::new(1, 2, 3, 4).into()),
             ));
             ctx.set_response(Some(resp));
@@ -473,6 +517,49 @@ mod tests {
                 })
                 .is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn deduplicates_inflight_refresh_for_same_key() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Cache::new(128, Duration::from_secs(30));
+        let chain: Vec<ChainNode> = vec![
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(cache)),
+            },
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
+                    ttl: 1,
+                    calls: Arc::clone(&calls),
+                    delay: Duration::from_millis(250),
+                })),
+            },
+        ];
+        let seq = Sequence::new(chain);
+
+        // Prime cache.
+        let mut first = Context::new(make_query());
+        seq.exec(&mut first).await.unwrap();
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+
+        // Make entry stale but still within lazy window.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Trigger one background refresh.
+        let mut stale_1 = Context::new(make_query());
+        seq.exec(&mut stale_1).await.unwrap();
+
+        // Duplicate stale hit for same key while first refresh is still running.
+        let mut stale_2 = Context::new(make_query());
+        seq.exec(&mut stale_2).await.unwrap();
+
+        // Wait for single background refresh completion.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // One initial upstream call + one deduplicated refresh.
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]
