@@ -307,19 +307,19 @@ impl RecursiveExecutable for Cache {
             if !should_spawn_refresh {
                 debug!(key = %key, "refresh already in-flight; skipping duplicate");
             } else {
-            let mut refresh_ctx = Context::new(ctx.query().clone());
-            refresh_ctx.server_meta = ctx.server_meta.clone();
-            let mut refresh_next = next.clone();
-            let cache_clone = self.clone();
-            let refresh_key = key.clone();
-            tokio::spawn(async move {
-                debug!(key = %refresh_key, "background optimistic refresh triggered");
-                let _ = refresh_next.exec_next(&mut refresh_ctx).await;
-                cache_clone.store_entry(&refresh_key, &refresh_ctx).await;
+                let mut refresh_ctx = Context::new(ctx.query().clone());
+                refresh_ctx.server_meta = ctx.server_meta.clone();
+                let mut refresh_next = next.clone();
+                let cache_clone = self.clone();
+                let refresh_key = key.clone();
+                tokio::spawn(async move {
+                    debug!(key = %refresh_key, "background optimistic refresh triggered");
+                    let _ = refresh_next.exec_next(&mut refresh_ctx).await;
+                    cache_clone.store_entry(&refresh_key, &refresh_ctx).await;
 
-                let mut inflight = cache_clone.inner.inflight_refreshes.lock().await;
-                inflight.remove(&refresh_key);
-            });
+                    let mut inflight = cache_clone.inner.inflight_refreshes.lock().await;
+                    inflight.remove(&refresh_key);
+                });
             }
         }
 
@@ -381,8 +381,8 @@ mod tests {
     use redns_core::plugin::Executable;
     use redns_core::sequence::{ChainNode, NodeExecutor, Sequence};
     use std::net::Ipv4Addr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     struct RespondWithTtl(u32);
     #[async_trait]
@@ -495,30 +495,38 @@ mod tests {
             // Sharding is disabled for small caches, so capacity stays exact.
             assert_eq!(store.len(), 2);
             // key0 should have been evicted (LRU).
-            assert!(store
-                .get(&CacheKey {
-                    qname: "key0".to_string(),
-                    qtype: RecordType::A,
-                })
-                .is_none());
-            assert!(store
-                .get(&CacheKey {
-                    qname: "key1".to_string(),
-                    qtype: RecordType::A,
-                })
-                .is_none());
-            assert!(store
-                .get(&CacheKey {
-                    qname: "key3".to_string(),
-                    qtype: RecordType::A,
-                })
-                .is_some());
-            assert!(store
-                .get(&CacheKey {
-                    qname: "key4".to_string(),
-                    qtype: RecordType::A,
-                })
-                .is_some());
+            assert!(
+                store
+                    .get(&CacheKey {
+                        qname: "key0".to_string(),
+                        qtype: RecordType::A,
+                    })
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get(&CacheKey {
+                        qname: "key1".to_string(),
+                        qtype: RecordType::A,
+                    })
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get(&CacheKey {
+                        qname: "key3".to_string(),
+                        qtype: RecordType::A,
+                    })
+                    .is_some()
+            );
+            assert!(
+                store
+                    .get(&CacheKey {
+                        qname: "key4".to_string(),
+                        qtype: RecordType::A,
+                    })
+                    .is_some()
+            );
         }
     }
 

@@ -152,6 +152,13 @@ impl DomainSet {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.full.is_empty()
+            && self.domain.root.children.is_empty()
+            && self.keywords.is_empty()
+            && self.regexes.is_empty()
+    }
+
     /// Normalize a domain: lowercase, strip leading/trailing dots.
     fn normalize(s: &str) -> String {
         s.trim()
@@ -255,13 +262,19 @@ impl DomainSet {
     ///
     /// Supports `&path` to load domain lists from files.
     pub fn from_str_args(s: &str) -> PluginResult<Self> {
+        let trimmed = s.trim();
+
         // Try YAML struct deserialization first.
         if let Ok(ds) = Self::from_yaml_str(s) {
-            return Ok(ds);
+            // `&path` can be interpreted by YAML as an anchor token and deserialize
+            // into an empty struct; preserve quick-arg file loading for that case.
+            if !(trimmed.starts_with('&') && ds.is_empty()) {
+                return Ok(ds);
+            }
         }
         // Fall back to newline/space-separated expressions.
         let mut ds = Self::new();
-        for part in s.split_whitespace() {
+        for part in trimmed.split_whitespace() {
             if let Some(path) = part.strip_prefix('&') {
                 if let Err(e) = ds.load_file(path) {
                     warn!(error = %e, file = path, "failed to load domain file");

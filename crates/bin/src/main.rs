@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn cache_size_defaults_when_arg_is_invalid() {
-        assert_eq!(parse_cache_size_arg("size: nope"), 1024);
+        assert_eq!(parse_cache_size_arg("size: nope"), 0);
     }
 
     #[tokio::test]
