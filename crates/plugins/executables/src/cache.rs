@@ -30,6 +30,9 @@ const DEFAULT_LAZY_TTL: Duration = Duration::from_secs(30);
 /// Number of shards for the cache to reduce lock contention.
 const CACHE_SHARDS: usize = 32;
 
+/// Minimum capacity to enable sharding.
+const SHARDING_MIN_CAPACITY: usize = 4096;
+
 static CACHE_REGISTRY: OnceLock<StdMutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
 static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -107,6 +110,7 @@ pub struct Cache {
 
 struct CacheInner {
     id: usize,
+    shard_count: usize,
     shards: Vec<Mutex<LruCache<String, CachedEntry>>>,
     lazy_ttl: Duration,
 }
@@ -134,9 +138,14 @@ impl Cache {
             max_size
         };
 
-        let shard_cap = cap / CACHE_SHARDS;
-        let mut shards = Vec::with_capacity(CACHE_SHARDS);
-        for _ in 0..CACHE_SHARDS {
+        let shard_count = if cap <= SHARDING_MIN_CAPACITY {
+            1
+        } else {
+            CACHE_SHARDS
+        };
+        let shard_cap = std::cmp::max(1, cap.div_ceil(shard_count));
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
             shards.push(Mutex::new(
                 LruCache::new(NonZeroUsize::new(shard_cap).unwrap()),
             ));
@@ -144,7 +153,12 @@ impl Cache {
 
         let id = CACHE_ID.fetch_add(1, Ordering::Relaxed);
 
-        let inner = Arc::new(CacheInner { id, shards, lazy_ttl });
+        let inner = Arc::new(CacheInner {
+            id,
+            shard_count,
+            shards,
+            lazy_ttl,
+        });
         register_cache(&inner);
         Self { inner }
     }
@@ -157,7 +171,7 @@ impl Cache {
         let mut s = DefaultHasher::new();
         key.hash(&mut s);
         let hash = s.finish();
-        &self.inner.shards[(hash as usize) % CACHE_SHARDS]
+        &self.inner.shards[(hash as usize) % self.inner.shard_count]
     }
 }
 
@@ -408,12 +422,25 @@ mod tests {
                     },
                 );
             }
-            // Capacity is 4 (min cap per shard), so only 4 should remain.
-            assert_eq!(store.len(), 4);
+            // Sharding is disabled for small caches, so capacity stays exact.
+            assert_eq!(store.len(), 2);
             // key0 should have been evicted (LRU).
             assert!(store.get("key0").is_none());
-            assert!(store.get("key1").is_some());
+            assert!(store.get("key1").is_none());
+            assert!(store.get("key3").is_some());
             assert!(store.get("key4").is_some());
         }
+    }
+
+    #[test]
+    fn disables_sharding_below_threshold() {
+        let cache = Cache::new(4095, Duration::from_secs(30));
+        assert_eq!(cache.inner.shard_count, 1);
+    }
+
+    #[test]
+    fn enables_sharding_at_threshold() {
+        let cache = Cache::new(4096, Duration::from_secs(30));
+        assert_eq!(cache.inner.shard_count, CACHE_SHARDS);
     }
 }
