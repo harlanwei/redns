@@ -234,42 +234,44 @@ impl RecursiveExecutable for Cache {
 
         // Check cache.
         let mut do_optimistic_refresh = false;
-        let mut served_from_cache = false;
+        let mut cached_payload: Option<(Vec<u8>, u32, bool)> = None;
         {
             let shard = self.get_shard(&key);
             let mut store = shard.lock().await;
             if let Some(entry) = store.get_mut(&key) {
                 if !entry.is_expired() {
                     // Fresh hit.
-                    let remaining = entry.remaining_ttl();
-                    if let Ok(mut resp) = Message::from_vec(&entry.resp_bytes) {
-                        resp.set_id(ctx.query().id());
-                        adjust_ttl(&mut resp, remaining);
-                        ctx.set_response(Some(resp));
-                        ctx.set_mark(MARK_CACHE_HIT);
-                        debug!(key = %key, ttl = remaining, "cache hit");
-                        served_from_cache = true;
+                    let ttl = entry.remaining_ttl();
+                    cached_payload = Some((entry.resp_bytes.clone(), ttl, false));
 
-                        let elapsed = entry.stored_at.elapsed().as_secs() as u32;
-                        if elapsed >= (entry.original_ttl as f32 * 0.8) as u32 {
-                            do_optimistic_refresh = true;
-                            // Optimistically advance stored_at to debounce parallel refreshes
-                            entry.stored_at = Instant::now();
-                        }
+                    let elapsed = entry.stored_at.elapsed().as_secs() as u32;
+                    if elapsed >= (entry.original_ttl as f32 * 0.8) as u32 {
+                        do_optimistic_refresh = true;
+                        // Optimistically advance stored_at to debounce parallel refreshes
+                        entry.stored_at = Instant::now();
                     }
                 } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
                     // Stale but within lazy window — serve stale and refresh.
                     do_optimistic_refresh = true;
                     entry.stored_at = Instant::now();
-                    if let Ok(mut resp) = Message::from_vec(&entry.resp_bytes) {
-                        resp.set_id(ctx.query().id());
-                        adjust_ttl(&mut resp, 5); // Short TTL for stale.
-                        ctx.set_response(Some(resp));
-                        ctx.set_mark(MARK_CACHE_HIT);
-                        debug!(key = %key, "cache lazy hit (stale)");
-                        served_from_cache = true;
-                    }
+                    cached_payload = Some((entry.resp_bytes.clone(), 1, true));
                 }
+            }
+        }
+
+        let mut served_from_cache = false;
+        if let Some((resp_bytes, ttl, stale_hit)) = cached_payload {
+            if let Ok(mut resp) = Message::from_vec(&resp_bytes) {
+                resp.set_id(ctx.query().id());
+                adjust_ttl(&mut resp, ttl);
+                ctx.set_response(Some(resp));
+                ctx.set_mark(MARK_CACHE_HIT);
+                if stale_hit {
+                    debug!(key = %key, "cache lazy hit (stale)");
+                } else {
+                    debug!(key = %key, ttl = ttl, "cache hit");
+                }
+                served_from_cache = true;
             }
         }
 
