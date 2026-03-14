@@ -29,9 +29,6 @@ const DEFAULT_CACHE_SIZE: usize = 1024;
 /// Default lazy cache TTL (serve stale for this long while refreshing).
 const DEFAULT_LAZY_TTL: Duration = Duration::from_secs(30);
 
-/// Number of shards for the cache to reduce lock contention.
-const CACHE_SHARDS: usize = 32;
-
 /// Minimum capacity to enable sharding.
 const SHARDING_MIN_CAPACITY: usize = 4096;
 
@@ -84,6 +81,12 @@ fn cache_key(ctx: &Context) -> Option<CacheKey> {
         qname: q.name().to_ascii().to_lowercase(),
         qtype: q.query_type(),
     })
+}
+
+fn host_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1)
 }
 
 /// Extract the minimum TTL from a DNS response message.
@@ -157,10 +160,10 @@ impl Cache {
             max_size
         };
 
-        let shard_count = if cap <= SHARDING_MIN_CAPACITY {
+        let shard_count = if cap < SHARDING_MIN_CAPACITY {
             1
         } else {
-            CACHE_SHARDS
+            host_parallelism().min(cap)
         };
         let shard_cap = std::cmp::max(1, cap.div_ceil(shard_count));
         let mut shards = Vec::with_capacity(shard_count);
@@ -571,6 +574,6 @@ mod tests {
     #[test]
     fn enables_sharding_at_threshold() {
         let cache = Cache::new(4096, Duration::from_secs(30));
-        assert_eq!(cache.inner.shard_count, CACHE_SHARDS);
+        assert_eq!(cache.inner.shard_count, host_parallelism().min(4096));
     }
 }
