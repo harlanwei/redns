@@ -113,6 +113,7 @@ impl Default for LogsQuery {
 pub struct DashboardStore {
     db_path: Arc<String>,
     log_tx: tokio::sync::mpsc::Sender<NewDnsLogEntry>,
+    inflight_geoip: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
 }
 
 impl DashboardStore {
@@ -123,6 +124,7 @@ impl DashboardStore {
         let store = Self {
             db_path: Arc::new(db_path.clone()),
             log_tx: tx,
+            inflight_geoip: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
         store.init()?;
 
@@ -429,7 +431,24 @@ impl DashboardStore {
 
     pub async fn get_geoip(&self, ip: &str) -> Result<GeoIpData, DynError> {
         let path = self.db_path.clone();
-        let ip_owned = ip.to_string();
+
+        // Normalize the IP for caching:
+        // Use full path for IPv4, but use the /64 subnet prefix for IPv6.
+        let normalized_ip = if let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() {
+            match parsed_ip {
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+                std::net::IpAddr::V6(v6) => {
+                    let segments = v6.segments();
+                    format!(
+                        "{:x}:{:x}:{:x}:{:x}::",
+                        segments[0], segments[1], segments[2], segments[3]
+                    )
+                }
+            }
+        } else {
+            ip.to_string()
+        };
+        let ip_owned = normalized_ip.clone();
 
         let cached: Option<GeoIpData> = tokio::task::spawn_blocking({
             let path = path.clone();
@@ -465,10 +484,59 @@ impl DashboardStore {
             return Ok(res);
         }
 
+        // Check if there is already an inflight request for this IP/subnet
+        let notify = {
+            let mut pending = self.inflight_geoip.lock().await;
+            if let Some(notify) = pending.get(&normalized_ip) {
+                Some(notify.clone())
+            } else {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                pending.insert(normalized_ip.clone(), notify);
+                None
+            }
+        };
+
+        if let Some(notify) = notify {
+            notify.notified().await;
+            
+            // Retry reading from cache after another task completed it
+            let path = self.db_path.clone();
+            let ip_owned = ip_owned.clone();
+            let retry_cached: Option<GeoIpData> = tokio::task::spawn_blocking(move || -> Result<Option<GeoIpData>, DynError> {
+                let conn = Self::open_connection(&path)?;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let mut stmt = conn.prepare("SELECT city, asn, isp, proxy, hosting, expires_at FROM geoip_cache WHERE ip = ?1")?;
+                let mut rows = stmt.query(params![ip_owned])?;
+
+                if let Some(row) = rows.next()? {
+                    let expires_at: i64 = row.get(5)?;
+                    if now < expires_at {
+                        let city: Option<String> = row.get(0)?;
+                        let asn: Option<String> = row.get(1)?;
+                        let isp: Option<String> = row.get(2)?;
+                        let proxy: Option<bool> = row.get(3)?;
+                        let hosting: Option<bool> = row.get(4)?;
+                        return Ok(Some(GeoIpData { city, asn, isp, proxy, hosting }));
+                    }
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|e| -> DynError { format!("geoip sqlite retry join failed: {e}").into() })??;
+            
+            if let Some(res) = retry_cached {
+                return Ok(res);
+            }
+        } // Otherwise proceed with the request
+        
         // Cache miss or expired, fetch from API
         let url = format!(
             "http://ip-api.com/json/{}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query,proxy,hosting",
-            ip
+            normalized_ip
         );
         let resp = reqwest::get(&url).await?;
         let text = resp.text().await?;
@@ -520,9 +588,9 @@ impl DashboardStore {
             hosting,
         };
 
-        // Save to cache (30 days expiration)
+        // Save to cache (30 days expiration) using the normalized IP string (subnet for IPv6)
         let c_res = res.clone();
-        let ip_owned_2 = ip_owned.clone();
+        let ip_owned = normalized_ip.clone();
         tokio::task::spawn_blocking(move || -> Result<(), DynError> {
             let conn = Self::open_connection(&path)?;
             let now = SystemTime::now()
@@ -542,7 +610,7 @@ impl DashboardStore {
                  hosting = excluded.hosting,
                  expires_at = excluded.expires_at",
                 params![
-                    ip_owned_2,
+                    ip_owned,
                     c_res.city,
                     c_res.asn,
                     c_res.isp,
@@ -555,6 +623,13 @@ impl DashboardStore {
         })
         .await
         .map_err(|e| -> DynError { format!("geoip sqlite write join failed: {e}").into() })??;
+
+        {
+            let mut pending = self.inflight_geoip.lock().await;
+            if let Some(notify) = pending.remove(&normalized_ip) {
+                notify.notify_waiters();
+            }
+        }
 
         Ok(res)
     }
