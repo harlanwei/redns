@@ -109,17 +109,22 @@ impl ReverseLookup {
                         expires: now + ttl,
                     },
                 );
-                // Evict oldest if over capacity.
-                if cache.len() > self.config.size {
-                    // Simple eviction — remove first expired or oldest.
-                    let to_remove: Vec<IpAddr> = cache
-                        .iter()
-                        .filter(|(_, e)| e.expires < now)
-                        .map(|(k, _)| *k)
-                        .collect();
-                    for k in to_remove {
-                        cache.remove(&k);
-                    }
+            }
+        }
+
+        // Evict when over capacity.
+        if cache.len() > self.config.size {
+            // First pass: remove expired entries (cheap).
+            cache.retain(|_, e| e.expires > now);
+
+            // Second pass: if still over capacity, evict soonest-expiring entries.
+            if cache.len() > self.config.size {
+                let excess = cache.len() - self.config.size;
+                let mut by_expiry: Vec<(IpAddr, Instant)> =
+                    cache.iter().map(|(k, e)| (*k, e.expires)).collect();
+                by_expiry.sort_unstable_by_key(|(_, exp)| *exp);
+                for (ip, _) in by_expiry.into_iter().take(excess) {
+                    cache.remove(&ip);
                 }
             }
         }

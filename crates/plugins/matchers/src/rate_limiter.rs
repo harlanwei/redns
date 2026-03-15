@@ -12,7 +12,7 @@ use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Rate limiter configuration.
 #[derive(Debug, Clone)]
@@ -70,17 +70,30 @@ impl Bucket {
     }
 }
 
+/// How often (in `allow()` calls) to run a stale-bucket eviction sweep.
+const EVICT_INTERVAL: u64 = 256;
+
 /// Per-IP rate limiter matcher.
 pub struct RateLimiter {
     config: RateLimiterConfig,
     buckets: DashMap<IpAddr, Bucket>,
+    /// Monotonic counter used to trigger periodic eviction.
+    call_counter: AtomicU64,
+    /// Buckets idle longer than this are evicted.
+    stale_threshold: Duration,
 }
 
 impl RateLimiter {
     pub fn new(config: RateLimiterConfig) -> Self {
+        // A bucket refills fully in `burst / qps` seconds.
+        // Consider it stale after 2× that duration (minimum 60 s).
+        let refill_secs = (config.burst as f64) / config.qps;
+        let stale_secs = (refill_secs * 2.0).max(60.0);
         Self {
+            stale_threshold: Duration::from_secs_f64(stale_secs),
             config,
             buckets: DashMap::new(),
+            call_counter: AtomicU64::new(0),
         }
     }
 
@@ -108,8 +121,23 @@ impl RateLimiter {
         }
     }
 
+    /// Remove buckets that have not been accessed recently.
+    fn evict_stale(&self) {
+        let now = Instant::now();
+        self.buckets.retain(|_, bucket| {
+            let last = bucket.last_refill.lock().unwrap();
+            now.duration_since(*last) < self.stale_threshold
+        });
+    }
+
     /// Check if a request from the given IP is allowed.
     fn allow(&self, ip: IpAddr) -> bool {
+        // Periodic eviction of stale buckets.
+        let n = self.call_counter.fetch_add(1, Ordering::Relaxed);
+        if n % EVICT_INTERVAL == 0 {
+            self.evict_stale();
+        }
+
         let masked = self.mask_ip(ip);
         let entry = self
             .buckets

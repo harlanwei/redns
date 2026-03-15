@@ -610,7 +610,10 @@ async fn run_server(
         .clone()
         .unwrap_or_else(|| dashboard::default_sqlite_path(&file_used));
     info!(path = %sqlite_path, "dashboard sqlite path selected");
-    let dashboard_store = Arc::new(dashboard::DashboardStore::new(sqlite_path, cfg.dashboard.dhcp_leases.clone())?);
+    let dashboard_store = Arc::new(dashboard::DashboardStore::new(
+        sqlite_path,
+        cfg.dashboard.dhcp_leases.clone(),
+    )?);
     {
         let store = dashboard_store.clone();
         let c = cancel.clone();

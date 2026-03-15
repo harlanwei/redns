@@ -395,7 +395,9 @@ impl DashboardStore {
             let items = merge_clients_by_hostname(ip_stats, &dhcp_map);
 
             let top_client = items.first().map(|item| {
-                item.hostname.clone().unwrap_or_else(|| item.ips.first().cloned().unwrap_or_default())
+                item.hostname
+                    .clone()
+                    .unwrap_or_else(|| item.ips.first().cloned().unwrap_or_default())
             });
             let top_volume = items.first().map(|item| item.query_total).unwrap_or(0);
 
@@ -727,10 +729,7 @@ fn parse_neigh_table() -> HashMap<String, String> {
 
 /// Executes `ip neigh` and returns its stdout as a string.
 fn run_ip_neigh() -> String {
-    match std::process::Command::new("ip")
-        .arg("neigh")
-        .output()
-    {
+    match std::process::Command::new("ip").arg("neigh").output() {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
         Err(e) => {
             warn!(error = %e, "failed to run `ip neigh` for neighbor-table hostname resolution");
@@ -783,7 +782,9 @@ fn enrich_dhcp_map_with_neighbors(dhcp_map: &mut HashMap<String, DhcpLeaseInfo>)
     let mut mac_to_info: HashMap<String, DhcpLeaseInfo> = HashMap::new();
     for info in dhcp_map.values() {
         if let Some(ref mac) = info.mac {
-            mac_to_info.entry(mac.to_lowercase()).or_insert_with(|| info.clone());
+            mac_to_info
+                .entry(mac.to_lowercase())
+                .or_insert_with(|| info.clone());
         }
     }
 
@@ -1635,10 +1636,22 @@ mod tests {
         );
 
         let ip_stats = vec![
-            IpStat { ip: "192.168.1.10".to_string(), query_total: 100 },
-            IpStat { ip: "fd00::1:abcd".to_string(), query_total: 50 },
-            IpStat { ip: "fd00::2:5678".to_string(), query_total: 30 },
-            IpStat { ip: "10.0.0.1".to_string(), query_total: 5 },
+            IpStat {
+                ip: "192.168.1.10".to_string(),
+                query_total: 100,
+            },
+            IpStat {
+                ip: "fd00::1:abcd".to_string(),
+                query_total: 50,
+            },
+            IpStat {
+                ip: "fd00::2:5678".to_string(),
+                query_total: 30,
+            },
+            IpStat {
+                ip: "10.0.0.1".to_string(),
+                query_total: 5,
+            },
         ];
 
         let items = merge_clients_by_hostname(ip_stats, &dhcp_map);
@@ -1723,7 +1736,9 @@ fd00::dead dev br-lan FAILED
         let mut mac_to_info: HashMap<String, DhcpLeaseInfo> = HashMap::new();
         for info in dhcp_map.values() {
             if let Some(ref mac) = info.mac {
-                mac_to_info.entry(mac.to_lowercase()).or_insert_with(|| info.clone());
+                mac_to_info
+                    .entry(mac.to_lowercase())
+                    .or_insert_with(|| info.clone());
             }
         }
         for (ipv6, mac) in &ndp_map {
