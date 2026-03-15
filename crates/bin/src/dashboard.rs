@@ -60,7 +60,9 @@ pub struct PaginatedLogsResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientStatsEntry {
-    pub ip: String,
+    pub hostname: Option<String>,
+    pub ips: Vec<String>,
+    pub mac: Option<String>,
     pub query_total: u64,
 }
 
@@ -115,10 +117,11 @@ pub struct DashboardStore {
     log_tx: tokio::sync::mpsc::Sender<NewDnsLogEntry>,
     inflight_geoip: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     http_client: reqwest::Client,
+    dhcp_leases: Arc<Vec<String>>,
 }
 
 impl DashboardStore {
-    pub fn new(db_path: impl Into<String>) -> Result<Self, DynError> {
+    pub fn new(db_path: impl Into<String>, dhcp_leases: Vec<String>) -> Result<Self, DynError> {
         let db_path = db_path.into();
         ensure_sqlite_file_exists(&db_path)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<NewDnsLogEntry>(10240);
@@ -127,6 +130,7 @@ impl DashboardStore {
             log_tx: tx,
             inflight_geoip: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_client: reqwest::Client::new(),
+            dhcp_leases: Arc::new(dhcp_leases),
         };
         store.init()?;
 
@@ -354,6 +358,7 @@ impl DashboardStore {
 
     pub async fn fetch_clients(&self) -> Result<ClientStatsResponse, DynError> {
         let path = self.db_path.clone();
+        let dhcp_leases = self.dhcp_leases.clone();
         tokio::task::spawn_blocking(move || -> Result<ClientStatsResponse, DynError> {
             let conn = Self::open_connection(&path)?;
             let total_queries: i64 =
@@ -370,19 +375,28 @@ impl DashboardStore {
                  GROUP BY client_ip
                  ORDER BY query_total DESC, client_ip ASC",
             )?;
+
             let rows = stmt.query_map([], |row| {
-                Ok(ClientStatsEntry {
+                Ok(IpStat {
                     ip: row.get(0)?,
                     query_total: row.get::<_, i64>(1)? as u64,
                 })
             })?;
 
-            let mut items = Vec::new();
+            let mut ip_stats = Vec::new();
             for row in rows {
-                items.push(row?);
+                ip_stats.push(row?);
             }
 
-            let top_client = items.first().map(|item| item.ip.clone());
+            let mut dhcp_map = parse_dhcp_leases(&dhcp_leases);
+            if cfg!(target_os = "linux") {
+                enrich_dhcp_map_with_neighbors(&mut dhcp_map);
+            }
+            let items = merge_clients_by_hostname(ip_stats, &dhcp_map);
+
+            let top_client = items.first().map(|item| {
+                item.hostname.clone().unwrap_or_else(|| item.ips.first().cloned().unwrap_or_default())
+            });
             let top_volume = items.first().map(|item| item.query_total).unwrap_or(0);
 
             Ok(ClientStatsResponse {
@@ -632,6 +646,211 @@ impl DashboardStore {
 
         Ok(res)
     }
+}
+
+/// Parsed DHCP lease entry mapping an IP to a hostname and optional MAC.
+#[derive(Debug, Clone)]
+struct DhcpLeaseInfo {
+    hostname: String,
+    mac: Option<String>,
+}
+
+/// Reads all configured DHCP lease files and builds an ip→info map.
+///
+/// Auto-detects the format of each file:
+/// - **dnsmasq** (`/tmp/dhcp.leases`): `<expiry> <mac> <ip> <hostname> [client-id]`
+/// - **hosts-file** (`/tmp/hosts/odhcpd`): `<ip> <hostname> [aliases...]`
+///
+/// Non-existent files are silently skipped.
+fn parse_dhcp_leases(paths: &[String]) -> HashMap<String, DhcpLeaseInfo> {
+    let mut map = HashMap::new();
+    for path in paths {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue, // silently skip missing files
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 4 {
+                // Try dnsmasq format: <expiry> <mac> <ip> <hostname>
+                if fields[0].chars().all(|c| c.is_ascii_digit()) {
+                    let mac = fields[1];
+                    let ip = fields[2];
+                    let hostname = fields[3];
+                    if hostname != "*" && !hostname.is_empty() {
+                        map.insert(
+                            ip.to_string(),
+                            DhcpLeaseInfo {
+                                hostname: hostname.to_string(),
+                                mac: Some(mac.to_string()),
+                            },
+                        );
+                    }
+                    continue;
+                }
+            }
+            // Fallback: hosts-file format: <ip> <hostname> [aliases...]
+            if fields.len() >= 2 {
+                let ip = fields[0];
+                let hostname = fields[1];
+                // Quick sanity check: first field should look like an IP
+                if ip.contains('.') || ip.contains(':') {
+                    if !hostname.is_empty() {
+                        map.entry(ip.to_string()).or_insert(DhcpLeaseInfo {
+                            hostname: hostname.to_string(),
+                            mac: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Runs `ip neigh` and parses output into a map of IP address → MAC address.
+///
+/// Each line of `ip neigh` output looks like:
+/// ```text
+/// 192.168.1.50 dev br-lan lladdr aa:bb:cc:dd:ee:ff REACHABLE
+/// fd00::abcd dev br-lan lladdr aa:bb:cc:dd:ee:ff STALE
+/// ```
+///
+/// Returns an empty map if the command fails (e.g. not on Linux).
+fn parse_neigh_table() -> HashMap<String, String> {
+    parse_neigh_output(&run_ip_neigh())
+}
+
+/// Executes `ip neigh` and returns its stdout as a string.
+fn run_ip_neigh() -> String {
+    match std::process::Command::new("ip")
+        .arg("neigh")
+        .output()
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(e) => {
+            warn!(error = %e, "failed to run `ip neigh` for neighbor-table hostname resolution");
+            String::new()
+        }
+    }
+}
+
+/// Parses the raw output of `ip neigh` into an IP→MAC map.
+///
+/// Only entries containing `lladdr` (i.e. with a resolved MAC) are included.
+/// Link-local IPv6 addresses (fe80::) are excluded since they are not useful
+/// for client identification.
+fn parse_neigh_output(output: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Expected: <ip> dev <iface> lladdr <mac> <state>
+        if fields.len() >= 5 {
+            if let Some(lladdr_idx) = fields.iter().position(|f| *f == "lladdr") {
+                if lladdr_idx + 1 < fields.len() {
+                    let ip = fields[0];
+                    let mac = fields[lladdr_idx + 1];
+                    // Skip link-local IPv6 addresses — not useful for client identification.
+                    if ip.starts_with("fe80:") {
+                        continue;
+                    }
+                    map.insert(ip.to_string(), mac.to_lowercase());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Enriches a DHCP lease map with IP→hostname mappings derived from the
+/// kernel neighbor table (ARP for IPv4, NDP for IPv6).
+///
+/// For each neighbor entry (IP → MAC), if the IP is not already in
+/// `dhcp_map`, we search for a DHCP entry with the same MAC address and copy
+/// its hostname. This resolves SLAAC-assigned IPv6 addresses and static-IP
+/// IPv4 clients that would otherwise remain anonymous.
+fn enrich_dhcp_map_with_neighbors(dhcp_map: &mut HashMap<String, DhcpLeaseInfo>) {
+    let neighbors = parse_neigh_table();
+    if neighbors.is_empty() {
+        return;
+    }
+
+    // Build a MAC → hostname+mac lookup from existing DHCP entries.
+    let mut mac_to_info: HashMap<String, DhcpLeaseInfo> = HashMap::new();
+    for info in dhcp_map.values() {
+        if let Some(ref mac) = info.mac {
+            mac_to_info.entry(mac.to_lowercase()).or_insert_with(|| info.clone());
+        }
+    }
+
+    for (ip, mac) in &neighbors {
+        if dhcp_map.contains_key(ip) {
+            continue;
+        }
+        if let Some(info) = mac_to_info.get(mac) {
+            dhcp_map.insert(
+                ip.clone(),
+                DhcpLeaseInfo {
+                    hostname: info.hostname.clone(),
+                    mac: Some(mac.clone()),
+                },
+            );
+        }
+    }
+}
+
+/// Per-IP query stats from database (internal).
+struct IpStat {
+    ip: String,
+    query_total: u64,
+}
+
+/// Merges per-IP stats into per-client entries using DHCP hostname grouping.
+///
+/// IPs sharing a DHCP hostname are combined into a single entry with summed
+/// query totals. IPs without a DHCP match remain as standalone entries.
+fn merge_clients_by_hostname(
+    ip_stats: Vec<IpStat>,
+    dhcp_map: &HashMap<String, DhcpLeaseInfo>,
+) -> Vec<ClientStatsEntry> {
+    // Group by hostname (or keep standalone)
+    let mut hostname_groups: HashMap<String, ClientStatsEntry> = HashMap::new();
+    let mut standalone: Vec<ClientStatsEntry> = Vec::new();
+
+    for stat in ip_stats {
+        if let Some(info) = dhcp_map.get(&stat.ip) {
+            let entry = hostname_groups
+                .entry(info.hostname.clone())
+                .or_insert_with(|| ClientStatsEntry {
+                    hostname: Some(info.hostname.clone()),
+                    ips: Vec::new(),
+                    mac: info.mac.clone(),
+                    query_total: 0,
+                });
+            entry.ips.push(stat.ip);
+            entry.query_total += stat.query_total;
+            // Prefer a MAC if we find one (from dnsmasq IPv4 entry)
+            if entry.mac.is_none() && info.mac.is_some() {
+                entry.mac = info.mac.clone();
+            }
+        } else {
+            standalone.push(ClientStatsEntry {
+                hostname: None,
+                ips: vec![stat.ip],
+                mac: None,
+                query_total: stat.query_total,
+            });
+        }
+    }
+
+    let mut items: Vec<ClientStatsEntry> = hostname_groups.into_values().collect();
+    items.append(&mut standalone);
+    items.sort_by(|a, b| b.query_total.cmp(&a.query_total));
+    items
 }
 
 async fn trigger_log_prune(store: Arc<DashboardStore>) {
@@ -1271,7 +1490,7 @@ mod tests {
     async fn prune_expired_logs_removes_rows_older_than_24_hours() {
         let path = temp_db_path("retention");
         let path_str = path.to_string_lossy().into_owned();
-        let store = DashboardStore::new(path_str.clone()).expect("create dashboard store");
+        let store = DashboardStore::new(path_str.clone(), vec![]).expect("create dashboard store");
 
         let now_ms = 3 * DNS_LOG_RETENTION.as_millis() as u64;
         let cutoff_ms = now_ms - DNS_LOG_RETENTION.as_millis() as u64;
@@ -1331,5 +1550,207 @@ mod tests {
         let (summary, rows) = persisted_dns_result(&nxdomain, qname);
         assert!(summary.is_empty());
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_dnsmasq_lease_format() {
+        let dir = std::env::temp_dir();
+        let file = dir.join("test-dnsmasq.leases");
+        std::fs::write(
+            &file,
+            "1710000000 aa:bb:cc:dd:ee:01 192.168.1.10 desktop-pc *\n\
+             1710000000 aa:bb:cc:dd:ee:02 192.168.1.20 laptop ff:00:11:22\n\
+             # comment line\n\
+             1710000000 aa:bb:cc:dd:ee:03 192.168.1.30 * *\n",
+        )
+        .unwrap();
+
+        let map = parse_dhcp_leases(&[file.to_string_lossy().into_owned()]);
+
+        assert_eq!(map.len(), 2);
+        let entry = map.get("192.168.1.10").unwrap();
+        assert_eq!(entry.hostname, "desktop-pc");
+        assert_eq!(entry.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
+
+        let entry = map.get("192.168.1.20").unwrap();
+        assert_eq!(entry.hostname, "laptop");
+        assert_eq!(entry.mac.as_deref(), Some("aa:bb:cc:dd:ee:02"));
+
+        // hostname "*" should be skipped
+        assert!(map.get("192.168.1.30").is_none());
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn parse_hosts_file_format() {
+        let dir = std::env::temp_dir();
+        let file = dir.join("test-odhcpd-hosts");
+        std::fs::write(
+            &file,
+            "fd00::1:abcd phone\n\
+             fd00::2:1234 tablet\n",
+        )
+        .unwrap();
+
+        let map = parse_dhcp_leases(&[file.to_string_lossy().into_owned()]);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("fd00::1:abcd").unwrap().hostname, "phone");
+        assert!(map.get("fd00::1:abcd").unwrap().mac.is_none());
+        assert_eq!(map.get("fd00::2:1234").unwrap().hostname, "tablet");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn parse_dhcp_leases_missing_file() {
+        let map = parse_dhcp_leases(&["/tmp/nonexistent-dhcp-leases-file".to_string()]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn merge_clients_groups_by_hostname() {
+        let mut dhcp_map = HashMap::new();
+        dhcp_map.insert(
+            "192.168.1.10".to_string(),
+            DhcpLeaseInfo {
+                hostname: "myphone".to_string(),
+                mac: Some("aa:bb:cc:dd:ee:01".to_string()),
+            },
+        );
+        dhcp_map.insert(
+            "fd00::1:abcd".to_string(),
+            DhcpLeaseInfo {
+                hostname: "myphone".to_string(),
+                mac: None,
+            },
+        );
+        dhcp_map.insert(
+            "fd00::2:5678".to_string(),
+            DhcpLeaseInfo {
+                hostname: "myphone".to_string(),
+                mac: None,
+            },
+        );
+
+        let ip_stats = vec![
+            IpStat { ip: "192.168.1.10".to_string(), query_total: 100 },
+            IpStat { ip: "fd00::1:abcd".to_string(), query_total: 50 },
+            IpStat { ip: "fd00::2:5678".to_string(), query_total: 30 },
+            IpStat { ip: "10.0.0.1".to_string(), query_total: 5 },
+        ];
+
+        let items = merge_clients_by_hostname(ip_stats, &dhcp_map);
+
+        // Should have 2 entries: "myphone" (merged) + 10.0.0.1 (standalone)
+        assert_eq!(items.len(), 2);
+
+        let phone = &items[0];
+        assert_eq!(phone.hostname.as_deref(), Some("myphone"));
+        assert_eq!(phone.query_total, 180); // 100 + 50 + 30
+        assert_eq!(phone.ips.len(), 3);
+        assert_eq!(phone.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
+
+        let standalone = &items[1];
+        assert!(standalone.hostname.is_none());
+        assert_eq!(standalone.ips, vec!["10.0.0.1"]);
+        assert_eq!(standalone.query_total, 5);
+    }
+
+    #[test]
+    fn parse_neigh_output_basic() {
+        let output = "\
+192.168.1.50 dev br-lan lladdr aa:bb:cc:dd:ee:04 REACHABLE
+fd00::1:abcd dev br-lan lladdr aa:bb:cc:dd:ee:01 REACHABLE
+fd00::2:5678 dev br-lan lladdr AA:BB:CC:DD:EE:02 STALE
+fe80::1 dev br-lan lladdr aa:bb:cc:dd:ee:03 REACHABLE
+fd00::dead dev br-lan FAILED
+";
+        let map = parse_neigh_output(output);
+
+        // Three valid entries (fe80 skipped, FAILED entry skipped)
+        assert_eq!(map.len(), 3);
+        // IPv4 entry
+        assert_eq!(map.get("192.168.1.50").unwrap(), "aa:bb:cc:dd:ee:04");
+        // IPv6 entries
+        assert_eq!(map.get("fd00::1:abcd").unwrap(), "aa:bb:cc:dd:ee:01");
+        // MAC should be lowercased
+        assert_eq!(map.get("fd00::2:5678").unwrap(), "aa:bb:cc:dd:ee:02");
+        // fe80 link-local should be excluded
+        assert!(map.get("fe80::1").is_none());
+        // FAILED entry (no lladdr) should be excluded
+        assert!(map.get("fd00::dead").is_none());
+    }
+
+    #[test]
+    fn parse_neigh_output_empty() {
+        let map = parse_neigh_output("");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn enrich_dhcp_map_correlates_mac() {
+        let mut dhcp_map = HashMap::new();
+        dhcp_map.insert(
+            "192.168.1.10".to_string(),
+            DhcpLeaseInfo {
+                hostname: "desktop-pc".to_string(),
+                mac: Some("aa:bb:cc:dd:ee:01".to_string()),
+            },
+        );
+        // IPv6 already known via odhcpd
+        dhcp_map.insert(
+            "fd00::99:1111".to_string(),
+            DhcpLeaseInfo {
+                hostname: "desktop-pc".to_string(),
+                mac: None,
+            },
+        );
+
+        // Simulate NDP entries
+        let ndp_map: HashMap<String, String> = [
+            ("fd00::1:abcd".to_string(), "aa:bb:cc:dd:ee:01".to_string()),
+            // This one has an unknown MAC
+            ("fd00::2:5678".to_string(), "ff:ff:ff:ff:ff:ff".to_string()),
+            // This one is already in dhcp_map
+            ("fd00::99:1111".to_string(), "aa:bb:cc:dd:ee:01".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        // Build mac_to_info and enrich manually to test the logic
+        let mut mac_to_info: HashMap<String, DhcpLeaseInfo> = HashMap::new();
+        for info in dhcp_map.values() {
+            if let Some(ref mac) = info.mac {
+                mac_to_info.entry(mac.to_lowercase()).or_insert_with(|| info.clone());
+            }
+        }
+        for (ipv6, mac) in &ndp_map {
+            if dhcp_map.contains_key(ipv6) {
+                continue;
+            }
+            if let Some(info) = mac_to_info.get(mac) {
+                dhcp_map.insert(
+                    ipv6.clone(),
+                    DhcpLeaseInfo {
+                        hostname: info.hostname.clone(),
+                        mac: Some(mac.clone()),
+                    },
+                );
+            }
+        }
+
+        // fd00::1:abcd should be enriched with hostname "desktop-pc"
+        let entry = dhcp_map.get("fd00::1:abcd").unwrap();
+        assert_eq!(entry.hostname, "desktop-pc");
+        assert_eq!(entry.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
+
+        // fd00::2:5678 has unknown MAC, should NOT be added
+        assert!(dhcp_map.get("fd00::2:5678").is_none());
+
+        // fd00::99:1111 was already in dhcp_map, should NOT be overwritten
+        let existing = dhcp_map.get("fd00::99:1111").unwrap();
+        assert!(existing.mac.is_none()); // original had no MAC
     }
 }

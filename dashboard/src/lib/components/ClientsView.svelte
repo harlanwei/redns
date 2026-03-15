@@ -27,6 +27,10 @@
     }
   }
 
+  function clientLabel(client: { hostname: string | null; ips: string[] }): string {
+    return client.hostname ?? client.ips[0] ?? 'unknown';
+  }
+
   onMount(() => {
     fetchClients();
   });
@@ -45,7 +49,7 @@
     <table class="min-w-full divide-y divide-gray-200">
       <thead class="bg-gray-50">
         <tr>
-          <th scope="col" class="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">IP Address</th>
+          <th scope="col" class="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Client</th>
           <th scope="col" class="px-4 sm:px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Total Queries</th>
           <th scope="col" class="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Volume</th>
         </tr>
@@ -58,8 +62,22 @@
         {:else if clientsResponse}
           {#each clientsResponse.items as client}
             <tr class="hover:bg-navy-50/50 transition-colors">
-              <td class="px-4 sm:px-6 py-4 whitespace-nowrap text-sm font-medium text-navy-900">
-                {client.ip}
+              <td class="px-4 sm:px-6 py-4 text-sm">
+                <div class="font-medium text-navy-900">
+                  {#if client.hostname}
+                    {client.hostname}
+                  {:else}
+                    {client.ips[0] ?? 'unknown'}
+                  {/if}
+                  {#if client.mac}
+                    <span class="ml-2 text-xs text-gray-400 font-normal">{client.mac}</span>
+                  {/if}
+                </div>
+                <div class="mt-0.5 space-x-2">
+                  {#each client.ips as ip}
+                    <span class="text-xs text-gray-500">{ip}</span>
+                  {/each}
+                </div>
               </td>
               <td class="px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-right font-medium text-gray-700">{client.query_total.toLocaleString()}</td>
               <td class="px-4 sm:px-6 py-4 whitespace-nowrap text-sm w-full min-w-[150px] max-w-xs">

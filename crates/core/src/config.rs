@@ -98,6 +98,11 @@ pub struct DashboardConfig {
     /// Directory to serve static frontend files from. Defaults to "./dashboard/dist".
     #[serde(default)]
     pub static_dir: Option<String>,
+    /// Paths to DHCP lease files for resolving client IPs to hostnames.
+    /// Supports dnsmasq lease format (`/tmp/dhcp.leases`) and
+    /// hosts-file format (`/tmp/hosts/odhcpd`).
+    #[serde(default)]
+    pub dhcp_leases: Vec<String>,
 }
 
 // ── Sequence Rule Config ─────────────────────────────────────────

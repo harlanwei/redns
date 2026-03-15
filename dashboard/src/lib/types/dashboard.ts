@@ -31,7 +31,9 @@ export type PaginatedLogsResponse = {
 };
 
 export type ClientStatsEntry = {
-  ip: string;
+  hostname: string | null;
+  ips: string[];
+  mac: string | null;
   query_total: number;
 };
 
