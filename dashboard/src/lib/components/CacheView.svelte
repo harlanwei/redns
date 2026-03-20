@@ -22,6 +22,11 @@
     return `Shard ${String(index + 1).padStart(2, '0')}`;
   }
 
+  function hitRate(hits: number, misses: number) {
+    const total = hits + misses;
+    return total > 0 ? (hits / total) * 100 : 0;
+  }
+
   async function fetchCache() {
     loading = true;
     error = null;
@@ -90,6 +95,26 @@
                 <div class="bg-white rounded-lg border border-gray-200 p-3">
                   <div class="text-xs uppercase tracking-wider text-gray-500 font-semibold">Avg / Shard</div>
                   <div class="text-xl font-bold text-navy-900">{Math.round(cache.total_entries / shardCount).toLocaleString()}</div>
+                </div>
+              </div>
+
+
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div class="bg-white rounded-lg border border-gray-200 p-3">
+                  <div class="text-xs uppercase tracking-wider text-gray-500 font-semibold">Cache Hits</div>
+                  <div class="text-xl font-bold text-emerald-600">{cache.hit_total.toLocaleString()}</div>
+                </div>
+                <div class="bg-white rounded-lg border border-gray-200 p-3">
+                  <div class="text-xs uppercase tracking-wider text-gray-500 font-semibold">Cache Misses</div>
+                  <div class="text-xl font-bold text-amber-600">{cache.miss_total.toLocaleString()}</div>
+                </div>
+                <div class="bg-white rounded-lg border border-gray-200 p-3">
+                  <div class="text-xs uppercase tracking-wider text-gray-500 font-semibold">Hit Rate</div>
+                  <div class="text-xl font-bold text-navy-900">{hitRate(cache.hit_total, cache.miss_total).toFixed(1)}%</div>
+                </div>
+                <div class="bg-white rounded-lg border border-gray-200 p-3">
+                  <div class="text-xs uppercase tracking-wider text-gray-500 font-semibold">Hot Refreshes</div>
+                  <div class="text-xl font-bold text-blue-600">{cache.hot_refresh_total.toLocaleString()}</div>
                 </div>
               </div>
 

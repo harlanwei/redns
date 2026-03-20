@@ -27,6 +27,12 @@ use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheBuildConfig {
+    size: usize,
+    hotset_percent: u8,
+}
+
 #[derive(Parser)]
 #[command(name = "redns", about = "A DNS forwarder", version = VERSION)]
 struct Cli {
@@ -120,30 +126,38 @@ fn bind_tcp_listener(addr: &str) -> io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
-fn parse_cache_size_arg(args: &str) -> usize {
+fn parse_cache_args(args: &str) -> CacheBuildConfig {
     #[derive(serde::Deserialize)]
     struct CacheArgs {
         #[serde(default)]
         size: Option<usize>,
+        #[serde(default, alias = "top_percent")]
+        hotset_percent: Option<u8>,
     }
+
+    let default = CacheBuildConfig {
+        size: 0,
+        hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
+    };
 
     let args = args.trim();
     if args.is_empty() {
         // Set to zero here. The Cache plugin treats zero as "use default size" and will apply its own default.
-        return 0;
+        return default;
     }
 
     if let Ok(size) = args.parse::<usize>() {
-        return size;
+        return CacheBuildConfig { size, ..default };
     }
 
     if let Ok(cfg) = redns_core::config::deserialize_yaml_str::<CacheArgs>(args) {
-        if let Some(size) = cfg.size {
-            return size;
-        }
+        return CacheBuildConfig {
+            size: cfg.size.unwrap_or(default.size),
+            hotset_percent: cfg.hotset_percent.unwrap_or(default.hotset_percent),
+        };
     }
 
-    0
+    default
 }
 
 /// Registers all built-in matcher and executor factories on the given builder.
@@ -208,11 +222,12 @@ fn register_builtins(builder: &mut ChainBuilder) {
     builder.register_rec_exec(
         "cache",
         Box::new(|args: &str| {
-            let size = parse_cache_size_arg(args);
-            Ok(
-                Box::new(Cache::new(size, std::time::Duration::from_secs(30)))
-                    as Box<dyn RecursiveExecutable>,
-            )
+            let cfg = parse_cache_args(args);
+            Ok(Box::new(Cache::new_with_hotset_percent(
+                cfg.size,
+                std::time::Duration::from_secs(30),
+                cfg.hotset_percent,
+            )) as Box<dyn RecursiveExecutable>)
         }),
     );
     builder.register_rec_exec(
@@ -738,21 +753,50 @@ async fn run_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_tcp_listener, bind_udp_socket, parse_cache_size_arg};
+    use super::{CacheBuildConfig, bind_tcp_listener, bind_udp_socket, parse_cache_args};
 
     #[test]
     fn cache_size_parses_plain_integer_arg() {
-        assert_eq!(parse_cache_size_arg("16384"), 16384);
+        assert_eq!(
+            parse_cache_args("16384"),
+            CacheBuildConfig {
+                size: 16384,
+                hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
+            }
+        );
     }
 
     #[test]
     fn cache_size_parses_yaml_mapping_arg() {
-        assert_eq!(parse_cache_size_arg("size: 16384"), 16384);
+        assert_eq!(
+            parse_cache_args("size: 16384"),
+            CacheBuildConfig {
+                size: 16384,
+                hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_hotset_percent_parses_yaml_mapping_arg() {
+        assert_eq!(
+            parse_cache_args("size: 16384\nhotset_percent: 35"),
+            CacheBuildConfig {
+                size: 16384,
+                hotset_percent: 35,
+            }
+        );
     }
 
     #[test]
     fn cache_size_defaults_when_arg_is_invalid() {
-        assert_eq!(parse_cache_size_arg("size: nope"), 0);
+        assert_eq!(
+            parse_cache_args("size: nope"),
+            CacheBuildConfig {
+                size: 0,
+                hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
+            }
+        );
     }
 
     #[tokio::test]

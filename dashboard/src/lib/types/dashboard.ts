@@ -82,5 +82,8 @@ export type CacheSnapshot = {
   id: number;
   total_entries: number;
   total_capacity: number;
+  hit_total: number;
+  miss_total: number;
+  hot_refresh_total: number;
   shards: CacheShardSnapshot[];
 };

@@ -34,6 +34,9 @@ const MAX_POOL_RETRY: usize = 2;
 /// Maximum idle UDP sockets in pool.
 const MAX_IDLE_UDP_SOCKETS: usize = 16;
 
+static GLOBAL_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// An upstream DNS transport that can exchange raw DNS wire messages.
 #[async_trait]
 pub trait Upstream: Send + Sync {
@@ -1086,6 +1089,16 @@ pub struct UpstreamWrapper {
     latency_sum_us: AtomicU64,
 }
 
+/// Returns the global average upstream latency across all completed exchanges.
+pub fn global_average_latency() -> Option<Duration> {
+    let completed = GLOBAL_COMPLETED_TOTAL.load(Ordering::Relaxed);
+    if completed == 0 {
+        return None;
+    }
+    let sum_us = GLOBAL_LATENCY_SUM_US.load(Ordering::Relaxed);
+    Some(Duration::from_micros(sum_us / completed))
+}
+
 impl UpstreamWrapper {
     /// EMA smoothing factor.
     const ALPHA: f64 = 0.3;
@@ -1196,6 +1209,8 @@ impl UpstreamWrapper {
         self.completed_count.fetch_add(1, Ordering::Relaxed);
         self.latency_sum_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        GLOBAL_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_LATENCY_SUM_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 
         match &result {
             Ok(_) => self.update_ema_latency(elapsed_ms),
