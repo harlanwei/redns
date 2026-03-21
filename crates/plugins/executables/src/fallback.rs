@@ -12,7 +12,7 @@
 //!   the primary but only its result is used if the primary fails/times out.
 //! - Uses the first valid (non-None) response.
 
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use redns_core::context::{Context, KV_SELECTED_UPSTREAM};
 use redns_core::plugin::{Executable, PluginResult};
 use redns_core::upstream::UpstreamWrapper;
@@ -86,6 +86,10 @@ fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
 
 fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
     if let Some(resp) = outcome.response {
+        let rcode = resp.response_code();
+        if rcode == ResponseCode::Refused || rcode == ResponseCode::ServFail {
+            return false;
+        }
         ctx.set_response(Some(resp));
         if let Some(upstream) = outcome.selected_upstream {
             ctx.store_value(KV_SELECTED_UPSTREAM, upstream);
@@ -99,6 +103,10 @@ fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
 impl Executable for Fallback {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
         let start = std::time::Instant::now();
+        let qname = ctx
+            .question()
+            .map(|q| q.name().to_ascii())
+            .unwrap_or_default();
         debug!(threshold = ?self.threshold, always_standby = self.always_standby, "fallback: starting");
         // Create a fresh context for each branch from the same query.
         let query = ctx.query().clone();
@@ -113,11 +121,12 @@ impl Executable for Fallback {
         let always_standby = self.always_standby;
 
         // Spawn primary task.
+        let qname_primary = qname.clone();
         let primary_handle = tokio::spawn(async move {
             match primary.exec(&mut ctx_primary).await {
                 Ok(()) => branch_outcome_from_ctx(&ctx_primary),
                 Err(e) => {
-                    warn!(error = %e, "fallback: primary failed");
+                    warn!(error = %e, qname = %qname_primary, "fallback: primary failed");
                     BranchOutcome {
                         response: None,
                         selected_upstream: None,
@@ -128,11 +137,12 @@ impl Executable for Fallback {
 
         if always_standby {
             // Start secondary immediately in parallel.
+            let qname_secondary = qname.clone();
             let mut secondary_handle = tokio::spawn(async move {
                 match secondary.exec(&mut ctx_secondary).await {
                     Ok(()) => branch_outcome_from_ctx(&ctx_secondary),
                     Err(e) => {
-                        warn!(error = %e, "fallback: secondary failed");
+                        warn!(error = %e, qname = %qname_secondary, "fallback: secondary failed");
                         BranchOutcome {
                             response: None,
                             selected_upstream: None,
@@ -159,12 +169,12 @@ impl Executable for Fallback {
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, "fallback: secondary join failed");
+                            warn!(error = %e, qname = %qname, "fallback: secondary join failed");
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "fallback: primary join failed");
+                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
                     match secondary_handle.await {
                         Ok(outcome) => {
                             if apply_outcome(ctx, outcome) {
@@ -172,7 +182,7 @@ impl Executable for Fallback {
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, "fallback: secondary join failed");
+                            warn!(error = %e, qname = %qname, "fallback: secondary join failed");
                         }
                     }
                 }
@@ -189,7 +199,7 @@ impl Executable for Fallback {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "fallback: primary join failed");
+                                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
                                 }
                             }
 
@@ -200,7 +210,7 @@ impl Executable for Fallback {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "fallback: secondary join failed");
+                                    warn!(error = %e, qname = %qname, "fallback: secondary join failed");
                                 }
                             }
                         }
@@ -213,7 +223,7 @@ impl Executable for Fallback {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "fallback: secondary join failed");
+                                    warn!(error = %e, qname = %qname, "fallback: secondary join failed");
                                 }
                             }
 
@@ -224,7 +234,7 @@ impl Executable for Fallback {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "fallback: primary join failed");
+                                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
                                 }
                             }
                         }
@@ -242,7 +252,7 @@ impl Executable for Fallback {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "fallback: primary join failed");
+                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
                 }
                 Err(_) => {}
             }
@@ -256,7 +266,7 @@ impl Executable for Fallback {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "fallback: secondary failed");
+                    warn!(error = %e, qname = %qname, "fallback: secondary failed");
                 }
             }
         }

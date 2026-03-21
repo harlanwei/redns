@@ -59,7 +59,6 @@ pub trait DnsHandler: Send + Sync {
 /// Wraps a sequence [`Executable`] as a [`DnsHandler`].
 ///
 /// - If the executable returns an error → SERVFAIL response.
-/// - If the executable returns Ok but no response is set → REFUSED response.
 /// - The response's `RecursionAvailable` flag is always set (forwarder assumption).
 pub struct EntryHandler {
     entry: Arc<dyn Executable>,
@@ -77,7 +76,7 @@ impl DnsHandler for EntryHandler {
     async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message> {
         // Basic query validation.
         if query.message_type() == MessageType::Response || query.queries().len() != 1 {
-            return Ok(refused_response(&query));
+            return Ok(servfail_response(&query));
         }
 
         let qname = query
@@ -154,25 +153,25 @@ impl DnsHandler for EntryHandler {
     }
 }
 
-fn refused_response(query: &Message) -> Message {
+fn empty_response(query: &Message) -> Message {
     let mut resp = Message::new();
     resp.set_id(query.id());
     resp.set_message_type(MessageType::Response);
-    resp.set_response_code(ResponseCode::Refused);
     if let Some(q) = query.queries().first() {
         resp.add_query(q.clone());
     }
     resp
 }
 
+fn refused_response(query: &Message) -> Message {
+    let mut resp = empty_response(query);
+    resp.set_response_code(ResponseCode::Refused);
+    resp
+}
+
 fn servfail_response(query: &Message) -> Message {
-    let mut resp = Message::new();
-    resp.set_id(query.id());
-    resp.set_message_type(MessageType::Response);
+    let mut resp = empty_response(query);
     resp.set_response_code(ResponseCode::ServFail);
-    if let Some(q) = query.queries().first() {
-        resp.add_query(q.clone());
-    }
     resp
 }
 
@@ -226,13 +225,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_response_returns_refused() {
+    async fn no_response_returns_noerror() {
         let handler = EntryHandler::new(Arc::new(NopExec));
         let resp = handler
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::Refused);
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
         assert!(resp.recursion_available());
     }
 

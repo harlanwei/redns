@@ -2,10 +2,15 @@ import type { UpstreamMetrics, UpstreamSortCol } from '../types/dashboard';
 
 export function parseAnswer(row: string) {
   const parts = row.split(' ');
-  if (parts.length >= 3) {
-    return { type: parts[1], value: parts.slice(2).join(' ') };
+  // New format: "name ttl type data" (4+ parts, second part is numeric TTL)
+  if (parts.length >= 4 && /^\d+$/.test(parts[1])) {
+    return { type: parts[2], value: parts.slice(3).join(' '), ttl: parseInt(parts[1], 10) };
   }
-  return { type: '-', value: row };
+  // Legacy format: "name type data" (3+ parts)
+  if (parts.length >= 3) {
+    return { type: parts[1], value: parts.slice(2).join(' '), ttl: undefined };
+  }
+  return { type: '-', value: row, ttl: undefined };
 }
 
 export function formatProtocol(protocol: string) {

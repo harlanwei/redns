@@ -38,6 +38,7 @@ pub struct DnsLogEntry {
     pub result: String,
     pub result_rows: Vec<String>,
     pub latency_ms: u64,
+    pub answer_ttl: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +93,7 @@ struct NewDnsLogEntry {
     result: String,
     result_rows_json: String,
     latency_ms: u64,
+    answer_ttl: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +163,8 @@ impl DashboardStore {
                             for entry in entries {
                                 let _ = tx.execute(
                                     "INSERT INTO dns_logs (
-                                        ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms
-                                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                        ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms, answer_ttl
+                                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                                     params![
                                         entry.ts_unix_ms as i64,
                                         entry.client_ip,
@@ -174,6 +176,7 @@ impl DashboardStore {
                                         entry.result_rows_json,
                                         entry.upstreams_json,
                                         entry.latency_ms as i64,
+                                        entry.answer_ttl as i64,
                                     ],
                                 );
                             }
@@ -245,6 +248,12 @@ impl DashboardStore {
         if !Self::has_column(conn, "geoip_cache", "hosting")? {
             conn.execute("ALTER TABLE geoip_cache ADD COLUMN hosting INTEGER", [])?;
         }
+        if !Self::has_column(conn, "dns_logs", "answer_ttl")? {
+            conn.execute(
+                "ALTER TABLE dns_logs ADD COLUMN answer_ttl INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -313,7 +322,7 @@ impl DashboardStore {
             let bounded_offset = (bounded_page - 1) * page_size;
 
             let mut stmt = conn.prepare(
-                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms
+                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms, answer_ttl
                  FROM dns_logs
                  WHERE client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1
                  ORDER BY id DESC
@@ -334,6 +343,7 @@ impl DashboardStore {
                         result_rows: parse_json_string_vec(&row.get::<_, String>(8)?),
                         upstreams: parse_json_string_vec(&row.get::<_, String>(9)?),
                         latency_ms: row.get::<_, i64>(10)? as u64,
+                        answer_ttl: row.get::<_, i64>(11)? as u32,
                     })
                 },
             )?;
@@ -926,16 +936,18 @@ impl DnsHandler for DashboardDnsHandler {
         let result = self.inner.handle(query, meta).await;
         let elapsed = start.elapsed();
 
-        let (rcode, result_summary, result_rows) = match &result {
+        let (rcode, result_summary, result_rows, answer_ttl) = match &result {
             Ok(resp) => {
                 let rcode = resp.response_code();
                 let (summary, rows) = persisted_dns_result(resp, &qname);
-                (format!("{:?}", rcode), summary, rows)
+                let ttl = min_answer_ttl(resp);
+                (format!("{:?}", rcode), summary, rows, ttl)
             }
             Err(e) => (
                 "ERROR".to_string(),
                 e.to_string(),
                 vec![format!("error: {}", e)],
+                0u32,
             ),
         };
 
@@ -959,6 +971,7 @@ impl DnsHandler for DashboardDnsHandler {
             result_rows_json: serde_json::to_string(&result_rows)
                 .unwrap_or_else(|_| "[]".to_string()),
             latency_ms: latency_ms_ceil(elapsed),
+            answer_ttl,
         };
         if let Err(e) = self.store.record(entry).await {
             warn!(error = %e, "dashboard failed to persist dns log entry");
@@ -1304,8 +1317,9 @@ fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
             &ans_name
         };
         rows.push(format!(
-            "{} {:?} {}",
+            "{} {} {:?} {}",
             name_disp,
+            answer.ttl(),
             answer.record_type(),
             answer.data()
         ));
@@ -1313,6 +1327,11 @@ fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
 
     // Return empty summary to save disk space, we will just rely on result_rows_json.
     (String::new(), rows)
+}
+
+/// Extract the minimum answer TTL from a DNS response.
+fn min_answer_ttl(resp: &Message) -> u32 {
+    resp.answers().iter().map(|rr| rr.ttl()).min().unwrap_or(0)
 }
 
 fn persisted_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
@@ -1478,6 +1497,7 @@ mod tests {
             result: "ok".to_string(),
             result_rows_json: "[]".to_string(),
             latency_ms: 12,
+            answer_ttl: 300,
         }
     }
 

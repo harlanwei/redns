@@ -11,7 +11,6 @@ use lru::LruCache;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
-use redns_core::upstream::global_average_latency;
 use redns_core::{Context, RecursiveExecutable};
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -23,7 +22,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::debug;
 
 /// Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -36,6 +34,9 @@ pub const DEFAULT_HOTSET_PERCENT: u8 = 20;
 
 /// Minimum capacity to enable sharding.
 const SHARDING_MIN_CAPACITY: usize = 4096;
+
+/// When TTL <= threshold, an optimistic refresh is triggered.
+const PROACTIVE_REFRESH_THRESHOLD: Duration = Duration::from_secs(2);
 
 static CACHE_REGISTRY: OnceLock<StdMutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
 static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
@@ -316,7 +317,7 @@ impl RecursiveExecutable for Cache {
         let mut do_optimistic_refresh = false;
         let mut refresh_candidate_request_count = 0u64;
         let mut refresh_candidate_ttl = 0u32;
-        let mut cached_payload: Option<(Message, u32, bool)> = None;
+        let mut cached_payload: Option<(Message, u32)> = None;
         {
             let shard = self.get_shard(&key);
             let mut store = shard.lock().await;
@@ -335,35 +336,30 @@ impl RecursiveExecutable for Cache {
                 if !entry.is_expired() {
                     // Fresh hit.
                     let ttl = entry.remaining_ttl();
-                    cached_payload = Some((entry.resp.clone(), ttl, false));
+                    cached_payload = Some((entry.resp.clone(), ttl));
                     refresh_candidate_request_count = new_count;
                     refresh_candidate_ttl = ttl;
                 } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
                     // Stale but within lazy window — serve stale and refresh.
                     do_optimistic_refresh = true;
                     entry.stored_at = Instant::now();
-                    cached_payload = Some((entry.resp.clone(), 1, true));
+                    cached_payload = Some((entry.resp.clone(), 1));
                 }
             }
         }
 
-        let mut served_from_cache = false;
-        if let Some((mut resp, ttl, stale_hit)) = cached_payload {
+        let served_from_cache = if let Some((mut resp, ttl)) = cached_payload {
             self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
             resp.set_id(ctx.query().id());
             adjust_ttl(&mut resp, ttl);
             ctx.set_response(Some(resp));
             ctx.set_mark(MARK_CACHE_HIT);
-            if stale_hit {
-                debug!(key = %key, "cache lazy hit (stale)");
-            } else {
-                debug!(key = %key, ttl = ttl, "cache hit");
-            }
-            served_from_cache = true;
-        }
+            true
+        } else {
+            false
+        };
 
         if !do_optimistic_refresh
-            && refresh_candidate_ttl > 0
             && self
                 .should_proactively_refresh(
                     &key,
@@ -394,7 +390,7 @@ impl RecursiveExecutable for Cache {
         next.exec_next(ctx).await?;
 
         // Store the response in cache.
-        self.store_entry(&key, ctx).await;
+        self.store(&key, ctx).await;
 
         Ok(())
     }
@@ -407,67 +403,65 @@ impl Cache {
         request_count: u64,
         remaining_ttl: u32,
     ) -> bool {
-        let threshold = match proactive_refresh_ttl_threshold() {
-            Some(v) if v > Duration::ZERO => v,
-            _ => return false,
-        };
-
-        if Duration::from_secs(remaining_ttl as u64) >= threshold {
-            return false;
-        }
-
-        if self.inner.hotset_percent == 0 {
+        if self.inner.hotset_percent == 0
+            || Duration::from_secs(remaining_ttl as u64) > PROACTIVE_REFRESH_THRESHOLD
+        {
             return false;
         }
 
         is_hot_entry(&self.inner, request_count).await
     }
 
-    async fn store_entry(&self, key: &CacheKey, ctx: &Context) {
+    async fn store(&self, key: &CacheKey, ctx: &Context) {
+        use hickory_proto::op::ResponseCode;
+
         if let Some(resp) = ctx.response() {
             let rcode = resp.response_code();
-            let is_negative = rcode == hickory_proto::op::ResponseCode::NXDomain
-                || rcode == hickory_proto::op::ResponseCode::ServFail;
 
-            if rcode == hickory_proto::op::ResponseCode::NoError || is_negative {
-                let mut ttl = min_ttl(resp);
-
-                if rcode == hickory_proto::op::ResponseCode::NXDomain {
-                    ttl = ttl.min(30);
-                } else if rcode == hickory_proto::op::ResponseCode::ServFail {
-                    ttl = ttl.min(5);
-                }
-
-                if ttl > 0 {
-                    let shard = self.get_shard(key);
-                    let mut store = shard.lock().await;
-
-                    // Remove old index entry if this key already exists.
-                    if let Some(old_entry) = store.peek(key) {
-                        let mut index = self.inner.hot_index.lock().await;
-                        index.remove(&(Reverse(old_entry.request_count), key.clone()));
-                    }
-
-                    // Use push() to capture evicted entries for index cleanup.
-                    let evicted = store.push(
-                        key.clone(),
-                        CachedEntry {
-                            resp: resp.clone(),
-                            stored_at: Instant::now(),
-                            original_ttl: ttl,
-                            request_count: 1,
-                        },
-                    );
-
-                    let mut index = self.inner.hot_index.lock().await;
-                    // Remove evicted entry from index.
-                    if let Some((evicted_key, evicted_entry)) = evicted {
-                        index.remove(&(Reverse(evicted_entry.request_count), evicted_key));
-                    }
-                    // Insert the new entry.
-                    index.insert((Reverse(1), key.clone()));
-                }
+            // Never cache REFUSED — it's a transient upstream signal (rate
+            // limiting, policy, etc.) and should not poison the cache.
+            if rcode == ResponseCode::Refused {
+                return;
             }
+
+            let mut ttl = min_ttl(resp);
+            if rcode == ResponseCode::NXDomain {
+                ttl = ttl.min(30);
+            } else if rcode == ResponseCode::ServFail {
+                ttl = ttl.min(5);
+            }
+
+            if ttl <= 0 {
+                return;
+            }
+
+            let shard = self.get_shard(key);
+            let mut store = shard.lock().await;
+
+            // Remove old index entry if this key already exists.
+            if let Some(old_entry) = store.peek(key) {
+                let mut index = self.inner.hot_index.lock().await;
+                index.remove(&(Reverse(old_entry.request_count), key.clone()));
+            }
+
+            // Use push() to capture evicted entries for index cleanup.
+            let evicted = store.push(
+                key.clone(),
+                CachedEntry {
+                    resp: resp.clone(),
+                    stored_at: Instant::now(),
+                    original_ttl: ttl,
+                    request_count: 1,
+                },
+            );
+
+            let mut index = self.inner.hot_index.lock().await;
+            // Remove evicted entry from index.
+            if let Some((evicted_key, evicted_entry)) = evicted {
+                index.remove(&(Reverse(evicted_entry.request_count), evicted_key));
+            }
+            // Insert the new entry.
+            index.insert((Reverse(1), key.clone()));
         }
     }
 
@@ -484,7 +478,6 @@ impl Cache {
         drop(inflight);
 
         if !should_spawn {
-            debug!(key = %key, "refresh already in-flight; skipping duplicate");
             return;
         }
 
@@ -494,9 +487,8 @@ impl Cache {
         let cache_clone = self.clone();
         let refresh_key = key.clone();
         tokio::spawn(async move {
-            debug!(key = %refresh_key, "background optimistic refresh triggered");
             let _ = chain.exec_next(&mut refresh_ctx).await;
-            cache_clone.store_entry(&refresh_key, &refresh_ctx).await;
+            cache_clone.store(&refresh_key, &refresh_ctx).await;
 
             let mut inflight = cache_clone.inner.inflight_refreshes.lock().await;
             inflight.remove(&refresh_key);
@@ -550,12 +542,7 @@ fn build_query_from_key(key: &CacheKey) -> Message {
 /// and trigger proactive refresh, even when no queries arrive for those entries.
 async fn sweep_hot_entries(inner: Arc<CacheInner>) {
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let threshold = match proactive_refresh_ttl_threshold() {
-            Some(v) if v > Duration::ZERO => v,
-            _ => continue,
-        };
+        tokio::time::sleep(PROACTIVE_REFRESH_THRESHOLD).await;
 
         if inner.hotset_percent == 0 {
             continue;
@@ -588,7 +575,7 @@ async fn sweep_hot_entries(inner: Arc<CacheInner>) {
                 match store.peek(key) {
                     Some(entry) => {
                         let remaining = entry.remaining_ttl();
-                        remaining > 0 && Duration::from_secs(remaining as u64) < threshold
+                        Duration::from_secs(remaining as u64) <= PROACTIVE_REFRESH_THRESHOLD
                     }
                     None => false,
                 }
@@ -609,12 +596,6 @@ async fn sweep_hot_entries(inner: Arc<CacheInner>) {
             }
         }
     }
-}
-
-fn proactive_refresh_ttl_threshold() -> Option<Duration> {
-    let avg_latency = global_average_latency()?;
-    let latency_bound = Duration::from_secs_f64(avg_latency.as_secs_f64() * 1.5);
-    Some(std::cmp::min(Duration::from_secs(10), latency_bound))
 }
 
 #[cfg(test)]
@@ -835,7 +816,7 @@ mod tests {
         // Cache with capacity 5 and 20% hot set → top 1 entry is "hot".
         let cache = Cache::new_with_hotset_percent(5, Duration::from_secs(30), 20);
 
-        // Helper to build a context with a response for store_entry.
+        // Helper to build a context with a response for store.
         let make_ctx_with_resp = |name: &str| {
             let mut msg = Message::new();
             msg.set_id(1)
@@ -876,7 +857,7 @@ mod tests {
                 qtype: RecordType::A,
             };
             let ctx = make_ctx_with_resp(name);
-            cache.store_entry(&key, &ctx).await;
+            cache.store(&key, &ctx).await;
         }
 
         // All start with request_count=1, so the index should have 3 entries.
@@ -911,7 +892,7 @@ mod tests {
                 qtype: RecordType::A,
             };
             let ctx = make_ctx_with_resp(name);
-            cache.store_entry(&key, &ctx).await;
+            cache.store(&key, &ctx).await;
         }
 
         // After evictions, the index should track the same count as the shard.

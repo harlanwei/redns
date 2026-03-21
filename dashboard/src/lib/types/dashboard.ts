@@ -12,6 +12,7 @@ export type DnsLogEntry = {
   result: string;
   result_rows: string[];
   latency_ms: number;
+  answer_ttl: number;
 };
 
 export type LogSummary = {

@@ -392,6 +392,7 @@ impl Forward {
     async fn resolve_once(
         &self,
         query_bytes: Arc<Vec<u8>>,
+        qname: &str,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let selected_indices = self.selector.select(self.concurrent);
         let selected: Vec<Arc<UpstreamWrapper>> = selected_indices
@@ -487,7 +488,7 @@ impl Forward {
                     let rcode = match dns_header_rcode(&resp_bytes) {
                         Some(rcode) => rcode,
                         None => {
-                            warn!(plugin = %self.name, upstream = %upstream_name, "invalid upstream response (too short)");
+                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, "invalid upstream response (too short)");
                             last_err = Some("invalid response: short dns header".into());
                             continue;
                         }
@@ -511,7 +512,7 @@ impl Forward {
                             return Ok((resp, selected[sel_idx].clone()));
                         }
                         Err(e) => {
-                            warn!(plugin = %self.name, upstream = %upstream_name, error = %e, "invalid upstream response");
+                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, error = %e, "invalid upstream response");
                             last_err = Some(format!("invalid response: {e}").into());
                         }
                     }
@@ -552,7 +553,9 @@ impl Forward {
                     },
                 )?)
             };
-            return self.resolve_once(query_bytes).await;
+            return self
+                .resolve_once(query_bytes, &original_name.to_ascii())
+                .await;
         }
 
         let mut chase_query = query.clone();
@@ -587,7 +590,9 @@ impl Forward {
                 )?)
             };
 
-            let (resp, upstream) = self.resolve_once(query_bytes).await?;
+            let (resp, upstream) = self
+                .resolve_once(query_bytes, &current_name.to_ascii())
+                .await?;
 
             let mut in_resp_seen: HashSet<Name> = HashSet::new();
             let mut step_cnames: Vec<Record> = Vec::new();

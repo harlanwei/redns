@@ -162,18 +162,19 @@
     <table class="min-w-full divide-y divide-gray-200 table-fixed">
       <thead class="bg-gray-50">
         <tr>
-          <th scope="col" class="w-[15%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Time</th>
-          <th scope="col" class="w-[20%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Client</th>
-          <th scope="col" class="w-[40%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Query</th>
-          <th scope="col" class="w-[12%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Status</th>
-          <th scope="col" class="w-[13%] px-4 sm:px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Latency</th>
+          <th scope="col" class="w-[14%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Time</th>
+          <th scope="col" class="w-[18%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Client</th>
+          <th scope="col" class="w-[36%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Query</th>
+          <th scope="col" class="w-[11%] px-4 sm:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Status</th>
+          <th scope="col" class="w-[10%] px-4 sm:px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">TTL</th>
+          <th scope="col" class="w-[11%] px-4 sm:px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Latency</th>
         </tr>
       </thead>
       <tbody class="bg-white divide-y divide-gray-100 relative">
         {#if loading && !logsResponse}
-          <tr><td colspan="5" class="px-6 py-12 text-center text-gray-500">Loading logs...</td></tr>
+          <tr><td colspan="6" class="px-6 py-12 text-center text-gray-500">Loading logs...</td></tr>
         {:else if logsResponse?.items.length === 0}
-          <tr><td colspan="5" class="px-6 py-12 text-center text-gray-500">No logs found.</td></tr>
+          <tr><td colspan="6" class="px-6 py-12 text-center text-gray-500">No logs found.</td></tr>
         {:else if logsResponse}
           {#each logsResponse.items as item (item.id)}
             <tr
@@ -183,13 +184,13 @@
                 selectedLog = item;
               }}
             >
-              <td class="w-[15%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-gray-500 truncate" title={new Date(item.ts_unix_ms).toLocaleString()}>
+              <td class="w-[14%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-gray-500 truncate" title={new Date(item.ts_unix_ms).toLocaleString()}>
                 {formatRelativeTime(item.ts_unix_ms)}
               </td>
-              <td class="w-[20%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-navy-900 font-medium truncate" title={`${item.client_ip} (${formatProtocol(item.protocol)})`}>
+              <td class="w-[18%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-navy-900 font-medium truncate" title={`${item.client_ip} (${formatProtocol(item.protocol)})`}>
                 {item.client_ip} <span class="text-gray-400 text-xs font-normal">({formatProtocol(item.protocol)})</span>
               </td>
-              <td class="w-[40%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm truncate" title={`${item.qtype} ${item.qname}`}>
+              <td class="w-[36%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm truncate" title={`${item.qtype} ${item.qname}`}>
                 <div class="flex items-center gap-2 truncate">
                   <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-gray-100 text-gray-700 border border-gray-200 flex-shrink-0">
                     {item.qtype}
@@ -197,12 +198,19 @@
                   <span class="text-navy-900 font-medium truncate">{item.qname}</span>
                 </div>
               </td>
-              <td class="w-[12%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm truncate">
+              <td class="w-[11%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm truncate">
                 <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold {item.rcode.toLowerCase() === 'noerror' ? 'bg-green-50 text-green-700 ring-1 ring-inset ring-green-600/20' : 'bg-red-50 text-red-700 ring-1 ring-inset ring-red-600/10'}">
                   {item.rcode}
                 </span>
               </td>
-              <td class="w-[13%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-right font-medium text-navy-900 truncate">
+              <td class="w-[10%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-right font-medium text-navy-900 truncate">
+                {#if item.answer_ttl > 0}
+                  {item.answer_ttl} <span class="text-gray-400 text-xs font-normal">s</span>
+                {:else}
+                  <span class="text-gray-300">—</span>
+                {/if}
+              </td>
+              <td class="w-[11%] px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-right font-medium text-navy-900 truncate">
                 {item.latency_ms} <span class="text-gray-400 text-xs font-normal">ms</span>
               </td>
             </tr>
@@ -418,8 +426,9 @@
                 <table class="min-w-full divide-y divide-gray-200">
                   <thead class="bg-gray-50">
                     <tr>
-                      <th scope="col" class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider w-1/4">Type</th>
+                      <th scope="col" class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider w-1/6">Type</th>
                       <th scope="col" class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Value</th>
+                      <th scope="col" class="px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider w-1/6">TTL</th>
                     </tr>
                   </thead>
                   <tbody class="bg-white divide-y divide-gray-100">
@@ -466,10 +475,17 @@
                             {/if}
                           {/if}
                         </td>
+                        <td class="px-6 py-3 text-right whitespace-nowrap text-sm text-gray-500 font-medium">
+                          {#if parsed.ttl !== undefined}
+                            {parsed.ttl} <span class="text-gray-400 text-xs">s</span>
+                          {:else}
+                            <span class="text-gray-300">—</span>
+                          {/if}
+                        </td>
                       </tr>
                     {/each}
                     {#if (selectedLog?.result_rows || []).length === 0}
-                      <tr><td colspan="2" class="px-6 py-8 text-sm text-gray-500 text-center italic">No answers recorded</td></tr>
+                      <tr><td colspan="3" class="px-6 py-8 text-sm text-gray-500 text-center italic">No answers recorded</td></tr>
                     {/if}
                   </tbody>
                 </table>
