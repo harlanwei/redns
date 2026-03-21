@@ -30,7 +30,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CacheBuildConfig {
     size: usize,
-    hotset_percent: u8,
 }
 
 #[derive(Parser)]
@@ -131,14 +130,9 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
     struct CacheArgs {
         #[serde(default)]
         size: Option<usize>,
-        #[serde(default, alias = "top_percent")]
-        hotset_percent: Option<u8>,
     }
 
-    let default = CacheBuildConfig {
-        size: 0,
-        hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
-    };
+    let default = CacheBuildConfig { size: 0 };
 
     let args = args.trim();
     if args.is_empty() {
@@ -153,7 +147,6 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
     if let Ok(cfg) = redns_core::config::deserialize_yaml_str::<CacheArgs>(args) {
         return CacheBuildConfig {
             size: cfg.size.unwrap_or(default.size),
-            hotset_percent: cfg.hotset_percent.unwrap_or(default.hotset_percent),
         };
     }
 
@@ -223,10 +216,9 @@ fn register_builtins(builder: &mut ChainBuilder) {
         "cache",
         Box::new(|args: &str| {
             let cfg = parse_cache_args(args);
-            Ok(Box::new(Cache::new_with_hotset_percent(
+            Ok(Box::new(Cache::new(
                 cfg.size,
                 std::time::Duration::from_secs(30),
-                cfg.hotset_percent,
             )) as Box<dyn RecursiveExecutable>)
         }),
     );
@@ -759,10 +751,7 @@ mod tests {
     fn cache_size_parses_plain_integer_arg() {
         assert_eq!(
             parse_cache_args("16384"),
-            CacheBuildConfig {
-                size: 16384,
-                hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
-            }
+            CacheBuildConfig { size: 16384 }
         );
     }
 
@@ -770,21 +759,7 @@ mod tests {
     fn cache_size_parses_yaml_mapping_arg() {
         assert_eq!(
             parse_cache_args("size: 16384"),
-            CacheBuildConfig {
-                size: 16384,
-                hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
-            }
-        );
-    }
-
-    #[test]
-    fn cache_hotset_percent_parses_yaml_mapping_arg() {
-        assert_eq!(
-            parse_cache_args("size: 16384\nhotset_percent: 35"),
-            CacheBuildConfig {
-                size: 16384,
-                hotset_percent: 35,
-            }
+            CacheBuildConfig { size: 16384 }
         );
     }
 
@@ -792,10 +767,7 @@ mod tests {
     fn cache_size_defaults_when_arg_is_invalid() {
         assert_eq!(
             parse_cache_args("size: nope"),
-            CacheBuildConfig {
-                size: 0,
-                hotset_percent: redns_executables::cache::DEFAULT_HOTSET_PERCENT,
-            }
+            CacheBuildConfig { size: 0 }
         );
     }
 
