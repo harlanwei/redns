@@ -2,7 +2,7 @@
 //
 // This file is part of redns.
 
-//! In-memory LRU DNS cache with lazy TTL refresh.
+//! In-memory LRU DNS cache with lazy TTL refresh and optional file persistence.
 
 use async_trait::async_trait;
 use hickory_proto::op::Message;
@@ -16,10 +16,12 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 /// Default cache size.
@@ -28,8 +30,24 @@ const DEFAULT_CACHE_SIZE: usize = 1024;
 /// Default lazy cache TTL (serve stale for this long while refreshing).
 const DEFAULT_LAZY_TTL: Duration = Duration::from_secs(30);
 
+/// Default interval between periodic cache dumps to disk.
+pub const DEFAULT_DUMP_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Minimum capacity to enable sharding.
 const SHARDING_MIN_CAPACITY: usize = 4096;
+
+/// File persistence magic header and version.
+const FILE_MAGIC: &[u8; 10] = b"REDNSCACHE";
+const FILE_VERSION: u8 = 1;
+
+/// Configuration for cache file persistence.
+#[derive(Debug, Clone)]
+pub struct CachePersistConfig {
+    /// Path to the cache file.
+    pub file_path: String,
+    /// Interval between periodic dumps.
+    pub dump_interval: Duration,
+}
 
 static CACHE_REGISTRY: OnceLock<StdMutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
 static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
@@ -161,7 +179,11 @@ pub struct CacheSnapshot {
 }
 
 impl Cache {
-    pub fn new(max_size: usize, lazy_ttl: Duration) -> Self {
+    pub fn new(
+        max_size: usize,
+        lazy_ttl: Duration,
+        persist_config: Option<CachePersistConfig>,
+    ) -> Self {
         let cap = if max_size == 0 {
             DEFAULT_CACHE_SIZE
         } else {
@@ -195,11 +217,52 @@ impl Cache {
             miss_total: AtomicU64::new(0),
         });
         register_cache(&inner);
-        Self { inner }
+        let cache = Self { inner };
+
+        if let Some(persist) = persist_config {
+            let cache_clone = cache.clone();
+            let file_path = persist.file_path;
+            let dump_interval = persist.dump_interval;
+            tokio::spawn(async move {
+                match cache_clone.load_from_file(Path::new(&file_path)).await {
+                    Ok(n) => {
+                        tracing::info!(path = %file_path, entries = n, "cache loaded from file")
+                    }
+                    Err(e) => {
+                        if e.kind() != io::ErrorKind::NotFound {
+                            tracing::warn!(
+                                error = %e,
+                                path = %file_path,
+                                "cache load from file failed"
+                            );
+                        }
+                    }
+                }
+
+                let mut interval = tokio::time::interval(dump_interval);
+                loop {
+                    interval.tick().await;
+                    match cache_clone.dump_to_file(Path::new(&file_path)).await {
+                        Ok(n) => {
+                            tracing::debug!(path = %file_path, entries = n, "cache dumped")
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %file_path,
+                                "cache dump failed"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        cache
     }
 
     pub fn default_cache() -> Self {
-        Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL)
+        Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL, None)
     }
 
     fn get_shard(&self, key: &CacheKey) -> &Mutex<LruCache<CacheKey, CachedEntry>> {
@@ -399,6 +462,190 @@ impl Cache {
             inflight.remove(&refresh_key);
         });
     }
+
+    /// Dump all non-expired cache entries to a binary file.
+    ///
+    /// The file is written atomically via a temp file + rename.
+    /// Returns the number of entries dumped.
+    async fn dump_to_file(&self, path: &Path) -> io::Result<usize> {
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let mut entries_buf = Vec::new();
+        let mut count: usize = 0;
+
+        for shard in &self.inner.shards {
+            let store = shard.lock().await;
+            for (key, entry) in store.iter() {
+                let remaining = entry.remaining_ttl();
+                if remaining == 0 {
+                    continue;
+                }
+
+                let qname_bytes = key.qname.as_bytes();
+                if qname_bytes.len() > u16::MAX as usize {
+                    continue;
+                }
+                entries_buf.write_all(&(qname_bytes.len() as u16).to_be_bytes())?;
+                entries_buf.write_all(qname_bytes)?;
+                entries_buf.write_all(&u16::from(key.qtype).to_be_bytes())?;
+                entries_buf.write_all(&remaining.to_be_bytes())?;
+
+                let msg_wire = match entry.resp.to_vec() {
+                    Ok(w) => w,
+                    Err(_) => continue,
+                };
+                if msg_wire.len() > u32::MAX as usize {
+                    continue;
+                }
+                entries_buf.write_all(&(msg_wire.len() as u32).to_be_bytes())?;
+                entries_buf.write_all(&msg_wire)?;
+
+                count += 1;
+            }
+        }
+
+        let mut buf = Vec::with_capacity(FILE_MAGIC.len() + 1 + 8 + 4 + entries_buf.len());
+        buf.write_all(FILE_MAGIC)?;
+        buf.write_all(&[FILE_VERSION])?;
+        buf.write_all(&now_ts.to_be_bytes())?;
+        buf.write_all(&(count as u32).to_be_bytes())?;
+        buf.write_all(&entries_buf)?;
+
+        let tmp_path = format!("{}.tmp", path.display());
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+
+        Ok(count)
+    }
+
+    /// Load cache entries from a binary file written by [`dump_to_file`].
+    ///
+    /// Entries that have expired between dump and load are skipped.
+    /// Returns the number of entries loaded.
+    async fn load_from_file(&self, path: &Path) -> io::Result<usize> {
+        let data = std::fs::read(path)?;
+
+        if data.len() < FILE_MAGIC.len() + 1 + 8 + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache file too short",
+            ));
+        }
+
+        let mut pos = 0;
+        if &data[pos..pos + FILE_MAGIC.len()] != FILE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache file: invalid magic",
+            ));
+        }
+        pos += FILE_MAGIC.len();
+
+        if data[pos] != FILE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache file: unsupported version",
+            ));
+        }
+        pos += 1;
+
+        let dump_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "cache file: timestamp corrupt")
+        })?);
+        pos += 8;
+
+        let entry_count = u32::from_be_bytes(data[pos..pos + 4].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache file: entry count corrupt",
+            )
+        })?) as usize;
+        pos += 4;
+
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let elapsed_since_dump = (now_ts - dump_ts).max(0) as u32;
+
+        let mut loaded = 0;
+        for _ in 0..entry_count {
+            if pos + 2 > data.len() {
+                break;
+            }
+            let qname_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+
+            if pos + qname_len > data.len() {
+                break;
+            }
+            let qname = String::from_utf8_lossy(&data[pos..pos + qname_len]).into_owned();
+            pos += qname_len;
+
+            if pos + 2 > data.len() {
+                break;
+            }
+            let qtype_u16 = u16::from_be_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+
+            if pos + 4 > data.len() {
+                break;
+            }
+            let remaining_at_dump =
+                u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+
+            if pos + 4 > data.len() {
+                break;
+            }
+            let msg_len =
+                u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
+            pos += 4;
+
+            if pos + msg_len > data.len() {
+                break;
+            }
+            let msg_wire = &data[pos..pos + msg_len];
+            pos += msg_len;
+
+            let effective_remaining = remaining_at_dump.saturating_sub(elapsed_since_dump);
+            if effective_remaining == 0 {
+                continue;
+            }
+
+            let msg = match Message::from_vec(msg_wire) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let key = CacheKey {
+                qname,
+                qtype: RecordType::from(qtype_u16),
+            };
+
+            let shard = self.get_shard(&key);
+            let mut store = shard.lock().await;
+            store.push(
+                key,
+                CachedEntry {
+                    resp: msg,
+                    stored_at: Instant::now(),
+                    original_ttl: effective_remaining,
+                },
+            );
+            loaded += 1;
+        }
+
+        Ok(loaded)
+    }
 }
 
 #[cfg(test)]
@@ -475,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_miss_then_hit() {
-        let cache = Cache::new(100, Duration::from_secs(30));
+        let cache = Cache::new(100, Duration::from_secs(30), None);
         let chain: Vec<ChainNode> = vec![
             ChainNode {
                 matchers: vec![],
@@ -496,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn lru_eviction_respects_capacity() {
-        let cache = Cache::new(2, Duration::from_secs(30));
+        let cache = Cache::new(2, Duration::from_secs(30), None);
 
         // Simulate 5 different cache entries via the store directly.
         {
@@ -560,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn deduplicates_inflight_refresh_for_same_key() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let cache = Cache::new(128, Duration::from_secs(30));
+        let cache = Cache::new(128, Duration::from_secs(30), None);
         let chain: Vec<ChainNode> = vec![
             ChainNode {
                 matchers: vec![],
@@ -602,14 +849,13 @@ mod tests {
 
     #[test]
     fn disables_sharding_below_threshold() {
-        let cache = Cache::new(4095, Duration::from_secs(30));
+        let cache = Cache::new(4095, Duration::from_secs(30), None);
         assert_eq!(cache.inner.shard_count, 1);
     }
 
     #[test]
     fn enables_sharding_at_threshold() {
-        let cache = Cache::new(4096, Duration::from_secs(30));
+        let cache = Cache::new(4096, Duration::from_secs(30), None);
         assert_eq!(cache.inner.shard_count, host_parallelism().min(4096));
     }
-
 }

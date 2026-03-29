@@ -1304,8 +1304,7 @@ async fn write_response(
 fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
     let answers = resp.answers();
     if answers.is_empty() {
-        let row = format!("rcode={:?}, answers=0", resp.response_code());
-        return (String::new(), vec![row]);
+        return (String::new(), vec![]);
     }
 
     let mut rows = Vec::new();

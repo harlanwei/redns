@@ -27,9 +27,11 @@ use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheBuildConfig {
     size: usize,
+    cache_file: Option<String>,
+    dump_interval_secs: u64,
 }
 
 #[derive(Parser)]
@@ -130,13 +132,20 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
     struct CacheArgs {
         #[serde(default)]
         size: Option<usize>,
+        #[serde(default)]
+        cache_file: Option<String>,
+        #[serde(default)]
+        dump_interval: Option<u64>,
     }
 
-    let default = CacheBuildConfig { size: 0 };
+    let default = CacheBuildConfig {
+        size: 0,
+        cache_file: None,
+        dump_interval_secs: 300,
+    };
 
     let args = args.trim();
     if args.is_empty() {
-        // Set to zero here. The Cache plugin treats zero as "use default size" and will apply its own default.
         return default;
     }
 
@@ -147,6 +156,8 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
     if let Ok(cfg) = redns_core::config::deserialize_yaml_str::<CacheArgs>(args) {
         return CacheBuildConfig {
             size: cfg.size.unwrap_or(default.size),
+            cache_file: cfg.cache_file,
+            dump_interval_secs: cfg.dump_interval.unwrap_or(default.dump_interval_secs),
         };
     }
 
@@ -216,9 +227,16 @@ fn register_builtins(builder: &mut ChainBuilder) {
         "cache",
         Box::new(|args: &str| {
             let cfg = parse_cache_args(args);
+            let persist =
+                cfg.cache_file
+                    .map(|file_path| redns_executables::cache::CachePersistConfig {
+                        file_path,
+                        dump_interval: std::time::Duration::from_secs(cfg.dump_interval_secs),
+                    });
             Ok(Box::new(Cache::new(
                 cfg.size,
                 std::time::Duration::from_secs(30),
+                persist,
             )) as Box<dyn RecursiveExecutable>)
         }),
     );
@@ -751,7 +769,11 @@ mod tests {
     fn cache_size_parses_plain_integer_arg() {
         assert_eq!(
             parse_cache_args("16384"),
-            CacheBuildConfig { size: 16384 }
+            CacheBuildConfig {
+                size: 16384,
+                cache_file: None,
+                dump_interval_secs: 300,
+            }
         );
     }
 
@@ -759,7 +781,11 @@ mod tests {
     fn cache_size_parses_yaml_mapping_arg() {
         assert_eq!(
             parse_cache_args("size: 16384"),
-            CacheBuildConfig { size: 16384 }
+            CacheBuildConfig {
+                size: 16384,
+                cache_file: None,
+                dump_interval_secs: 300,
+            }
         );
     }
 
@@ -767,7 +793,11 @@ mod tests {
     fn cache_size_defaults_when_arg_is_invalid() {
         assert_eq!(
             parse_cache_args("size: nope"),
-            CacheBuildConfig { size: 0 }
+            CacheBuildConfig {
+                size: 0,
+                cache_file: None,
+                dump_interval_secs: 300,
+            }
         );
     }
 
