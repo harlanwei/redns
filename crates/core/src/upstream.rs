@@ -6,6 +6,7 @@
 
 use crate::plugin::PluginResult;
 use async_trait::async_trait;
+use parking_lot::Mutex as StdMutex;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1290,13 +1291,9 @@ fn normalize_addr(addr: &str, default_port: u16) -> String {
 /// A custom DNS resolver for reqwest that resolves a specific hostname
 /// via a bootstrap DNS server, caching the result according to DNS TTL.
 struct BootstrapResolver {
-    /// The hostname this resolver is responsible for.
     target_host: String,
-    /// Bootstrap upstream URL (e.g., "8.8.8.8", "tls://1.1.1.1", "https://1.1.1.1/dns-query").
     bootstrap: String,
-    /// Cached resolution: (resolved address, expiry time).
-    cache: std::sync::Mutex<Option<(SocketAddr, Instant)>>,
-    /// Port to use for the resolved address.
+    cache: StdMutex<Option<(SocketAddr, Instant)>>,
     port: u16,
 }
 
@@ -1305,7 +1302,7 @@ impl BootstrapResolver {
         Self {
             target_host,
             bootstrap,
-            cache: std::sync::Mutex::new(None),
+            cache: StdMutex::new(None),
             port,
         }
     }
@@ -1329,18 +1326,13 @@ impl reqwest::dns::Resolve for BootstrapResolver {
             });
         }
 
-        // Check cache (sync Mutex, fast path).
-        {
-            if let Ok(guard) = self.cache.lock() {
-                if let Some((addr, expiry)) = *guard {
-                    if Instant::now() < expiry {
-                        let addrs = vec![addr];
-                        return Box::pin(async move {
-                            Ok(Box::new(addrs.into_iter())
-                                as Box<dyn Iterator<Item = SocketAddr> + Send>)
-                        });
-                    }
-                }
+        let guard = self.cache.lock();
+        if let Some((addr, expiry)) = &*guard {
+            if Instant::now() < *expiry {
+                let addrs = vec![*addr];
+                return Box::pin(async move {
+                    Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+                });
             }
         }
 
@@ -1351,8 +1343,8 @@ impl reqwest::dns::Resolve for BootstrapResolver {
         // We need a way to update cache from the async block. Since self is behind
         // Arc (reqwest stores the resolver in Arc), we can't directly capture &self.
         // Instead, wrap cache update in a pointer — safe because Arc keeps us alive.
-        let cache_ptr = &self.cache as *const std::sync::Mutex<Option<(SocketAddr, Instant)>>;
-        let cache_raw = cache_ptr as usize; // Convert to raw for Send
+        let cache_ptr = &self.cache as *const StdMutex<Option<(SocketAddr, Instant)>>;
+        let cache_raw = cache_ptr as usize;
 
         Box::pin(async move {
             let result = bootstrap_resolve(&target_host, &bootstrap).await?;
@@ -1360,14 +1352,10 @@ impl reqwest::dns::Resolve for BootstrapResolver {
             let (ip, ttl) = result;
             let addr = SocketAddr::new(ip, port);
 
-            // Update cache.
-            // SAFETY: BootstrapResolver is stored in Arc inside reqwest::Client,
-            // so it outlives all resolve calls.
             let cache_ref =
-                unsafe { &*(cache_raw as *const std::sync::Mutex<Option<(SocketAddr, Instant)>>) };
-            if let Ok(mut guard) = cache_ref.lock() {
-                *guard = Some((addr, Instant::now() + ttl));
-            }
+                unsafe { &*(cache_raw as *const StdMutex<Option<(SocketAddr, Instant)>>) };
+            let mut guard = cache_ref.lock();
+            *guard = Some((addr, Instant::now() + ttl));
 
             let addrs = vec![addr];
             Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
@@ -1458,8 +1446,8 @@ fn resolve_doh_host(endpoint: &str, opts: &UpstreamOpts) -> PluginResult<DohReso
             bootstrap.to_string(),
             port,
         ));
-        // Seed the cache with the initial resolution.
-        if let Ok(mut cache) = resolver.cache.lock() {
+        {
+            let mut cache = resolver.cache.lock();
             *cache = Some((SocketAddr::new(ip, port), Instant::now() + ttl));
         }
 

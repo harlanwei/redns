@@ -8,6 +8,7 @@
 //! `false` if the client has exceeded their rate limit.
 
 use dashmap::DashMap;
+use parking_lot::Mutex as StdMutex;
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use std::net::IpAddr;
@@ -57,15 +58,15 @@ impl RateLimiterConfig {
 
 /// A single token bucket for one client subnet.
 struct Bucket {
-    tokens: AtomicU64, // tokens * 1000 (fixed-point)
-    last_refill: std::sync::Mutex<Instant>,
+    tokens: AtomicU64,
+    last_refill: StdMutex<Instant>,
 }
 
 impl Bucket {
     fn new(burst: u32) -> Self {
         Self {
             tokens: AtomicU64::new((burst as u64) * 1000),
-            last_refill: std::sync::Mutex::new(Instant::now()),
+            last_refill: StdMutex::new(Instant::now()),
         }
     }
 }
@@ -125,7 +126,7 @@ impl RateLimiter {
     fn evict_stale(&self) {
         let now = Instant::now();
         self.buckets.retain(|_, bucket| {
-            let last = bucket.last_refill.lock().unwrap();
+            let last = bucket.last_refill.lock();
             now.duration_since(*last) < self.stale_threshold
         });
     }
@@ -145,20 +146,18 @@ impl RateLimiter {
             .or_insert_with(|| Bucket::new(self.config.burst));
         let bucket = entry.value();
 
-        // Refill tokens based on elapsed time.
-        {
-            let mut last = bucket.last_refill.lock().unwrap();
-            let now = Instant::now();
-            let elapsed = now.duration_since(*last).as_secs_f64();
-            let refill = (elapsed * self.config.qps * 1000.0) as u64;
-            if refill > 0 {
-                let max_tokens = (self.config.burst as u64) * 1000;
-                let current = bucket.tokens.load(Ordering::Relaxed);
-                let new_tokens = (current + refill).min(max_tokens);
-                bucket.tokens.store(new_tokens, Ordering::Relaxed);
-                *last = now;
-            }
+        let mut last = bucket.last_refill.lock();
+        let now = Instant::now();
+        let elapsed = now.duration_since(*last).as_secs_f64();
+        let refill = (elapsed * self.config.qps * 1000.0) as u64;
+        if refill > 0 {
+            let max_tokens = (self.config.burst as u64) * 1000;
+            let current = bucket.tokens.load(Ordering::Relaxed);
+            let new_tokens = (current + refill).min(max_tokens);
+            bucket.tokens.store(new_tokens, Ordering::Relaxed);
+            *last = now;
         }
+        drop(last);
 
         // Try to consume one token.
         let current = bucket.tokens.load(Ordering::Relaxed);

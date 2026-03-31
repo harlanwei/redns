@@ -438,8 +438,8 @@ async fn run_server(
 
     // Register forward plugin with upstream collection for metrics API.
     // Uses a Mutex during startup only; frozen into Arc<[]> before serving.
-    let upstreams_collector: Arc<std::sync::Mutex<Vec<Arc<UpstreamWrapper>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstreams_collector: Arc<parking_lot::Mutex<Vec<Arc<UpstreamWrapper>>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
     {
         let collector = upstreams_collector.clone();
         builder.register_exec(
@@ -454,7 +454,8 @@ async fn run_server(
                     ForwardConfig::from_str_args(args)
                 };
                 let fwd = Forward::new(cfg, "forward")?;
-                if let Ok(mut guard) = collector.lock() {
+                {
+                    let mut guard = collector.lock();
                     guard.extend(fwd.upstreams().iter().cloned());
                 }
                 Ok(Box::new(fwd) as Box<dyn Executable>)
@@ -704,7 +705,7 @@ async fn run_server(
     // ── Phase 4: Start API HTTP server ──────────────────────────
     // Freeze the upstreams collection into an immutable Arc slice (no more Mutex).
     let all_upstreams: Arc<[Arc<UpstreamWrapper>]> = {
-        let guard = upstreams_collector.lock().unwrap();
+        let guard = upstreams_collector.lock();
         guard.clone().into()
     };
 
