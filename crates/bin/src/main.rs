@@ -52,6 +52,10 @@ enum Commands {
         /// Working directory.
         #[arg(short, long)]
         dir: Option<String>,
+        
+        /// UDP backend: "epoll" (default) or "io-uring" (Linux-only, requires io-uring feature).
+        #[arg(long, default_value = None)]
+        udp_backend: Option<String>,
     },
 
     /// Print version info and exit.
@@ -77,8 +81,8 @@ async fn main() {
 
     match cli.command {
         Commands::Version => println!("redns {VERSION}"),
-        Commands::Start { config, dir } => {
-            if let Err(e) = run_server(config, dir).await {
+        Commands::Start { config, dir, udp_backend } => {
+            if let Err(e) = run_server(config, dir, udp_backend).await {
                 error!(error = %e, "server failed");
                 std::process::exit(1);
             }
@@ -387,6 +391,7 @@ fn register_builtins(builder: &mut ChainBuilder) {
 async fn run_server(
     config_path: Option<String>,
     working_dir: Option<String>,
+    cli_udp_backend: Option<String>,
 ) -> Result<(), redns_core::PluginError> {
     if let Some(ref dir) = working_dir {
         std::env::set_current_dir(dir).map_err(|e| -> redns_core::PluginError {
@@ -618,6 +623,7 @@ async fn run_server(
                     protocol: proto.into(),
                     addr: args.listen,
                     entry: args.entry,
+                    udp_backend: cli_udp_backend.clone(),
                 });
             }
             _ => {}
@@ -660,7 +666,8 @@ async fn run_server(
                 return Err(format!("entry sequence '{}' not found", srv.entry).into());
             }
         };
-        let handler: Arc<dyn redns_core::DnsHandler> = Arc::new(EntryHandler::new(entry_exec));
+        let handler: Arc<dyn redns_core::DnsHandler> =
+            Arc::new(EntryHandler::with_best_effort(entry_exec, cfg.best_effort));
         let handler: Arc<dyn redns_core::DnsHandler> = Arc::new(
             dashboard::DashboardDnsHandler::new(handler, dashboard_store.clone()),
         );
@@ -675,11 +682,47 @@ async fn run_server(
                     let h = handler.clone();
                     let s = Arc::new(socket);
                     let c = cancel.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
-                            error!(error = %e, "UDP server error");
+                    
+                    // Determine which UDP backend to use
+                    let use_io_uring = srv.udp_backend.as_deref() == Some("io-uring");
+                    
+                    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                    if use_io_uring {
+                        // Check if io_uring is available
+                        if redns_core::udp_server_uring::is_uring_available() {
+                            info!(addr = %addr, "using io_uring UDP backend");
+                            tokio::spawn(async move {
+                                if let Err(e) = redns_core::udp_server_uring::serve_udp_uring(s, h, c).await {
+                                    error!(error = %e, "io_uring UDP server error");
+                                }
+                            });
+                        } else {
+                            warn!(addr = %addr, "io_uring requested but not available, falling back to epoll");
+                            tokio::spawn(async move {
+                                if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
+                                    error!(error = %e, "UDP server error");
+                                }
+                            });
                         }
-                    });
+                    } else {
+                        tokio::spawn(async move {
+                            if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
+                                error!(error = %e, "UDP server error");
+                            }
+                        });
+                    }
+                    
+                    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                    {
+                        if use_io_uring {
+                            warn!(addr = %addr, "io_uring not supported (requires Linux + io-uring feature), using epoll");
+                        }
+                        tokio::spawn(async move {
+                            if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
+                                error!(error = %e, "UDP server error");
+                            }
+                        });
+                    }
                 }
                 Err(e) => warn!(error = %e, addr = %addr, "failed to bind UDP"),
             }

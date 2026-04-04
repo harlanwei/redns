@@ -34,6 +34,10 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    /// When enabled, attempt to resolve SERVFAIL queries using the system DNS
+    /// via the Ethernet interface as a last-resort fallback.
+    #[serde(default)]
+    pub best_effort: bool,
 }
 
 /// Server listener configuration.
@@ -47,6 +51,9 @@ pub struct ServerConfig {
     /// Entry sequence tag to use for this server.
     #[serde(default)]
     pub entry: String,
+    /// UDP backend: "epoll" (default) or "io-uring" (Linux-only, requires io-uring feature).
+    #[serde(default)]
+    pub udp_backend: Option<String>,
 }
 
 fn default_protocol() -> String {

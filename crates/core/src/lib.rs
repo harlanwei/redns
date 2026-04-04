@@ -12,9 +12,14 @@ pub mod redns;
 pub mod registry;
 pub mod sequence;
 pub mod server;
+pub mod system_dns;
 pub mod tcp_server;
 pub mod udp_server;
 pub mod upstream;
+
+/// io_uring-based UDP server (Linux-only, feature-gated).
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod udp_server_uring;
 
 /// Ensure rustls has a process-level crypto provider installed.
 ///

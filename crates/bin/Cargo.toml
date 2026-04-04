@@ -31,3 +31,7 @@ parking_lot = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 bc-mimalloc = { version = "0.1.48", features = ["v3"] }
+
+[features]
+default = []
+io-uring = ["redns-core/io-uring"]

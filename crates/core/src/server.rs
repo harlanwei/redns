@@ -19,6 +19,7 @@
 
 use crate::context::{Context, KV_SELECTED_UPSTREAM, MARK_CACHE_HIT};
 use crate::plugin::{Executable, PluginResult};
+use crate::system_dns::system_fallback_resolve;
 use crate::upstream::UpstreamWrapper;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
@@ -60,14 +61,28 @@ pub trait DnsHandler: Send + Sync {
 ///
 /// - If the executable returns an error → SERVFAIL response.
 /// - The response's `RecursionAvailable` flag is always set (forwarder assumption).
+/// - When `best_effort` is enabled, SERVFAIL responses trigger a fallback
+///   attempt via the system DNS over the Ethernet interface.
 pub struct EntryHandler {
     entry: Arc<dyn Executable>,
+    best_effort: bool,
 }
 
 impl EntryHandler {
     /// Creates a new entry handler wrapping the given executable.
     pub fn new(entry: Arc<dyn Executable>) -> Self {
-        Self { entry }
+        Self {
+            entry,
+            best_effort: false,
+        }
+    }
+
+    /// Creates a new entry handler with best-effort system DNS fallback.
+    pub fn with_best_effort(entry: Arc<dyn Executable>, best_effort: bool) -> Self {
+        Self {
+            entry,
+            best_effort,
+        }
     }
 }
 
@@ -109,6 +124,14 @@ impl DnsHandler for EntryHandler {
         let served_from_cache =
             result.is_ok() && ctx.response().is_some() && ctx.has_mark(MARK_CACHE_HIT);
 
+        let is_servfail = match &result {
+            Err(_) => true,
+            Ok(()) => ctx
+                .response()
+                .map(|r| r.response_code() == ResponseCode::ServFail)
+                .unwrap_or(false),
+        };
+
         let mut resp = match result {
             Ok(()) => ctx
                 .response()
@@ -119,6 +142,30 @@ impl DnsHandler for EntryHandler {
                 servfail_response(&query)
             }
         };
+
+        if is_servfail && self.best_effort {
+            let fallback_query = query.clone();
+            match tokio::time::timeout(
+                DEFAULT_QUERY_TIMEOUT,
+                system_fallback_resolve(&fallback_query),
+            )
+            .await
+            {
+                Ok(Ok(Some(system_resp))) => {
+                    debug!(qname = %qname, "using system DNS fallback response");
+                    resp = system_resp;
+                }
+                Ok(Ok(None)) => {
+                    debug!(qname = %qname, "system DNS fallback unavailable");
+                }
+                Ok(Err(e)) => {
+                    debug!(error = %e, qname = %qname, "system DNS fallback error");
+                }
+                Err(_) => {
+                    debug!(qname = %qname, "system DNS fallback timed out");
+                }
+            }
+        }
 
         if let Some(upstream) = selected_upstream {
             if let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
