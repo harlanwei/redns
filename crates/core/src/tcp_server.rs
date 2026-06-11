@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -18,6 +19,11 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default first read timeout.
 const FIRST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum number of concurrent in-flight TCP connections. Bounds task and
+/// memory growth under a connection flood; further connections wait in the OS
+/// accept backlog until a slot frees rather than spawning unbounded tasks.
+const MAX_CONNECTIONS: usize = 1024;
 
 /// Backoff applied after an accept failure caused by fd exhaustion, to avoid
 /// busy-spinning while descriptors are unavailable.
@@ -40,6 +46,10 @@ pub async fn serve_tcp(
     handler: Arc<dyn DnsHandler>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Bound concurrent connections. A permit is acquired before spawning the
+    // per-connection task and held until that task ends, so a connection flood
+    // cannot grow tasks and memory without limit.
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -58,10 +68,24 @@ pub async fn serve_tcp(
                         continue;
                     }
                 };
+
+                // Wait for a free connection slot. Cancellation still wins so
+                // shutdown is not blocked by a saturated pool.
+                let permit = tokio::select! {
+                    p = conn_limit.clone().acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()), // Semaphore closed; shutting down.
+                    },
+                    _ = cancel.cancelled() => {
+                        debug!("TCP server shutting down");
+                        return Ok(());
+                    }
+                };
                 let handler = handler.clone();
                 let cancel = cancel.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     debug!(peer = %peer, "new TCP connection");
                     let mut stream = stream;
                     let mut first_read = true;

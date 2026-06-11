@@ -16,10 +16,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 /// Maximum DNS message size for DoH.
 const MAX_DOH_MSG_SIZE: usize = 65535;
+
+/// Maximum number of concurrent in-flight DoH connections. Bounds task and
+/// memory growth under a connection flood; further connections wait in the OS
+/// accept backlog until a slot frees rather than spawning unbounded tasks.
+const MAX_CONNECTIONS: usize = 1024;
 
 /// Per-read timeout for HTTP request header/body reads.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -60,6 +66,10 @@ pub async fn serve_doh(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Arc::new(config);
+    // Bound concurrent connections. A permit is acquired before spawning the
+    // per-connection task and held until that task ends, so a connection flood
+    // cannot grow tasks and memory without limit.
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -78,10 +88,24 @@ pub async fn serve_doh(
                         continue;
                     }
                 };
+
+                // Wait for a free connection slot. Cancellation still wins so
+                // shutdown is not blocked by a saturated pool.
+                let permit = tokio::select! {
+                    p = conn_limit.clone().acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()), // Semaphore closed; shutting down.
+                    },
+                    _ = cancel.cancelled() => {
+                        debug!("DoH server shutting down");
+                        return Ok(());
+                    }
+                };
                 let handler = handler.clone();
                 let config = config.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_doh_connection(stream, peer, handler, config, cancel).await {
                         debug!(error = %e, peer = %peer, "DoH connection error");
                     }

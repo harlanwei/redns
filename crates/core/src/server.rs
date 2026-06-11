@@ -197,7 +197,44 @@ impl DnsHandler for EntryHandler {
 
         // Forwarder: always set RA.
         resp.set_recursion_available(true);
+
+        // For UDP, ensure the response fits the client's advertised buffer. If
+        // it doesn't, return a truncated response (TC bit set, answer sections
+        // dropped) so the client retries over TCP (RFC 1035 §4.2.1). TCP/DoH
+        // are length-prefixed/streamed and need no truncation.
+        if meta.from_udp {
+            resp = truncate_for_udp(resp, &query);
+        }
+
         Ok(resp)
+    }
+}
+
+/// Maximum UDP response size assumed when the client advertises no EDNS0 buffer.
+const MIN_UDP_RESPONSE_SIZE: usize = 512;
+
+/// Ensures a UDP response fits the client's advertised buffer.
+///
+/// The limit is the client's EDNS0 `max_payload` (read from the original
+/// query), floored at the classic 512-byte DNS limit. If the wire form exceeds
+/// it, the response is truncated: the TC bit is set and answer sections are
+/// dropped, signalling the client to retry over TCP. The `RecursionAvailable`
+/// flag is re-applied since [`Message::truncate`] rebuilds the message.
+fn truncate_for_udp(resp: Message, query: &Message) -> Message {
+    let max_payload = query
+        .extensions()
+        .as_ref()
+        .map(|e| e.max_payload() as usize)
+        .filter(|&p| p >= MIN_UDP_RESPONSE_SIZE)
+        .unwrap_or(MIN_UDP_RESPONSE_SIZE);
+
+    match resp.to_vec() {
+        Ok(wire) if wire.len() > max_payload => {
+            let mut truncated = resp.truncate();
+            truncated.set_recursion_available(true);
+            truncated
+        }
+        _ => resp,
     }
 }
 
@@ -303,5 +340,57 @@ mod tests {
             .unwrap();
         assert_eq!(resp.response_code(), ResponseCode::NoError);
         assert!(resp.recursion_available());
+    }
+
+    /// Executable that stuffs the response with enough answer records to blow
+    /// past the 512-byte classic UDP limit.
+    struct BigResponseExec;
+    #[async_trait]
+    impl Executable for BigResponseExec {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            use hickory_proto::rr::{rdata::TXT, Name, RData, Record};
+            let mut resp = Message::new();
+            resp.set_id(ctx.query().id());
+            resp.set_message_type(MessageType::Response);
+            resp.set_response_code(ResponseCode::NoError);
+            if let Some(q) = ctx.query().queries().first() {
+                resp.add_query(q.clone());
+            }
+            let name = Name::from_ascii("example.com.").unwrap();
+            for _ in 0..40 {
+                resp.add_answer(Record::from_rdata(
+                    name.clone(),
+                    300,
+                    RData::TXT(TXT::new(vec!["x".repeat(60)])),
+                ));
+            }
+            ctx.set_response(Some(resp));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_response_is_truncated() {
+        let handler = EntryHandler::new(Arc::new(BigResponseExec));
+        let meta = QueryMeta {
+            from_udp: true,
+            ..Default::default()
+        };
+        let resp = handler.handle(make_query(), meta).await.unwrap();
+        assert!(resp.truncated(), "TC bit should be set");
+        assert!(resp.answers().is_empty(), "answers should be dropped");
+        assert!(resp.recursion_available());
+    }
+
+    #[tokio::test]
+    async fn oversized_tcp_response_is_not_truncated() {
+        let handler = EntryHandler::new(Arc::new(BigResponseExec));
+        // from_udp defaults to false → TCP path, no truncation.
+        let resp = handler
+            .handle(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
+        assert!(!resp.truncated(), "TCP response must not be truncated");
+        assert_eq!(resp.answers().len(), 40);
     }
 }
