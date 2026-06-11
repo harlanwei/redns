@@ -21,6 +21,19 @@ use tracing::{debug, error, warn};
 /// Maximum DNS message size for DoH.
 const MAX_DOH_MSG_SIZE: usize = 65535;
 
+/// Per-read timeout for HTTP request header/body reads.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Backoff applied after an accept failure caused by fd exhaustion, to avoid
+/// busy-spinning while descriptors are unavailable.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Returns true if the accept error indicates file-descriptor exhaustion
+/// (`EMFILE`/`ENFILE`), where backing off helps rather than retrying hot.
+fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+}
+
 /// DoH server configuration.
 pub struct DohServerConfig {
     /// Header to read client IP from (e.g., "X-Forwarded-For").
@@ -50,7 +63,21 @@ pub async fn serve_doh(
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, peer) = accept?;
+                let (stream, peer) = match accept {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A failed accept must never tear down the listener.
+                        // Back off briefly on fd exhaustion so we don't spin at
+                        // 100% CPU while descriptors are unavailable.
+                        if is_fd_exhaustion(&e) {
+                            warn!(error = %e, "DoH accept failed (fd exhaustion), backing off");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        } else {
+                            warn!(error = %e, "DoH accept failed");
+                        }
+                        continue;
+                    }
+                };
                 let handler = handler.clone();
                 let config = config.clone();
                 let cancel = cancel.clone();
@@ -76,7 +103,7 @@ async fn handle_doh_connection(
     config: Arc<DohServerConfig>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let timeout = std::time::Duration::from_secs(10);
+    let timeout = READ_TIMEOUT;
 
     loop {
         // Read HTTP request headers.
@@ -177,14 +204,25 @@ async fn handle_doh_connection(
                     body.extend_from_slice(&request_data[header_end..n]);
                 }
 
-                // Read remaining body.
+                // Read remaining body, bounding each read with a timeout so a
+                // client that stops sending (slowloris) cannot pin the task and
+                // hold the connection open indefinitely.
                 while body.len() < content_length {
                     let mut buf = vec![0u8; content_length - body.len()];
-                    let br = stream.read(&mut buf).await.map_err(
-                        |e| -> Box<dyn std::error::Error + Send + Sync> {
-                            format!("body read: {e}").into()
-                        },
-                    )?;
+                    let br = tokio::select! {
+                        result = tokio::time::timeout(timeout, stream.read(&mut buf)) => {
+                            match result {
+                                Ok(Ok(br)) => br,
+                                Ok(Err(e)) => {
+                                    return Err(format!("body read: {e}").into());
+                                }
+                                Err(_) => {
+                                    return Err("body read timed out".into());
+                                }
+                            }
+                        }
+                        _ = cancel.cancelled() => return Ok(()),
+                    };
                     if br == 0 {
                         break;
                     }

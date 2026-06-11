@@ -146,27 +146,36 @@ impl RateLimiter {
             .or_insert_with(|| Bucket::new(self.config.burst));
         let bucket = entry.value();
 
+        // Refill and consume are performed together under the per-bucket lock.
+        // This serializes the read-modify-write so two concurrent callers cannot
+        // both observe `tokens >= 1000`, both subtract, and underflow the
+        // unsigned counter (which would wrap to a huge value and effectively
+        // disable rate limiting for that subnet). Saturating arithmetic guards
+        // against underflow regardless of how this is reached.
         let mut last = bucket.last_refill.lock();
         let now = Instant::now();
         let elapsed = now.duration_since(*last).as_secs_f64();
         let refill = (elapsed * self.config.qps * 1000.0) as u64;
-        if refill > 0 {
-            let max_tokens = (self.config.burst as u64) * 1000;
-            let current = bucket.tokens.load(Ordering::Relaxed);
-            let new_tokens = (current + refill).min(max_tokens);
-            bucket.tokens.store(new_tokens, Ordering::Relaxed);
+        let max_tokens = (self.config.burst as u64) * 1000;
+
+        let current = bucket.tokens.load(Ordering::Relaxed);
+        let mut tokens = if refill > 0 {
             *last = now;
-        }
-        drop(last);
+            current.saturating_add(refill).min(max_tokens)
+        } else {
+            current
+        };
 
         // Try to consume one token.
-        let current = bucket.tokens.load(Ordering::Relaxed);
-        if current >= 1000 {
-            bucket.tokens.fetch_sub(1000, Ordering::Relaxed);
+        let allowed = if tokens >= 1000 {
+            tokens -= 1000;
             true
         } else {
             false
-        }
+        };
+
+        bucket.tokens.store(tokens, Ordering::Relaxed);
+        allowed
     }
 }
 
@@ -258,5 +267,54 @@ mod tests {
         assert!(!rl.match_ctx(&ctx1).unwrap());
         // Client 2 still has tokens.
         assert!(rl.match_ctx(&ctx2).unwrap());
+    }
+
+    #[test]
+    fn concurrent_consume_never_exceeds_burst() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A large burst with many threads hammering the same subnet must never
+        // hand out more than `burst` tokens. The previous non-atomic consume
+        // could underflow the token counter and grant effectively unlimited
+        // tokens; this guards against that regression.
+        const BURST: u32 = 1000;
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 500;
+
+        let rl = Arc::new(RateLimiter::new(RateLimiterConfig {
+            // Very low qps so refill during the test is negligible.
+            qps: 0.001,
+            burst: BURST,
+            ..Default::default()
+        }));
+        let allowed = Arc::new(AtomicUsize::new(0));
+
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let rl = rl.clone();
+                let allowed = allowed.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        if rl.allow(ip) {
+                            allowed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // We may grant a few extra tokens due to refill, but never wildly more
+        // than the burst — certainly nowhere near THREADS * PER_THREAD.
+        let total = allowed.load(Ordering::Relaxed);
+        assert!(
+            total <= BURST as usize + THREADS,
+            "granted {total} tokens, expected <= {}",
+            BURST as usize + THREADS
+        );
     }
 }

@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::plugin::PluginResult;
 use hickory_proto::op::{Edns, Message, Query};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -32,6 +33,15 @@ pub const MARK_CACHE_HIT: u32 = 0x4341_4348;
 
 /// Global monotonically increasing context ID.
 static CONTEXT_UID: AtomicU32 = AtomicU32::new(0);
+
+/// Maximum number of chain nodes a single query may execute.
+///
+/// `jump`/`goto` can transfer control between chains, so a misconfigured or
+/// hostile config (e.g. chain A `goto`s B and B `goto`s A) could otherwise
+/// recurse forever — overflowing the stack and growing `jump_back` without
+/// bound. This budget is charged per node visited across the whole query and
+/// caps that work. The limit is generous relative to any sane config.
+pub const MAX_CHAIN_STEPS: u32 = 10_000;
 
 /// Metadata from the server that received the query.
 /// Read-only once set.
@@ -77,6 +87,10 @@ pub struct Context {
 
     /// A set of boolean marks for fast flag checks.
     marks: HashSet<u32>,
+
+    /// Remaining chain-node execution budget for this query (see
+    /// [`MAX_CHAIN_STEPS`]). Decremented as the chain walker visits nodes.
+    steps_remaining: u32,
 }
 
 impl Context {
@@ -111,6 +125,25 @@ impl Context {
             response: None,
             kv: HashMap::new(),
             marks: HashSet::new(),
+            steps_remaining: MAX_CHAIN_STEPS,
+        }
+    }
+
+    /// Charges one chain-node execution against this query's step budget.
+    ///
+    /// Returns `Err` once the budget is exhausted, which aborts the query
+    /// rather than letting a cyclic `jump`/`goto` config recurse forever. The
+    /// chain walker calls this before visiting each node.
+    pub fn charge_step(&mut self) -> PluginResult<()> {
+        match self.steps_remaining.checked_sub(1) {
+            Some(rem) => {
+                self.steps_remaining = rem;
+                Ok(())
+            }
+            None => Err(format!(
+                "chain execution exceeded {MAX_CHAIN_STEPS} steps (possible jump/goto cycle)"
+            )
+            .into()),
         }
     }
 
@@ -276,5 +309,19 @@ mod tests {
 
         ctx.delete_mark(42);
         assert!(!ctx.has_mark(42));
+    }
+
+    #[test]
+    fn charge_step_exhausts_budget_and_then_errors() {
+        let mut ctx = Context::new(make_query());
+        // The budget allows exactly MAX_CHAIN_STEPS successful charges; the
+        // next one fails, which is what aborts a cyclic jump/goto config
+        // instead of letting the walker recurse until the stack overflows.
+        for _ in 0..MAX_CHAIN_STEPS {
+            assert!(ctx.charge_step().is_ok());
+        }
+        assert!(ctx.charge_step().is_err());
+        // Remains exhausted on subsequent calls (no wraparound).
+        assert!(ctx.charge_step().is_err());
     }
 }

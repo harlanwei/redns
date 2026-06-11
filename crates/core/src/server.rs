@@ -60,6 +60,7 @@ pub trait DnsHandler: Send + Sync {
 /// Wraps a sequence [`Executable`] as a [`DnsHandler`].
 ///
 /// - If the executable returns an error → SERVFAIL response.
+/// - If the executable returns Ok but sets no response → NOERROR response.
 /// - The response's `RecursionAvailable` flag is always set (forwarder assumption).
 /// - When `best_effort` is enabled, SERVFAIL responses trigger a fallback
 ///   attempt via the system DNS over the Ethernet interface.
@@ -136,7 +137,7 @@ impl DnsHandler for EntryHandler {
             Ok(()) => ctx
                 .response()
                 .cloned()
-                .unwrap_or_else(|| refused_response(&query)),
+                .unwrap_or_else(|| noerror_response(&query)),
             Err(e) => {
                 warn!(error = %e, qname = %qname, elapsed = ?elapsed, "entry handler error");
                 servfail_response(&query)
@@ -210,9 +211,9 @@ fn empty_response(query: &Message) -> Message {
     resp
 }
 
-fn refused_response(query: &Message) -> Message {
+fn noerror_response(query: &Message) -> Message {
     let mut resp = empty_response(query);
-    resp.set_response_code(ResponseCode::Refused);
+    resp.set_response_code(ResponseCode::NoError);
     resp
 }
 

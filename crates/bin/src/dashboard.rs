@@ -1334,10 +1334,17 @@ fn min_answer_ttl(resp: &Message) -> u32 {
 }
 
 fn persisted_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
-    if resp.response_code() == ResponseCode::NXDomain
-        || (resp.response_code() == ResponseCode::NoError && resp.answers().is_empty())
+    let rcode = resp.response_code();
+    if rcode == ResponseCode::NXDomain
+        || (rcode == ResponseCode::NoError && resp.answers().is_empty())
     {
+        // Normal non-results (NXDOMAIN, empty NOERROR) are elided to save disk.
         (String::new(), Vec::new())
+    } else if resp.answers().is_empty() {
+        // An error rcode (e.g. SERVFAIL) with no answers carries no records to
+        // summarize, but the failure itself is worth keeping in the logs — emit
+        // a compact diagnostic row so it stays visible in the dashboard.
+        (String::new(), vec![format!("rcode={:?}, answers=0", rcode)])
     } else {
         summarize_dns_result(resp, qname)
     }

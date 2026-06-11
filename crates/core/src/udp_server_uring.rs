@@ -67,6 +67,13 @@ fn recv_buf_idx(user_data: u64) -> usize {
     (user_data & !RECV_MARKER) as usize
 }
 
+/// Send completions carry `user_data == slab_index + 1` so the value is always
+/// non-zero (it never collides with the multishot recv's `user_data == 0`).
+/// Returns the slab index, or `None` if `user_data` is 0 (not a send).
+fn send_slab_idx(user_data: u64) -> Option<usize> {
+    (user_data != 0).then(|| (user_data - 1) as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Kernel version detection
 // ---------------------------------------------------------------------------
@@ -261,15 +268,30 @@ unsafe impl Send for SendCtx {}
 
 #[cfg(target_os = "linux")]
 impl SendCtx {
-    fn new(response: Vec<u8>, addr: libc::sockaddr_storage, addr_len: libc::socklen_t) -> Self {
-        let mut ctx = Self {
+    /// Allocates a `SendCtx` on the heap and wires its `msghdr`/`iovec`
+    /// self-pointers to the box's final address.
+    ///
+    /// # Safety contract
+    /// The `msghdr` points into the box's own fields (`_addr`, `iovec`), so the
+    /// box must never be moved out of or relocated while an in-flight `SendMsg`
+    /// SQE references it. Callers keep it boxed in a stable slot (never
+    /// `swap_remove`d) until the matching completion arrives.
+    fn new_boxed(
+        response: Vec<u8>,
+        addr: libc::sockaddr_storage,
+        addr_len: libc::socklen_t,
+    ) -> Box<Self> {
+        let mut ctx = Box::new(Self {
             _response: response,
             _addr: addr,
             _addr_len: addr_len,
             iovec: unsafe { std::mem::zeroed() },
             msghdr: unsafe { std::mem::zeroed() },
-        };
+        });
 
+        // Wire self-pointers now that the box has its final, stable address.
+        // `_response` owns its heap buffer, so its data pointer is stable
+        // regardless of where the box lives.
         ctx.iovec.iov_base = ctx._response.as_ptr() as *mut libc::c_void;
         ctx.iovec.iov_len = ctx._response.len();
 
@@ -279,6 +301,55 @@ impl SendCtx {
         ctx.msghdr.msg_iovlen = 1;
 
         ctx
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Send context slab (stable-address storage)
+// ---------------------------------------------------------------------------
+
+/// Stable-slot storage for in-flight `SendCtx`s.
+///
+/// Each boxed `SendCtx` lives at a fixed index for its whole lifetime: an
+/// in-flight `SendMsg` SQE carries that index in its `user_data`, and the
+/// matching completion frees exactly that slot. We never reindex live entries
+/// (no `swap_remove`), so the address the kernel reads through stays valid.
+/// Freed indices are recycled via a free list to bound growth.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct SendSlab {
+    slots: Vec<Option<Box<SendCtx>>>,
+    free: Vec<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl SendSlab {
+    /// Inserts a context and returns its stable index.
+    fn insert(&mut self, ctx: Box<SendCtx>) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.slots[idx] = Some(ctx);
+            idx
+        } else {
+            self.slots.push(Some(ctx));
+            self.slots.len() - 1
+        }
+    }
+
+    /// Frees the slot at `idx` (if occupied), recycling it for reuse.
+    fn remove(&mut self, idx: usize) {
+        if let Some(slot) = self.slots.get_mut(idx) {
+            if slot.take().is_some() {
+                self.free.push(idx);
+            }
+        }
+    }
+
+    /// Raw pointer to the boxed context's `msghdr`, stable across slab growth.
+    fn msghdr_ptr(&self, idx: usize) -> Option<*const libc::msghdr> {
+        self.slots
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .map(|ctx| &ctx.msghdr as *const libc::msghdr)
     }
 }
 
@@ -365,8 +436,9 @@ pub struct UringUdpServer {
     socket_fd: std::os::raw::c_int,
     /// Single-shot: per-buffer receive contexts.
     recv_ctxs: Vec<RecvCtx>,
-    /// Shared send context pool (both modes).
-    send_ctxs: Vec<SendCtx>,
+    /// Shared send context slab (both modes). Stable-index storage so an
+    /// in-flight `SendMsg` SQE's `user_data` always maps back to the same box.
+    send_ctxs: SendSlab,
     pending_sends: VecDeque<UringSend>,
     shutdown: Arc<AtomicBool>,
     /// Multishot: provided-buffer ring.
@@ -405,7 +477,7 @@ impl UringUdpServer {
             ring,
             socket_fd,
             recv_ctxs: (0..NUM_BUFFERS).map(|_| RecvCtx::new()).collect(),
-            send_ctxs: Vec::new(),
+            send_ctxs: SendSlab::default(),
             pending_sends: VecDeque::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             buf_ring: None,
@@ -486,19 +558,24 @@ impl UringUdpServer {
 
         while let Some(send) = self.pending_sends.pop_front() {
             let (storage, addr_len) = socket_addr_to_sockaddr(&send.peer);
-            let ctx = SendCtx::new(send.response, storage, addr_len);
-            self.send_ctxs.push(ctx);
-            let idx = self.send_ctxs.len() - 1;
+            let ctx = SendCtx::new_boxed(send.response, storage, addr_len);
+            let idx = self.send_ctxs.insert(ctx);
 
-            let sqe = opcode::SendMsg::new(
-                Fd(self.socket_fd),
-                &self.send_ctxs[idx].msghdr as *const libc::msghdr,
-            )
-            .build()
-            .user_data(idx as u64);
+            // `user_data` encodes the slot as `idx + 1` so it is always non-zero
+            // and never collides with the multishot recv completion (user_data
+            // == 0). The matching completion frees exactly this slot.
+            let msghdr_ptr = match self.send_ctxs.msghdr_ptr(idx) {
+                Some(p) => p,
+                None => continue,
+            };
+            let sqe = opcode::SendMsg::new(Fd(self.socket_fd), msghdr_ptr)
+                .build()
+                .user_data((idx as u64) + 1);
 
             if unsafe { self.ring.submission().push(&sqe) }.is_err() {
-                self.send_ctxs.pop();
+                // SQ is full; reclaim the slot and stop draining. The response
+                // is dropped (acceptable for UDP); remaining sends stay queued.
+                self.send_ctxs.remove(idx);
                 break;
             }
         }
@@ -605,17 +682,13 @@ impl UringUdpServer {
                     warn!(result = result, "io_uring operation failed");
                     if self.multishot {
                         // Only sends have non-zero user_data in multishot mode.
-                        let idx = user_data as usize;
-                        if idx < self.send_ctxs.len() {
-                            self.send_ctxs.swap_remove(idx);
+                        if let Some(idx) = send_slab_idx(user_data) {
+                            self.send_ctxs.remove(idx);
                         }
                     } else if is_recv_completion(user_data) {
                         let _ = self.submit_recv(recv_buf_idx(user_data));
-                    } else {
-                        let idx = user_data as usize;
-                        if idx < self.send_ctxs.len() {
-                            self.send_ctxs.swap_remove(idx);
-                        }
+                    } else if let Some(idx) = send_slab_idx(user_data) {
+                        self.send_ctxs.remove(idx);
                     }
                     continue;
                 }
@@ -629,11 +702,8 @@ impl UringUdpServer {
                             &handler,
                             &send_tx,
                         );
-                    } else {
-                        let idx = user_data as usize;
-                        if idx < self.send_ctxs.len() {
-                            self.send_ctxs.swap_remove(idx);
-                        }
+                    } else if let Some(idx) = send_slab_idx(user_data) {
+                        self.send_ctxs.remove(idx);
                     }
                 } else if is_recv_completion(user_data) {
                     self.process_singleshot_recv(
@@ -642,11 +712,8 @@ impl UringUdpServer {
                         &handler,
                         &send_tx,
                     );
-                } else {
-                    let idx = user_data as usize;
-                    if idx < self.send_ctxs.len() {
-                        self.send_ctxs.swap_remove(idx);
-                    }
+                } else if let Some(idx) = send_slab_idx(user_data) {
+                    self.send_ctxs.remove(idx);
                 }
             }
         }

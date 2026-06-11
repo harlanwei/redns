@@ -1293,7 +1293,7 @@ fn normalize_addr(addr: &str, default_port: u16) -> String {
 struct BootstrapResolver {
     target_host: String,
     bootstrap: String,
-    cache: StdMutex<Option<(SocketAddr, Instant)>>,
+    cache: Arc<StdMutex<Option<(SocketAddr, Instant)>>>,
     port: u16,
 }
 
@@ -1302,7 +1302,7 @@ impl BootstrapResolver {
         Self {
             target_host,
             bootstrap,
-            cache: StdMutex::new(None),
+            cache: Arc::new(StdMutex::new(None)),
             port,
         }
     }
@@ -1339,12 +1339,11 @@ impl reqwest::dns::Resolve for BootstrapResolver {
         let target_host = self.target_host.clone();
         let bootstrap = self.bootstrap.clone();
         let port = self.port;
-        // Clone the Arc to the cache mutex for use in the async block.
-        // We need a way to update cache from the async block. Since self is behind
-        // Arc (reqwest stores the resolver in Arc), we can't directly capture &self.
-        // Instead, wrap cache update in a pointer — safe because Arc keeps us alive.
-        let cache_ptr = &self.cache as *const StdMutex<Option<(SocketAddr, Instant)>>;
-        let cache_raw = cache_ptr as usize;
+        // Clone the Arc so the cache outlives this future independently of the
+        // resolver. reqwest stores the resolver behind an Arc and may poll this
+        // future after dropping its handle, so capturing a borrow would be
+        // unsound; an owned Arc is both safe and cheap.
+        let cache = Arc::clone(&self.cache);
 
         Box::pin(async move {
             let result = bootstrap_resolve(&target_host, &bootstrap).await?;
@@ -1352,10 +1351,10 @@ impl reqwest::dns::Resolve for BootstrapResolver {
             let (ip, ttl) = result;
             let addr = SocketAddr::new(ip, port);
 
-            let cache_ref =
-                unsafe { &*(cache_raw as *const StdMutex<Option<(SocketAddr, Instant)>>) };
-            let mut guard = cache_ref.lock();
-            *guard = Some((addr, Instant::now() + ttl));
+            {
+                let mut guard = cache.lock();
+                *guard = Some((addr, Instant::now() + ttl));
+            }
 
             let addrs = vec![addr];
             Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)

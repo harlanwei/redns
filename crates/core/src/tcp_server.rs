@@ -19,6 +19,19 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default first read timeout.
 const FIRST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Backoff applied after an accept failure caused by fd exhaustion, to avoid
+/// busy-spinning while descriptors are unavailable.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Returns true if the accept error indicates file-descriptor exhaustion
+/// (`EMFILE`/`ENFILE`), where backing off helps rather than retrying hot.
+fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
 /// Starts an async TCP DNS server on the given listener.
 ///
 /// Runs until the cancellation token is triggered or the listener errors.
@@ -30,7 +43,21 @@ pub async fn serve_tcp(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, peer) = result?;
+                let (stream, peer) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A failed accept must never tear down the listener.
+                        // Back off briefly on fd exhaustion so we don't spin at
+                        // 100% CPU while descriptors are unavailable.
+                        if is_fd_exhaustion(&e) {
+                            warn!(error = %e, "TCP accept failed (fd exhaustion), backing off");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        } else {
+                            warn!(error = %e, "TCP accept failed");
+                        }
+                        continue;
+                    }
+                };
                 let handler = handler.clone();
                 let cancel = cancel.clone();
 

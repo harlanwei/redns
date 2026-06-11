@@ -794,15 +794,56 @@ async fn run_server(
     }
 
     info!("redns started");
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl-c");
+    wait_for_shutdown_signal().await;
     info!("shutting down...");
     cancel.cancel();
     // Give servers time to clean up.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     info!("redns stopped");
     Ok(())
+}
+
+/// Waits for a shutdown signal.
+///
+/// On Unix this resolves on either SIGTERM (sent by `systemctl stop` and
+/// `docker stop`) or SIGINT (Ctrl-C). Handling SIGTERM is essential: its
+/// default disposition is immediate termination, which would bypass the
+/// cancellation token and the graceful-shutdown paths (e.g. cache dumping).
+/// On non-Unix platforms it falls back to Ctrl-C only.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // If signal registration fails, fall back to never resolving for that
+        // source rather than panicking; the other source still works.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGTERM handler");
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGINT handler");
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM"),
+            _ = sigint.recv() => info!("received SIGINT"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = %e, "failed to listen for ctrl-c");
+        }
+    }
 }
 
 #[cfg(test)]

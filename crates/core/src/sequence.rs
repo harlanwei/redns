@@ -83,6 +83,12 @@ impl ChainWalker {
     ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'b>> {
         Box::pin(async move {
             while self.pos < self.chain.len() {
+                // Charge this node visit against the query's step budget. This
+                // is the runtime backstop against cyclic jump/goto configs that
+                // would otherwise recurse forever (stack overflow + unbounded
+                // jump_back growth).
+                ctx.charge_step()?;
+
                 let idx = self.pos;
                 let node = &self.chain[idx];
 
