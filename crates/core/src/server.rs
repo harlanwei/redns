@@ -23,8 +23,9 @@ use crate::system_dns::system_fallback_resolve;
 use crate::upstream::UpstreamWrapper;
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
+use parking_lot::Mutex;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -95,17 +96,20 @@ impl DnsHandler for EntryHandler {
             return Ok(servfail_response(&query));
         }
 
-        let qname = query
-            .queries()
-            .first()
-            .map(|q| q.name().to_ascii())
-            .unwrap_or_default();
-        let qtype = query
-            .queries()
-            .first()
-            .map(|q| format!("{:?}", q.query_type()))
-            .unwrap_or_default();
-        debug!(qname = %qname, qtype = %qtype, id = query.id(), "handling query");
+        // Safe: validated above that exactly one question exists. Binding
+        // `qname` as a `&Name` (not a String) keeps it allocation-free; `query`
+        // is never mutated, so this borrow lives for the whole handler. The
+        // `tracing` macros only evaluate field expressions when the level is
+        // enabled, so no `to_ascii`/`format!` allocation happens on the hot
+        // path when debug logging is off.
+        let question = &query.queries()[0];
+        let qname = question.name();
+        debug!(
+            qname = %qname,
+            qtype = ?question.query_type(),
+            id = query.id(),
+            "handling query"
+        );
 
         let start = std::time::Instant::now();
         let mut ctx = Context::new(query.clone());
@@ -145,10 +149,9 @@ impl DnsHandler for EntryHandler {
         };
 
         if is_servfail && self.best_effort {
-            let fallback_query = query.clone();
             match tokio::time::timeout(
                 DEFAULT_QUERY_TIMEOUT,
-                system_fallback_resolve(&fallback_query),
+                system_fallback_resolve(&query),
             )
             .await
             {
@@ -169,9 +172,8 @@ impl DnsHandler for EntryHandler {
         }
 
         if let Some(upstream) = selected_upstream {
-            if let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
-                && let Ok(mut selected) = selected_upstreams.lock()
-            {
+            if let Some(selected_upstreams) = meta.selected_upstreams.as_ref() {
+                let mut selected = selected_upstreams.lock();
                 let upstream_name = upstream.name().to_string();
                 if !selected.iter().any(|name| name == &upstream_name) {
                     selected.push(upstream_name);
@@ -182,10 +184,11 @@ impl DnsHandler for EntryHandler {
 
         if served_from_cache
             && let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
-            && let Ok(mut selected) = selected_upstreams.lock()
-            && !selected.iter().any(|name| name == "__C__")
         {
-            selected.push("__C__".to_string());
+            let mut selected = selected_upstreams.lock();
+            if !selected.iter().any(|name| name == "__C__") {
+                selected.push("__C__".to_string());
+            }
         }
 
         debug!(

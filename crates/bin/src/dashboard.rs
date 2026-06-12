@@ -4,7 +4,8 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -967,10 +968,7 @@ impl DnsHandler for DashboardDnsHandler {
             ),
         };
 
-        let upstreams = selected_upstreams
-            .lock()
-            .map(|items| dedupe_keep_order(items.clone()))
-            .unwrap_or_default();
+        let upstreams = dedupe_keep_order(selected_upstreams.lock().clone());
 
         let entry = NewDnsLogEntry {
             ts_unix_ms: SystemTime::now()

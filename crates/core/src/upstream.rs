@@ -1277,12 +1277,16 @@ impl UpstreamWrapper {
         GLOBAL_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
         GLOBAL_LATENCY_SUM_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 
-        match &result {
-            Ok(_) => self.update_ema_latency(elapsed_ms),
-            Err(e) => {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-                warn!(upstream = %self.name, error = %e, "upstream exchange failed");
-            }
+        // Feed the EMA latency on both success and failure. A failure — most
+        // importantly a timeout — burns real wall-clock time, so folding it into
+        // the latency signal lets the selector's score penalize a chronically
+        // slow/failing upstream on latency too, not just via `error_rate`.
+        // Without this, a timing-out upstream keeps a stale, misleadingly-low
+        // EMA (it only ever recorded its fast successes) and keeps getting picked.
+        self.update_ema_latency(elapsed_ms);
+        if let Err(e) = &result {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+            warn!(upstream = %self.name, error = %e, "upstream exchange failed");
         }
         result
     }
