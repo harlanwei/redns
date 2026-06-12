@@ -23,7 +23,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 /// Default EDNS0 UDP payload size.
-const EDNS0_SIZE: u16 = 1200;
+///
+/// This is the value used when no explicit `edns_udp_size` is set in the config.
+/// 1232 bytes is a safe default that avoids IPv6 fragmentation on typical MTUs
+/// while providing more space than the classic 512-byte limit. Configurable via
+/// the `edns_udp_size` field in the top-level config.
+pub const DEFAULT_EDNS0_SIZE: u16 = 1232;
 
 /// Context KV key for the upstream selected by a forward stage.
 pub const KV_SELECTED_UPSTREAM: u32 = 0x5244_4e53;
@@ -91,10 +96,13 @@ pub struct Context {
     /// Remaining chain-node execution budget for this query (see
     /// [`MAX_CHAIN_STEPS`]). Decremented as the chain walker visits nodes.
     steps_remaining: u32,
+
+    /// EDNS0 UDP payload size to use when sending queries to upstreams.
+    edns_udp_size: u16,
 }
 
 impl Context {
-    /// Creates a new `Context` that takes ownership of the given query message.
+    /// Creates a new `Context` with the default EDNS UDP size.
     ///
     /// If the incoming message contains an existing EDNS0 OPT record, it is
     /// saved as `client_edns` and replaced with a fresh OPT record. If none
@@ -103,19 +111,28 @@ impl Context {
     /// The context `id` is a monotonically increasing `u32` that wraps after
     /// ~4B queries. It is unique within a session until wrap, but not globally
     /// unique across restarts or forever.
-    pub fn new(mut query: Message) -> Self {
+    pub fn new(query: Message) -> Self {
+        Self::with_edns_size(query, DEFAULT_EDNS0_SIZE)
+    }
+
+    /// Creates a new `Context` with a custom EDNS UDP payload size.
+    ///
+    /// The `edns_udp_size` is the buffer size advertised to upstream DNS servers
+    /// via the EDNS0 OPT record. Larger values allow bigger responses but may
+    /// trigger fragmentation on some networks.
+    pub fn with_edns_size(mut query: Message, edns_udp_size: u16) -> Self {
         let id = CONTEXT_UID.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Extract client EDNS and replace with our own.
         let client_edns: Option<Edns> = query.extensions().as_ref().cloned();
         let mut new_edns = Edns::new();
-        new_edns.set_max_payload(EDNS0_SIZE);
+        new_edns.set_max_payload(edns_udp_size);
 
         // Copy the DO bit from the client (RFC 3225 §3).
-        if let Some(ref ce) = client_edns {
-            if ce.flags().dnssec_ok {
-                new_edns.set_dnssec_ok(true);
-            }
+        if let Some(ref ce) = client_edns
+            && ce.flags().dnssec_ok
+        {
+            new_edns.set_dnssec_ok(true);
         }
         query.set_edns(new_edns);
 
@@ -130,6 +147,7 @@ impl Context {
             kv: HashMap::new(),
             marks: HashSet::new(),
             steps_remaining: MAX_CHAIN_STEPS,
+            edns_udp_size,
         }
     }
 
@@ -161,6 +179,11 @@ impl Context {
     /// Returns the time this context was created.
     pub fn start_time(&self) -> Instant {
         self.start_time
+    }
+
+    /// Returns the configured EDNS0 UDP payload size for this context.
+    pub fn edns_udp_size(&self) -> u16 {
+        self.edns_udp_size
     }
 
     /// Returns a reference to the query message.

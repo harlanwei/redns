@@ -46,17 +46,10 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 }
 
 /// DoH server configuration.
+#[derive(Default)]
 pub struct DohServerConfig {
     /// Header to read client IP from (e.g., "X-Forwarded-For").
     pub src_ip_header: Option<String>,
-}
-
-impl Default for DohServerConfig {
-    fn default() -> Self {
-        Self {
-            src_ip_header: None,
-        }
-    }
 }
 
 /// Starts a simple DNS-over-HTTPS server.
@@ -134,176 +127,174 @@ async fn handle_doh_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timeout = READ_TIMEOUT;
 
-    loop {
-        // Read HTTP request headers.
-        let mut header_buf = vec![0u8; 8192];
-        let n = tokio::select! {
-            result = tokio::time::timeout(timeout, stream.read(&mut header_buf)) => {
-                match result {
-                    Ok(Ok(0)) | Err(_) => return Ok(()), // Connection closed or timeout.
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => return Err(format!("read error: {e}").into()),
-                }
+    // HTTP/1.0 style: handle one request then close the connection.
+    // Read HTTP request headers.
+    let mut header_buf = vec![0u8; 8192];
+    let n = tokio::select! {
+        result = tokio::time::timeout(timeout, stream.read(&mut header_buf)) => {
+            match result {
+                Ok(Ok(0)) | Err(_) => return Ok(()), // Connection closed or timeout.
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(format!("read error: {e}").into()),
             }
-            _ = cancel.cancelled() => return Ok(()),
-        };
+        }
+        _ = cancel.cancelled() => return Ok(()),
+    };
 
-        let request_data = &header_buf[..n];
-        let request_str = String::from_utf8_lossy(request_data);
+    let request_data = &header_buf[..n];
+    let request_str = String::from_utf8_lossy(request_data);
 
-        // Parse first line: METHOD PATH HTTP/1.1
-        let first_line = match request_str.lines().next() {
-            Some(l) => l,
-            None => {
-                send_http_error(&mut stream, 400, "Bad Request").await?;
-                return Ok(());
-            }
-        };
-
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        if parts.len() < 3 {
+    // Parse first line: METHOD PATH HTTP/1.1
+    let first_line = match request_str.lines().next() {
+        Some(l) => l,
+        None => {
             send_http_error(&mut stream, 400, "Bad Request").await?;
             return Ok(());
         }
+    };
 
-        let method = parts[0];
-        let path = parts[1];
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 3 {
+        send_http_error(&mut stream, 400, "Bad Request").await?;
+        return Ok(());
+    }
 
-        // Extract client IP from XFF header if configured.
-        let client_ip = extract_client_ip(&request_str, peer.ip(), &config.src_ip_header);
-        let request_path = path.split('?').next().unwrap_or(path).to_string();
+    let method = parts[0];
+    let path = parts[1];
 
-        // Parse DNS query from request.
-        let dns_query = match method {
-            "GET" => {
-                // Extract ?dns= parameter.
-                if let Some(query_string) = path.split('?').nth(1) {
-                    let dns_param = query_string
-                        .split('&')
-                        .find(|p| p.starts_with("dns="))
-                        .and_then(|p| p.strip_prefix("dns="));
+    // Extract client IP from XFF header if configured.
+    let client_ip = extract_client_ip(&request_str, peer.ip(), &config.src_ip_header);
+    let request_path = path.split('?').next().unwrap_or(path).to_string();
 
-                    match dns_param {
-                        Some(encoded) => {
-                            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) {
-                                Ok(bytes) => match Message::from_vec(&bytes) {
-                                    Ok(msg) => Some((msg, Arc::new(bytes))),
-                                    Err(e) => {
-                                        warn!(error = %e, "invalid DNS query in GET");
-                                        send_http_error(&mut stream, 400, "Invalid DNS message")
-                                            .await?;
-                                        return Ok(());
-                                    }
-                                },
+    // Parse DNS query from request.
+    let dns_query = match method {
+        "GET" => {
+            // Extract ?dns= parameter.
+            if let Some(query_string) = path.split('?').nth(1) {
+                let dns_param = query_string
+                    .split('&')
+                    .find(|p| p.starts_with("dns="))
+                    .and_then(|p| p.strip_prefix("dns="));
+
+                match dns_param {
+                    Some(encoded) => {
+                        match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) {
+                            Ok(bytes) => match Message::from_vec(&bytes) {
+                                Ok(msg) => Some((msg, Arc::new(bytes))),
                                 Err(e) => {
-                                    warn!(error = %e, "invalid base64 in GET");
-                                    send_http_error(&mut stream, 400, "Invalid base64").await?;
+                                    warn!(error = %e, "invalid DNS query in GET");
+                                    send_http_error(&mut stream, 400, "Invalid DNS message")
+                                        .await?;
                                     return Ok(());
                                 }
+                            },
+                            Err(e) => {
+                                warn!(error = %e, "invalid base64 in GET");
+                                send_http_error(&mut stream, 400, "Invalid base64").await?;
+                                return Ok(());
                             }
                         }
-                        None => {
-                            send_http_error(&mut stream, 400, "Missing dns parameter").await?;
-                            return Ok(());
-                        }
                     }
-                } else {
-                    send_http_error(&mut stream, 400, "Missing query string").await?;
-                    return Ok(());
-                }
-            }
-            "POST" => {
-                // Read Content-Length and body.
-                let content_length = extract_header(&request_str, "Content-Length")
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(0);
-
-                if content_length == 0 || content_length > MAX_DOH_MSG_SIZE {
-                    send_http_error(&mut stream, 400, "Invalid content length").await?;
-                    return Ok(());
-                }
-
-                // Check if body is already in the header buffer.
-                let header_end = request_str.find("\r\n\r\n").map(|p| p + 4).unwrap_or(n);
-
-                let body_in_header = n.saturating_sub(header_end);
-                let mut body = Vec::with_capacity(content_length);
-
-                if body_in_header > 0 && header_end < n {
-                    body.extend_from_slice(&request_data[header_end..n]);
-                }
-
-                // Read remaining body, bounding each read with a timeout so a
-                // client that stops sending (slowloris) cannot pin the task and
-                // hold the connection open indefinitely.
-                while body.len() < content_length {
-                    let mut buf = vec![0u8; content_length - body.len()];
-                    let br = tokio::select! {
-                        result = tokio::time::timeout(timeout, stream.read(&mut buf)) => {
-                            match result {
-                                Ok(Ok(br)) => br,
-                                Ok(Err(e)) => {
-                                    return Err(format!("body read: {e}").into());
-                                }
-                                Err(_) => {
-                                    return Err("body read timed out".into());
-                                }
-                            }
-                        }
-                        _ = cancel.cancelled() => return Ok(()),
-                    };
-                    if br == 0 {
-                        break;
-                    }
-                    body.extend_from_slice(&buf[..br]);
-                }
-
-                match Message::from_vec(&body) {
-                    Ok(msg) => Some((msg, Arc::new(body))),
-                    Err(e) => {
-                        warn!(error = %e, "invalid DNS query in POST body");
-                        send_http_error(&mut stream, 400, "Invalid DNS message").await?;
+                    None => {
+                        send_http_error(&mut stream, 400, "Missing dns parameter").await?;
                         return Ok(());
                     }
                 }
-            }
-            _ => {
-                send_http_error(&mut stream, 405, "Method Not Allowed").await?;
+            } else {
+                send_http_error(&mut stream, 400, "Missing query string").await?;
                 return Ok(());
             }
-        };
+        }
+        "POST" => {
+            // Read Content-Length and body.
+            let content_length = extract_header(&request_str, "Content-Length")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
 
-        if let Some((query, query_wire)) = dns_query {
-            let meta = QueryMeta {
-                protocol: Some("doh".to_string()),
-                from_udp: false,
-                client_addr: Some(client_ip),
-                url_path: Some(request_path),
-                server_name: None,
-                selected_upstreams: None,
-                query_wire: Some(query_wire),
-            };
+            if content_length == 0 || content_length > MAX_DOH_MSG_SIZE {
+                send_http_error(&mut stream, 400, "Invalid content length").await?;
+                return Ok(());
+            }
 
-            match handler.handle(query, meta).await {
-                Ok(resp) => match resp.to_vec() {
-                    Ok(resp_bytes) => {
-                        send_http_dns_response(&mut stream, &resp_bytes).await?;
+            // Check if body is already in the header buffer.
+            let header_end = request_str.find("\r\n\r\n").map(|p| p + 4).unwrap_or(n);
+
+            let body_in_header = n.saturating_sub(header_end);
+            let mut body = Vec::with_capacity(content_length);
+
+            if body_in_header > 0 && header_end < n {
+                body.extend_from_slice(&request_data[header_end..n]);
+            }
+
+            // Read remaining body, bounding each read with a timeout so a
+            // client that stops sending (slowloris) cannot pin the task and
+            // hold the connection open indefinitely.
+            while body.len() < content_length {
+                let mut buf = vec![0u8; content_length - body.len()];
+                let br = tokio::select! {
+                    result = tokio::time::timeout(timeout, stream.read(&mut buf)) => {
+                        match result {
+                            Ok(Ok(br)) => br,
+                            Ok(Err(e)) => {
+                                return Err(format!("body read: {e}").into());
+                            }
+                            Err(_) => {
+                                return Err("body read timed out".into());
+                            }
+                        }
                     }
-                    Err(e) => {
-                        error!(error = %e, "failed to serialize DNS response");
-                        send_http_error(&mut stream, 500, "Internal Server Error").await?;
-                    }
-                },
+                    _ = cancel.cancelled() => return Ok(()),
+                };
+                if br == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..br]);
+            }
+
+            match Message::from_vec(&body) {
+                Ok(msg) => Some((msg, Arc::new(body))),
                 Err(e) => {
-                    error!(error = %e, "handler error");
-                    send_http_error(&mut stream, 500, "Internal Server Error").await?;
+                    warn!(error = %e, "invalid DNS query in POST body");
+                    send_http_error(&mut stream, 400, "Invalid DNS message").await?;
+                    return Ok(());
                 }
             }
         }
+        _ => {
+            send_http_error(&mut stream, 405, "Method Not Allowed").await?;
+            return Ok(());
+        }
+    };
 
-        // HTTP/1.0 style: close after one request for simplicity.
-        return Ok(());
+    if let Some((query, query_wire)) = dns_query {
+        let meta = QueryMeta {
+            protocol: Some("doh".to_string()),
+            from_udp: false,
+            client_addr: Some(client_ip),
+            url_path: Some(request_path),
+            server_name: None,
+            selected_upstreams: None,
+            query_wire: Some(query_wire),
+        };
+
+        match handler.handle(query, meta).await {
+            Ok(resp) => match resp.to_vec() {
+                Ok(resp_bytes) => {
+                    send_http_dns_response(&mut stream, &resp_bytes).await?;
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to serialize DNS response");
+                    send_http_error(&mut stream, 500, "Internal Server Error").await?;
+                }
+            },
+            Err(e) => {
+                error!(error = %e, "handler error");
+                send_http_error(&mut stream, 500, "Internal Server Error").await?;
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn extract_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
@@ -311,10 +302,6 @@ fn extract_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
         if let Some(rest) = line.strip_prefix(name) {
             if let Some(value) = rest.strip_prefix(':') {
                 return Some(value.trim());
-            }
-            // Case-insensitive check.
-            if rest.starts_with(':') {
-                return Some(rest[1..].trim());
             }
         }
         // Case-insensitive.

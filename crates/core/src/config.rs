@@ -38,6 +38,15 @@ pub struct Config {
     /// via the Ethernet interface as a last-resort fallback.
     #[serde(default)]
     pub best_effort: bool,
+    /// EDNS0 UDP payload size advertised in queries sent to upstreams.
+    /// Defaults to 1232 bytes (safe for most networks, avoids fragmentation).
+    /// RFC 6891 recommends at least 512; modern networks can handle 4096+.
+    #[serde(default = "default_edns_size")]
+    pub edns_udp_size: u16,
+}
+
+fn default_edns_size() -> u16 {
+    1232
 }
 
 /// Server listener configuration.

@@ -231,13 +231,13 @@ impl ChainBuilder {
                     .insert(tag.to_string(), NamedPlugin::Exec(Arc::from(exec)));
                 return Ok(());
             }
-        } else if is_recursive {
-            if let Some(ExecKind::Recursive(f)) = self.exec_factories.get(type_name) {
-                let exec = f(args)?;
-                self.named_plugins
-                    .insert(tag.to_string(), NamedPlugin::RecExec(Arc::from(exec)));
-                return Ok(());
-            }
+        } else if is_recursive
+            && let Some(ExecKind::Recursive(f)) = self.exec_factories.get(type_name)
+        {
+            let exec = f(args)?;
+            self.named_plugins
+                .insert(tag.to_string(), NamedPlugin::RecExec(Arc::from(exec)));
+            return Ok(());
         }
 
         Err(format!("unknown plugin type: {}", type_name).into())

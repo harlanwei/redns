@@ -3,6 +3,77 @@
 // This file is part of redns.
 
 //! Upstream DNS transport implementations.
+//!
+//! This module provides the [`Upstream`] trait and concrete implementations for
+//! all major DNS transport protocols. Each upstream exchanges raw DNS wire-format
+//! messages with a remote DNS server.
+//!
+//! # Supported Protocols
+//!
+//! | Protocol | Scheme       | Default Port | Features                          |
+//! |----------|--------------|--------------|-----------------------------------|
+//! | UDP      | `udp://`     | 53           | Socket pooling, ID filtering      |
+//! | TCP      | `tcp://`     | 53           | Connection pooling, auto-retry    |
+//! | DoT      | `tls://`     | 853          | TLS session cache, pooling        |
+//! | DoH      | `https://`   | 443          | HTTP/2, GET method (RFC 8484)     |
+//! | DoQ      | `quic://`    | 853          | QUIC streams (RFC 9250)           |
+//! | DoH3     | `h3://`      | 443          | HTTP/3 over QUIC                  |
+//!
+//! # Creating Upstreams
+//!
+//! Use [`new_upstream`] to parse a URL string and create the appropriate upstream:
+//!
+//! ```rust,ignore
+//! use redns_core::upstream::{new_upstream, UpstreamOpts};
+//!
+//! // UDP (default)
+//! let udp = new_upstream("8.8.8.8:53", UpstreamOpts::default())?;
+//!
+//! // DNS-over-TLS
+//! let dot = new_upstream("tls://1.1.1.1:853", UpstreamOpts::default())?;
+//!
+//! // DNS-over-HTTPS
+//! let doh = new_upstream("https://dns.google/dns-query", UpstreamOpts::default())?;
+//! ```
+//!
+//! # Hostname Resolution
+//!
+//! Upstreams with domain names (DoH, DoT, DoQ, DoH3) require explicit resolution
+//! configuration to avoid DNS bootstrapping loops. Two options:
+//!
+//! 1. **Static pinning** via `dial_addr` — connect directly to a fixed IP:
+//!    ```rust,ignore
+//!    let opts = UpstreamOpts {
+//!        dial_addr: Some("8.8.8.8:443".parse().unwrap()),
+//!        ..Default::default()
+//!    };
+//!    let doh = new_upstream("https://dns.google/dns-query", opts)?;
+//!    ```
+//!
+//! 2. **Bootstrap resolver** — resolve via a specific DNS server with TTL caching:
+//!    ```rust,ignore
+//!    let opts = UpstreamOpts {
+//!        bootstrap: Some("8.8.8.8:53".to_string()),
+//!        ..Default::default()
+//!    };
+//!    let doh = new_upstream("https://dns.google/dns-query", opts)?;
+//!    ```
+//!
+//! **Resolution precedence:** IP-based (no resolution needed) → `dial_addr` (static) → `bootstrap` (DNS) → error.
+//!
+//! Bootstrap upstreams must themselves be IP-based to prevent recursion.
+//!
+//! # Connection Pooling
+//!
+//! TCP and TLS upstreams pool idle connections with a 30-second TTL. Stale connections
+//! are automatically detected and retried (up to 2 attempts). UDP upstreams pool sockets
+//! to reuse ephemeral ports, reducing setup overhead.
+//!
+//! # Metrics
+//!
+//! Wrap an upstream with [`UpstreamWrapper`] to track per-upstream latency (EMA),
+//! query counts, error rates, and adoption metrics. See [`UpstreamMetrics`] for
+//! the full set of tracked statistics.
 
 use crate::plugin::PluginResult;
 use async_trait::async_trait;
@@ -75,9 +146,13 @@ impl UdpUpstream {
         // in `exchange` is load-bearing — it discards stale datagrams that
         // could otherwise be misinterpreted as responses to later queries.
         let bind_addr: SocketAddr = if self.addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+            "0.0.0.0:0"
+                .parse()
+                .expect("hardcoded IPv4 bind address is valid")
         } else {
-            "[::]:0".parse().unwrap()
+            "[::]:0"
+                .parse()
+                .expect("hardcoded IPv6 bind address is valid")
         };
 
         let sock = UdpSocket::bind(bind_addr).await.map_err(
@@ -501,7 +576,11 @@ impl DohUpstream {
     fn new(endpoint: String, resolution: DohResolution) -> Self {
         use reqwest::header;
         let mut headers = header::HeaderMap::new();
-        headers.insert(header::ACCEPT, "application/dns-message".parse().unwrap());
+        // HeaderValue::from_static is infallible for valid static strings.
+        headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/dns-message"),
+        );
 
         let mut builder = reqwest::Client::builder()
             .default_headers(headers)
@@ -588,9 +667,13 @@ impl Upstream for DohUpstream {
 
 fn quic_bind_addr_for_target(target: SocketAddr) -> SocketAddr {
     if target.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
+        "0.0.0.0:0"
+            .parse()
+            .expect("hardcoded IPv4 bind address is valid")
     } else {
-        "[::]:0".parse().unwrap()
+        "[::]:0"
+            .parse()
+            .expect("hardcoded IPv6 bind address is valid")
     }
 }
 
@@ -1271,6 +1354,12 @@ fn normalize_addr(addr: &str, default_port: u16) -> String {
 
 /// A custom DNS resolver for reqwest that resolves a specific hostname
 /// via a bootstrap DNS server, caching the result according to DNS TTL.
+///
+/// This resolver is used for DoH upstreams when the user specifies a `bootstrap`
+/// server. It prevents recursion by requiring the bootstrap itself to be IP-based,
+/// and respects DNS TTL for cache freshness (clamped to 60–3600 seconds).
+///
+/// For hostnames other than the target, falls back to the system resolver.
 struct BootstrapResolver {
     target_host: String,
     bootstrap: String,
@@ -1347,8 +1436,33 @@ impl reqwest::dns::Resolve for BootstrapResolver {
 
 /// Resolves a hostname for socket-based upstreams (DoT, DoQ).
 ///
-/// Priority: `dial_addr` (direct) → `bootstrap` (via specific DNS) → error if unresolved domain.
-/// IP-based hosts resolve directly without needing dial_addr/bootstrap.
+/// ## Resolution Precedence
+///
+/// 1. **IP address** — If `host` is already an IP, no resolution needed.
+/// 2. **`dial_addr`** — Static pinning to a fixed address (highest precedence).
+/// 3. **`bootstrap`** — Resolve via a specific DNS server.
+/// 4. **Error** — Unresolved domains without dial_addr/bootstrap are rejected.
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// // IP-based — no resolution needed
+/// resolve_upstream_host("1.1.1.1", 853, &opts)?; // → 1.1.1.1:853
+///
+/// // Domain with dial_addr — static pin
+/// let opts = UpstreamOpts {
+///     dial_addr: Some("1.1.1.1:853".parse().unwrap()),
+///     ..Default::default()
+/// };
+/// resolve_upstream_host("one.one.one.one", 853, &opts)?; // → 1.1.1.1:853
+///
+/// // Domain with bootstrap — DNS resolution
+/// let opts = UpstreamOpts {
+///     bootstrap: Some("8.8.8.8:53".to_string()),
+///     ..Default::default()
+/// };
+/// resolve_upstream_host("dns.google", 853, &opts)?; // → resolves via 8.8.8.8
+/// ```
 fn resolve_upstream_host(host: &str, port: u16, opts: &UpstreamOpts) -> PluginResult<SocketAddr> {
     // If host is already an IP, no resolution needed.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -1385,9 +1499,15 @@ fn resolve_upstream_host(host: &str, port: u16, opts: &UpstreamOpts) -> PluginRe
 
 /// Resolves a DoH endpoint hostname.
 ///
-/// Priority: `dial_addr` (static pin) → `bootstrap` (TTL-aware resolver).
-/// If the host is already an IP, no resolution is needed.
-/// **Errors** if the host is a domain and neither `dial_addr` nor `bootstrap` is set.
+/// ## Resolution Precedence
+///
+/// 1. **IP address** — If the host in the URL is already an IP, no resolution needed.
+/// 2. **`dial_addr`** — Static pinning to a fixed address.
+/// 3. **`bootstrap`** — TTL-aware DNS resolver with caching.
+/// 4. **Error** — Unresolved domains without dial_addr/bootstrap are rejected.
+///
+/// The bootstrap resolver performs an initial resolution at startup to fail fast,
+/// then caches results according to DNS TTL (clamped to 60–3600 seconds).
 fn resolve_doh_host(endpoint: &str, opts: &UpstreamOpts) -> PluginResult<DohResolution> {
     let url =
         reqwest::Url::parse(endpoint).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
