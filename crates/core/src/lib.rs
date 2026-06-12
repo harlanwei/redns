@@ -6,7 +6,6 @@ pub mod built_in;
 pub mod chain_builder;
 pub mod config;
 pub mod context;
-pub mod doh_server;
 pub mod plugin;
 pub mod redns;
 pub mod registry;
