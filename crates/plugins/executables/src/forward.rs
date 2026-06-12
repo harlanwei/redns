@@ -13,7 +13,6 @@ use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -293,7 +292,6 @@ impl Drop for SubprocessUpstream {
 struct UpstreamSelector {
     upstreams: Vec<Arc<UpstreamWrapper>>,
     cached_order: RwLock<Option<(Vec<usize>, Instant)>>,
-    rr_counter: AtomicUsize,
 }
 
 impl UpstreamSelector {
@@ -301,7 +299,6 @@ impl UpstreamSelector {
         Self {
             upstreams,
             cached_order: RwLock::new(None),
-            rr_counter: AtomicUsize::new(0),
         }
     }
 
@@ -341,22 +338,7 @@ impl UpstreamSelector {
 
         let scores: Vec<(usize, f64)> = indices
             .iter()
-            .map(|&i| {
-                let uw = &self.upstreams[i];
-                let latency = uw.ema_latency() as f64;
-                let latency = if latency <= 0.0 {
-                    DEFAULT_LATENCY
-                } else {
-                    latency
-                };
-                let error_rate = uw.error_rate();
-                let penalty_factor = 1.0 + error_rate * ERROR_PENALTY_MULT;
-                let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                let noise_seed = ((counter + i) % 256) as f64 / 256.0;
-                let noise = (noise_seed * 2.0 - 1.0) * NOISE_FACTOR;
-                let score = (1.0 / (latency * penalty_factor)) * (1.0 + noise);
-                (i, score.max(0.001))
-            })
+            .map(|&i| (i, self.score_one(&self.upstreams[i])))
             .collect();
 
         self.weighted_sample(&scores, count)
@@ -366,22 +348,26 @@ impl UpstreamSelector {
         self.upstreams
             .iter()
             .enumerate()
-            .map(|(i, uw)| {
-                let latency = uw.ema_latency() as f64;
-                let latency = if latency <= 0.0 {
-                    DEFAULT_LATENCY
-                } else {
-                    latency
-                };
-                let error_rate = uw.error_rate();
-                let penalty_factor = 1.0 + error_rate * ERROR_PENALTY_MULT;
-                let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                let noise_seed = ((counter + i) % 256) as f64 / 256.0;
-                let noise = (noise_seed * 2.0 - 1.0) * NOISE_FACTOR;
-                let score = (1.0 / (latency * penalty_factor)) * (1.0 + noise);
-                (i, score.max(0.001))
-            })
+            .map(|(i, uw)| (i, self.score_one(uw)))
             .collect()
+    }
+
+    /// Compute the selection score for a single upstream.
+    ///
+    /// Higher scores are better. The score is inversely proportional to latency
+    /// and error rate, with a small random jitter to break ties.
+    fn score_one(&self, uw: &UpstreamWrapper) -> f64 {
+        let latency = uw.ema_latency() as f64;
+        let latency = if latency <= 0.0 {
+            DEFAULT_LATENCY
+        } else {
+            latency
+        };
+        let error_rate = uw.error_rate();
+        let penalty_factor = 1.0 + error_rate * ERROR_PENALTY_MULT;
+        let noise = (fastrand::f64() * 2.0 - 1.0) * NOISE_FACTOR;
+        let score = (1.0 / (latency * penalty_factor)) * (1.0 + noise);
+        score.max(0.001)
     }
 
     fn weighted_sample(&self, scores: &[(usize, f64)], count: usize) -> Vec<usize> {
@@ -393,8 +379,7 @@ impl UpstreamSelector {
                 break;
             }
             let total: f64 = remaining.iter().map(|(_, s)| s).sum();
-            let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-            let point = (counter % 1000) as f64 / 1000.0 * total;
+            let point = fastrand::f64() * total;
             let mut cumulative = 0.0;
             let mut pick = 0;
             for (j, (_, score)) in remaining.iter().enumerate() {
@@ -453,7 +438,14 @@ impl Forward {
         }
 
         if let Some(ref suffix) = cfg.subprocess_suffix {
-            let socket_path = format!("/tmp/redns{}.sock", suffix.replace('-', "_"));
+            // Include PID in the socket path to avoid collisions between multiple
+            // instances or stale sockets from crashed runs. The subprocess helper
+            // will be spawned with this same path.
+            let socket_path = format!(
+                "/tmp/redns{}-{}.sock",
+                suffix.replace('-', "_"),
+                std::process::id()
+            );
             let sub = SubprocessUpstream::new(suffix, &socket_path)?;
             let sub_name = format!("subprocess{suffix}");
             let uw = Arc::new(UpstreamWrapper::new(

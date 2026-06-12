@@ -99,6 +99,10 @@ impl Context {
     /// If the incoming message contains an existing EDNS0 OPT record, it is
     /// saved as `client_edns` and replaced with a fresh OPT record. If none
     /// is present a new one is appended.
+    ///
+    /// The context `id` is a monotonically increasing `u32` that wraps after
+    /// ~4B queries. It is unique within a session until wrap, but not globally
+    /// unique across restarts or forever.
     pub fn new(mut query: Message) -> Self {
         let id = CONTEXT_UID.fetch_add(1, Ordering::Relaxed) + 1;
 

@@ -69,6 +69,11 @@ impl UdpUpstream {
     }
 
     async fn create_socket(&self) -> PluginResult<UdpSocket> {
+        // Bind to :0 gives the OS an ephemeral source port, which provides
+        // per-socket randomization and reduces cache-poisoning surface. The
+        // pooled sockets are reused across queries, so the ID-matching loop
+        // in `exchange` is load-bearing — it discards stale datagrams that
+        // could otherwise be misinterpreted as responses to later queries.
         let bind_addr: SocketAddr = if self.addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
@@ -181,11 +186,11 @@ impl TcpUpstream {
 impl Upstream for TcpUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
         let mut stream = tcp_connect(self.addr, self.timeout).await?;
-        tcp_exchange(&mut stream, query, self.timeout).await
+        stream_exchange(&mut stream, query, self.timeout).await
     }
 }
 
-// ── TCP Pooled ──────────────────────────────────────────────────
+// ── Connection Pool (shared by TCP and TLS) ─────────────────────
 
 /// An idle connection with a timestamp for expiry tracking.
 struct IdleConn<S> {
@@ -193,32 +198,26 @@ struct IdleConn<S> {
     idle_since: Instant,
 }
 
-/// TCP upstream with connection pooling and retry on stale connections.
-pub struct PooledTcpUpstream {
-    addr: SocketAddr,
-    timeout: Duration,
+/// A bounded pool of idle connections with TTL-based expiry.
+///
+/// Shared by the pooled TCP and TLS upstreams — both keep length-prefixed
+/// byte streams alive between queries, differing only in the stream type.
+struct ConnPool<S> {
     idle_timeout: Duration,
-    pool: Mutex<VecDeque<IdleConn<TcpStream>>>,
+    conns: Mutex<VecDeque<IdleConn<S>>>,
 }
 
-impl PooledTcpUpstream {
-    pub fn new(addr: SocketAddr) -> Self {
+impl<S> ConnPool<S> {
+    fn new(idle_timeout: Duration) -> Self {
         Self {
-            addr,
-            timeout: DEFAULT_TIMEOUT,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            pool: Mutex::new(VecDeque::new()),
+            idle_timeout,
+            conns: Mutex::new(VecDeque::new()),
         }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
     /// Try to get a non-expired idle connection from the pool.
-    async fn get_idle(&self) -> Option<TcpStream> {
-        let mut pool = self.pool.lock().await;
+    async fn get_idle(&self) -> Option<S> {
+        let mut pool = self.conns.lock().await;
         while let Some(idle) = pool.pop_front() {
             if idle.idle_since.elapsed() < self.idle_timeout {
                 return Some(idle.stream);
@@ -228,10 +227,9 @@ impl PooledTcpUpstream {
         None
     }
 
-    /// Return a connection to the pool.
-    async fn put_idle(&self, stream: TcpStream) {
-        let mut pool = self.pool.lock().await;
-        // Enforce max idle limit.
+    /// Return a connection to the pool, enforcing the max idle limit.
+    async fn put_idle(&self, stream: S) {
+        let mut pool = self.conns.lock().await;
         while pool.len() >= MAX_IDLE_CONNS {
             pool.pop_front();
         }
@@ -242,31 +240,77 @@ impl PooledTcpUpstream {
     }
 }
 
+/// Run a length-prefixed exchange over a pooled connection, reconnecting and
+/// retrying on a failed reused connection (which is usually a stale socket the
+/// upstream has already closed).
+async fn pooled_exchange<S, F, Fut>(
+    pool: &ConnPool<S>,
+    connect: F,
+    query: &[u8],
+    timeout: Duration,
+) -> PluginResult<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = PluginResult<S>>,
+{
+    let mut retries = 0;
+    loop {
+        let (mut stream, is_reused) = match pool.get_idle().await {
+            Some(s) => (s, true),
+            None => (connect().await?, false),
+        };
+
+        match stream_exchange(&mut stream, query, timeout).await {
+            Ok(resp) => {
+                pool.put_idle(stream).await;
+                return Ok(resp);
+            }
+            Err(e) => {
+                if is_reused && retries < MAX_POOL_RETRY {
+                    retries += 1;
+                    continue; // Retry with a fresh connection.
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+// ── TCP Pooled ──────────────────────────────────────────────────
+
+/// TCP upstream with connection pooling and retry on stale connections.
+pub struct PooledTcpUpstream {
+    addr: SocketAddr,
+    timeout: Duration,
+    pool: ConnPool<TcpStream>,
+}
+
+impl PooledTcpUpstream {
+    pub fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            timeout: DEFAULT_TIMEOUT,
+            pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
 #[async_trait]
 impl Upstream for PooledTcpUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let mut retries = 0;
-        loop {
-            let (mut stream, is_reused) = match self.get_idle().await {
-                Some(s) => (s, true),
-                None => (tcp_connect(self.addr, self.timeout).await?, false),
-            };
-
-            match tcp_exchange(&mut stream, query, self.timeout).await {
-                Ok(resp) => {
-                    // Return connection to pool for reuse.
-                    self.put_idle(stream).await;
-                    return Ok(resp);
-                }
-                Err(e) => {
-                    if is_reused && retries < MAX_POOL_RETRY {
-                        retries += 1;
-                        continue; // Retry with a fresh connection.
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        pooled_exchange(
+            &self.pool,
+            || tcp_connect(self.addr, self.timeout),
+            query,
+            self.timeout,
+        )
+        .await
     }
 }
 
@@ -286,6 +330,27 @@ fn build_tls_config() -> Arc<ClientConfig> {
         .with_no_client_auth();
     // rustls enables a 256-slot session cache by default.
     Arc::new(config)
+}
+
+/// Open a TLS connection to `addr` with SNI `server_name` using `tls_config`.
+async fn tls_connect(
+    addr: SocketAddr,
+    server_name: &str,
+    tls_config: &Arc<ClientConfig>,
+    timeout: Duration,
+) -> PluginResult<TlsStream<TcpStream>> {
+    let tcp = tcp_connect(addr, timeout).await?;
+    let connector = TlsConnector::from(tls_config.clone());
+    let sni = ServerName::try_from(server_name.to_string()).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("invalid server name: {e}").into()
+        },
+    )?;
+    connector.connect(sni, tcp).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("tls handshake: {e}").into()
+        },
+    )
 }
 
 /// TLS (DNS-over-TLS) upstream transport with session caching.
@@ -313,29 +378,14 @@ impl TlsUpstream {
         self.timeout = timeout;
         self
     }
-
-    async fn tls_connect(&self) -> PluginResult<TlsStream<TcpStream>> {
-        let tcp = tcp_connect(self.addr, self.timeout).await?;
-        let connector = TlsConnector::from(self.tls_config.clone());
-        let sni = ServerName::try_from(self.server_name.clone()).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("invalid server name: {e}").into()
-            },
-        )?;
-        let tls = connector.connect(sni, tcp).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("tls handshake: {e}").into()
-            },
-        )?;
-        Ok(tls)
-    }
 }
 
 #[async_trait]
 impl Upstream for TlsUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let mut tls = self.tls_connect().await?;
-        tls_exchange(&mut tls, query, self.timeout).await
+        let mut tls =
+            tls_connect(self.addr, &self.server_name, &self.tls_config, self.timeout).await?;
+        stream_exchange(&mut tls, query, self.timeout).await
     }
 }
 
@@ -346,9 +396,8 @@ pub struct PooledTlsUpstream {
     addr: SocketAddr,
     server_name: String,
     timeout: Duration,
-    idle_timeout: Duration,
     tls_config: Arc<ClientConfig>,
-    pool: Mutex<VecDeque<IdleConn<TlsStream<TcpStream>>>>,
+    pool: ConnPool<TlsStream<TcpStream>>,
 }
 
 impl PooledTlsUpstream {
@@ -357,9 +406,8 @@ impl PooledTlsUpstream {
             addr,
             server_name,
             timeout: DEFAULT_TIMEOUT,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             tls_config: build_tls_config(),
-            pool: Mutex::new(VecDeque::new()),
+            pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT),
         }
     }
 
@@ -367,69 +415,18 @@ impl PooledTlsUpstream {
         self.timeout = timeout;
         self
     }
-
-    async fn get_idle(&self) -> Option<TlsStream<TcpStream>> {
-        let mut pool = self.pool.lock().await;
-        while let Some(idle) = pool.pop_front() {
-            if idle.idle_since.elapsed() < self.idle_timeout {
-                return Some(idle.stream);
-            }
-        }
-        None
-    }
-
-    async fn put_idle(&self, stream: TlsStream<TcpStream>) {
-        let mut pool = self.pool.lock().await;
-        while pool.len() >= MAX_IDLE_CONNS {
-            pool.pop_front();
-        }
-        pool.push_back(IdleConn {
-            stream,
-            idle_since: Instant::now(),
-        });
-    }
-
-    async fn tls_connect(&self) -> PluginResult<TlsStream<TcpStream>> {
-        let tcp = tcp_connect(self.addr, self.timeout).await?;
-        let connector = TlsConnector::from(self.tls_config.clone());
-        let sni = ServerName::try_from(self.server_name.clone()).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("invalid server name: {e}").into()
-            },
-        )?;
-        let tls = connector.connect(sni, tcp).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("tls handshake: {e}").into()
-            },
-        )?;
-        Ok(tls)
-    }
 }
 
 #[async_trait]
 impl Upstream for PooledTlsUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let mut retries = 0;
-        loop {
-            let (mut stream, is_reused) = match self.get_idle().await {
-                Some(s) => (s, true),
-                None => (self.tls_connect().await?, false),
-            };
-
-            match tls_exchange(&mut stream, query, self.timeout).await {
-                Ok(resp) => {
-                    self.put_idle(stream).await;
-                    return Ok(resp);
-                }
-                Err(e) => {
-                    if is_reused && retries < MAX_POOL_RETRY {
-                        retries += 1;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        pooled_exchange(
+            &self.pool,
+            || tls_connect(self.addr, &self.server_name, &self.tls_config, self.timeout),
+            query,
+            self.timeout,
+        )
+        .await
     }
 }
 
@@ -447,15 +444,15 @@ async fn tcp_connect(addr: SocketAddr, timeout: Duration) -> PluginResult<TcpStr
         })
 }
 
-/// Exchange a DNS query over a length-prefixed TCP stream.
-async fn tcp_exchange(
-    stream: &mut TcpStream,
-    query: &[u8],
-    timeout: Duration,
-) -> PluginResult<Vec<u8>> {
-    // Write the query and read the response under a single timeout. Bounding
-    // only the read leaves the write able to block indefinitely if the upstream
-    // accepts the connection but stalls its receive window.
+/// Exchange a DNS query over any length-prefixed byte stream (TCP or TLS).
+///
+/// Writes the query and reads the response under a single timeout. Bounding
+/// only the read would leave the write able to block indefinitely if the
+/// upstream accepts the connection but stalls its receive window.
+async fn stream_exchange<S>(stream: &mut S, query: &[u8], timeout: Duration) -> PluginResult<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let len = query.len() as u16;
     let exchange = tokio::time::timeout(timeout, async {
         stream.write_all(&len.to_be_bytes()).await?;
@@ -470,35 +467,8 @@ async fn tcp_exchange(
 
     match exchange.await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(format!("tcp exchange: {e}").into()),
-        Err(_) => Err("tcp exchange timed out".into()),
-    }
-}
-
-/// Exchange a DNS query over a TLS stream (length-prefixed).
-async fn tls_exchange(
-    stream: &mut TlsStream<TcpStream>,
-    query: &[u8],
-    timeout: Duration,
-) -> PluginResult<Vec<u8>> {
-    // Bound writes and reads together so a stalled upstream receive window
-    // cannot block the exchange past the timeout.
-    let len = query.len() as u16;
-    let exchange = tokio::time::timeout(timeout, async {
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(query).await?;
-        let mut len_buf = [0u8; 2];
-        stream.read_exact(&mut len_buf).await?;
-        let resp_len = u16::from_be_bytes(len_buf) as usize;
-        let mut resp_buf = vec![0u8; resp_len];
-        stream.read_exact(&mut resp_buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(resp_buf)
-    });
-
-    match exchange.await {
-        Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(format!("tls exchange: {e}").into()),
-        Err(_) => Err("tls exchange timed out".into()),
+        Ok(Err(e)) => Err(format!("stream exchange: {e}").into()),
+        Err(_) => Err("stream exchange timed out".into()),
     }
 }
 
@@ -1552,17 +1522,27 @@ async fn bootstrap_resolve(
         })?;
 
     for answer in resp.answers() {
-        if let RData::A(a) = answer.data() {
-            let ttl = Duration::from_secs(answer.ttl() as u64);
-            // Clamp TTL: min 60s, max 3600s.
-            let ttl = ttl
-                .max(Duration::from_secs(60))
-                .min(Duration::from_secs(3600));
-            return Ok((std::net::IpAddr::V4(a.0), ttl));
+        match answer.data() {
+            RData::A(a) => {
+                let ttl = Duration::from_secs(answer.ttl() as u64);
+                // Clamp TTL: min 60s, max 3600s.
+                let ttl = ttl
+                    .max(Duration::from_secs(60))
+                    .min(Duration::from_secs(3600));
+                return Ok((std::net::IpAddr::V4(a.0), ttl));
+            }
+            RData::AAAA(aaaa) => {
+                let ttl = Duration::from_secs(answer.ttl() as u64);
+                let ttl = ttl
+                    .max(Duration::from_secs(60))
+                    .min(Duration::from_secs(3600));
+                return Ok((std::net::IpAddr::V6(aaaa.0), ttl));
+            }
+            _ => continue,
         }
     }
 
-    Err(format!("bootstrap DNS returned no A records for '{}'", hostname).into())
+    Err(format!("bootstrap DNS returned no A/AAAA records for '{}'", hostname).into())
 }
 
 pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upstream>> {

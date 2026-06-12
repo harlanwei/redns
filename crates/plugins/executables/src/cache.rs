@@ -353,8 +353,10 @@ impl RecursiveExecutable for Cache {
                     cached_payload = Some((entry.resp.clone(), ttl));
                 } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
                     // Stale but within lazy window — serve stale and refresh.
+                    // Note: stored_at is NOT updated here. The background refresh
+                    // will replace this entry on success, or it will eventually
+                    // age out past the lazy window if the refresh fails.
                     do_optimistic_refresh = true;
-                    entry.stored_at = Instant::now();
                     cached_payload = Some((entry.resp.clone(), 1));
                 }
             }
@@ -416,7 +418,7 @@ impl Cache {
                 ttl = ttl.min(5);
             }
 
-            if ttl <= 0 {
+            if ttl == 0 {
                 return;
             }
 
