@@ -95,7 +95,13 @@ const MAX_UDP_SIZE: usize = 4096;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default idle timeout for pooled connections.
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Kept generous (5 min) so secure-transport connections (DoT) stay warm
+/// across the sparse query gaps typical of a home/small resolver, avoiding a
+/// fresh TLS handshake (1-2 RTT) on the critical path. If the upstream has
+/// closed an idle connection in the meantime, `pooled_exchange` transparently
+/// reconnects and retries, so a longer window costs at most one stale retry.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum idle connections in pool.
 const MAX_IDLE_CONNS: usize = 4;
@@ -677,6 +683,23 @@ fn quic_bind_addr_for_target(target: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Transport config that keeps an idle QUIC connection (DoQ/DoH3) alive.
+///
+/// QUIC connections are otherwise torn down by the peer (or our own
+/// `max_idle_timeout`) after a short idle period, forcing a fresh handshake on
+/// the next query. Sending a keepalive every 25s holds the single pooled
+/// connection open across the sparse query gaps typical of a home resolver,
+/// while a 5-min max idle timeout bounds how long a dead connection lingers.
+fn quic_keepalive_transport() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(25)));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(300))
+            .expect("300s is a valid QUIC idle timeout"),
+    ));
+    Arc::new(transport)
+}
+
 fn build_quic_endpoint(
     target: SocketAddr,
     client_config: quinn::ClientConfig,
@@ -747,7 +770,9 @@ impl DoqUpstream {
         tls_config.alpn_protocols = vec![b"doq".to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .expect("failed to create QUIC client config");
-        quinn::ClientConfig::new(Arc::new(quic_config))
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(quic_keepalive_transport());
+        client_config
     }
 
     async fn connect(&self) -> PluginResult<quinn::Connection> {
@@ -936,7 +961,9 @@ impl Doh3Upstream {
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .expect("failed to create QUIC client config");
-        quinn::ClientConfig::new(Arc::new(quic_config))
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(quic_keepalive_transport());
+        client_config
     }
 
     async fn connect_quic(&self) -> PluginResult<quinn::Connection> {
