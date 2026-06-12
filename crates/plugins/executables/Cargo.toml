@@ -9,7 +9,7 @@ redns-core = { path = "../../core" }
 hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
 tracing = "0.1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["time", "sync", "rt"] }
+tokio = { version = "1", features = ["time", "sync", "rt", "net", "process", "io-util"] }
 lru = "0.12"
 ahash = "0.8"
 serde = { version = "1", features = ["derive"] }

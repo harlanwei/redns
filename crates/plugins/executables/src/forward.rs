@@ -16,7 +16,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 // ── Constants ───────────────────────────────────────────────────
 
@@ -113,6 +117,8 @@ pub struct ForwardConfig {
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default = "default_concurrent")]
     pub concurrent: usize,
+    #[serde(default)]
+    pub subprocess_suffix: Option<String>,
 }
 
 fn default_concurrent() -> usize {
@@ -150,6 +156,7 @@ impl Default for ForwardConfig {
         Self {
             upstreams: vec![],
             concurrent: 1,
+            subprocess_suffix: None,
         }
     }
 }
@@ -178,6 +185,105 @@ impl ForwardConfig {
         ForwardConfig {
             upstreams,
             concurrent: MAX_CONCURRENT_QUERIES,
+            subprocess_suffix: None,
+        }
+    }
+}
+
+// ── Subprocess Upstream ──────────────────────────────────────────
+
+const SUBPROCESS_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct SubprocessUpstream {
+    socket_path: String,
+    child: Mutex<Option<Child>>,
+}
+
+impl SubprocessUpstream {
+    fn new(suffix: &str, socket_path: &str) -> PluginResult<Self> {
+        let current_exe = std::env::current_exe().map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("subprocess: failed to get current exe path: {e}").into()
+            },
+        )?;
+
+        let exe_str = current_exe.to_string_lossy();
+        let parent_name = current_exe
+            .file_name()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("subprocess: cannot determine exe name from '{exe_str}'").into()
+            })?
+            .to_string_lossy();
+        let new_name = format!("{parent_name}{suffix}");
+        let subprocess_path = current_exe.with_file_name(&new_name);
+
+        if !subprocess_path.exists() {
+            return Err(format!(
+                "subprocess: binary not found at '{}'",
+                subprocess_path.display()
+            )
+            .into());
+        }
+
+        let child = Command::new(&*subprocess_path)
+            .arg("start")
+            .arg("--socket")
+            .arg(socket_path)
+            .spawn()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("subprocess: failed to spawn '{}': {e}", subprocess_path.display()).into()
+            })?;
+
+        info!(
+            binary = %subprocess_path.display(),
+            socket = %socket_path,
+            pid = ?child.id(),
+            "subprocess spawned"
+        );
+
+        Ok(Self {
+            socket_path: socket_path.to_string(),
+            child: Mutex::new(Some(child)),
+        })
+    }
+}
+
+#[async_trait]
+impl upstream::Upstream for SubprocessUpstream {
+    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+        let mut stream = UnixStream::connect(&self.socket_path).await.map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("subprocess: connect failed: {e}").into()
+            },
+        )?;
+
+        let exchange = async {
+            let len = query.len() as u16;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(query).await?;
+
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await?;
+            let resp_len = u16::from_be_bytes(len_buf) as usize;
+            let mut resp_buf = vec![0u8; resp_len];
+            stream.read_exact(&mut resp_buf).await?;
+            Ok::<Vec<u8>, std::io::Error>(resp_buf)
+        };
+
+        match tokio::time::timeout(SUBPROCESS_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(format!("subprocess exchange: {e}").into()),
+            Err(_) => Err("subprocess exchange timed out".into()),
+        }
+    }
+}
+
+impl Drop for SubprocessUpstream {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            if let Some(child) = child.as_mut() {
+                let _ = child.start_kill();
+            }
         }
     }
 }
@@ -320,7 +426,7 @@ pub struct Forward {
 
 impl Forward {
     pub fn new(cfg: ForwardConfig, name: &str) -> PluginResult<Self> {
-        if cfg.upstreams.is_empty() {
+        if cfg.upstreams.is_empty() && cfg.subprocess_suffix.is_none() {
             return Err("forward: no upstreams configured".into());
         }
 
@@ -344,6 +450,19 @@ impl Forward {
             if let Some(ref tag) = ucfg.tag {
                 tag_index.entry(tag.clone()).or_default().push(i);
             }
+        }
+
+        if let Some(ref suffix) = cfg.subprocess_suffix {
+            let socket_path = format!("/tmp/redns{}.sock", suffix.replace('-', "_"));
+            let sub = SubprocessUpstream::new(suffix, &socket_path)?;
+            let sub_name = format!("subprocess{suffix}");
+            let uw = Arc::new(UpstreamWrapper::new(
+                Box::new(sub),
+                sub_name.clone(),
+                "Unix".into(),
+            ));
+            upstreams.push(uw);
+            tag_index.entry(sub_name).or_default().push(upstreams.len() - 1);
         }
 
         let concurrent = if cfg.concurrent == 0 {
@@ -754,6 +873,14 @@ mod tests {
     }
 
     #[test]
+    fn forward_config_subprocess_suffix_only_ok() {
+        let yaml = "subprocess_suffix: -direct\n";
+        let cfg = ForwardConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.subprocess_suffix.as_deref(), Some("-direct"));
+        assert!(cfg.upstreams.is_empty());
+    }
+
+    #[test]
     fn forward_config_valid() {
         let cfg = ForwardConfig {
             upstreams: vec![UpstreamConfig {
@@ -763,6 +890,7 @@ mod tests {
                 bootstrap: None,
             }],
             concurrent: 1,
+            subprocess_suffix: None,
         };
         assert!(Forward::new(cfg, "test").is_ok());
     }
@@ -791,6 +919,7 @@ mod tests {
                 },
             ],
             concurrent: 1,
+            subprocess_suffix: None,
         };
         let f = Forward::new(cfg, "test").unwrap();
         assert_eq!(f.tag_index.get("google"), Some(&vec![0]));
@@ -816,6 +945,7 @@ mod tests {
                 },
             ],
             concurrent: 1,
+            subprocess_suffix: None,
         };
         let f = Forward::new(cfg, "test").unwrap();
         let selected = f.select_by_tags(&["google".into()]);
@@ -867,6 +997,7 @@ mod tests {
                 bootstrap: None,
             }],
             concurrent: 1,
+            subprocess_suffix: None,
         };
         assert!(Forward::new(cfg, "test").is_err());
     }
