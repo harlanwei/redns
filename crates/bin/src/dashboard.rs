@@ -512,15 +512,20 @@ impl DashboardStore {
             return Ok(res);
         }
 
-        // Check if there is already an inflight request for this IP/subnet
-        let notify = {
+        // Check if there is already an inflight request for this IP/subnet.
+        // `we_own_inflight` is true when *this* call inserted the entry and is
+        // therefore responsible for removing it and waking waiters. That cleanup
+        // must run on every exit path below — including early `?` returns on a
+        // failed HTTP fetch / body read / JSON parse — otherwise the stale entry
+        // persists and all current and future waiters for this IP hang forever.
+        let (notify, we_own_inflight) = {
             let mut pending = self.inflight_geoip.lock().await;
             if let Some(notify) = pending.get(&normalized_ip) {
-                Some(notify.clone())
+                (Some(notify.clone()), false)
             } else {
                 let notify = Arc::new(tokio::sync::Notify::new());
                 pending.insert(normalized_ip.clone(), notify);
-                None
+                (None, true)
             }
         };
 
@@ -561,102 +566,113 @@ impl DashboardStore {
             }
         } // Otherwise proceed with the request
 
-        // Cache miss or expired, fetch from API
-        let url = format!("http://ip-api.com/json/{}", normalized_ip);
-        let resp = self.http_client.get(&url).send().await?;
-        let text = resp.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&text)?;
+        // Perform the fetch + cache-write in an inner async block so that, no
+        // matter which step fails, we always run the inflight cleanup below
+        // before returning. Leaving the inflight entry in place on error would
+        // strand every waiter on this IP indefinitely.
+        let fetch_result: Result<GeoIpData, DynError> = async {
+            // Cache miss or expired, fetch from API
+            let url = format!("http://ip-api.com/json/{}", normalized_ip);
+            let resp = self.http_client.get(&url).send().await?;
+            let text = resp.text().await?;
+            let json: serde_json::Value = serde_json::from_str(&text)?;
 
-        let mut location = None;
-        let city = json.get("city").and_then(|v| v.as_str());
-        let region = json.get("regionName").and_then(|v| v.as_str());
-        let country = json.get("country").and_then(|v| v.as_str());
-        let mut parts = Vec::new();
-        if let Some(city) = city {
-            let trimmed = city.trim();
-            if !trimmed.is_empty() {
-                parts.push(trimmed);
+            let mut location = None;
+            let city = json.get("city").and_then(|v| v.as_str());
+            let region = json.get("regionName").and_then(|v| v.as_str());
+            let country = json.get("country").and_then(|v| v.as_str());
+            let mut parts = Vec::new();
+            if let Some(city) = city {
+                let trimmed = city.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
             }
-        }
-        if let Some(region) = region {
-            let trimmed = region.trim();
-            if !trimmed.is_empty() && !parts.contains(&trimmed) {
-                parts.push(trimmed);
+            if let Some(region) = region {
+                let trimmed = region.trim();
+                if !trimmed.is_empty() && !parts.contains(&trimmed) {
+                    parts.push(trimmed);
+                }
             }
-        }
-        if let Some(country) = country {
-            let trimmed = country.trim();
-            if !trimmed.is_empty() && !parts.contains(&trimmed) {
-                parts.push(trimmed);
+            if let Some(country) = country {
+                let trimmed = country.trim();
+                if !trimmed.is_empty() && !parts.contains(&trimmed) {
+                    parts.push(trimmed);
+                }
             }
+            if !parts.is_empty() {
+                location = Some(parts.join(", "));
+            }
+
+            let asn = json
+                .get("as")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let isp = json
+                .get("isp")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let proxy = json.get("proxy").and_then(|v| v.as_bool());
+            let hosting = json.get("hosting").and_then(|v| v.as_bool());
+
+            let res = GeoIpData {
+                city: location,
+                asn,
+                isp,
+                proxy,
+                hosting,
+            };
+
+            // Save to cache (30 days expiration) using the normalized IP string (subnet for IPv6)
+            let record = res.clone();
+            let ip_owned = normalized_ip.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), DynError> {
+                let conn = Self::open_connection(&path)?;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let expires_at = now + (30 * 24 * 60 * 60);
+
+                conn.execute(
+                    "INSERT INTO geoip_cache (ip, city, asn, isp, proxy, hosting, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(ip) DO UPDATE SET
+                     city = excluded.city,
+                     asn = excluded.asn,
+                     isp = excluded.isp,
+                     proxy = excluded.proxy,
+                     hosting = excluded.hosting,
+                     expires_at = excluded.expires_at",
+                    params![
+                        ip_owned,
+                        record.city,
+                        record.asn,
+                        record.isp,
+                        record.proxy,
+                        record.hosting,
+                        expires_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| -> DynError { format!("geoip sqlite write join failed: {e}").into() })??;
+
+            Ok(res)
         }
-        if !parts.is_empty() {
-            location = Some(parts.join(", "));
-        }
+        .await;
 
-        let asn = json
-            .get("as")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let isp = json
-            .get("isp")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let proxy = json.get("proxy").and_then(|v| v.as_bool());
-        let hosting = json.get("hosting").and_then(|v| v.as_bool());
-
-        let res = GeoIpData {
-            city: location,
-            asn,
-            isp,
-            proxy,
-            hosting,
-        };
-
-        // Save to cache (30 days expiration) using the normalized IP string (subnet for IPv6)
-        let record = res.clone();
-        let ip_owned = normalized_ip.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), DynError> {
-            let conn = Self::open_connection(&path)?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let expires_at = now + (30 * 24 * 60 * 60);
-
-            conn.execute(
-                "INSERT INTO geoip_cache (ip, city, asn, isp, proxy, hosting, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(ip) DO UPDATE SET
-                 city = excluded.city,
-                 asn = excluded.asn,
-                 isp = excluded.isp,
-                 proxy = excluded.proxy,
-                 hosting = excluded.hosting,
-                 expires_at = excluded.expires_at",
-                params![
-                    ip_owned,
-                    record.city,
-                    record.asn,
-                    record.isp,
-                    record.proxy,
-                    record.hosting,
-                    expires_at
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| -> DynError { format!("geoip sqlite write join failed: {e}").into() })??;
-
-        {
+        // Always release the inflight entry and wake waiters, regardless of
+        // whether the fetch succeeded, so a failure never strands waiters.
+        if we_own_inflight {
             let mut pending = self.inflight_geoip.lock().await;
             if let Some(notify) = pending.remove(&normalized_ip) {
                 notify.notify_waiters();
             }
         }
 
-        Ok(res)
+        fetch_result
     }
 }
 

@@ -117,16 +117,40 @@ impl Upstream for UdpUpstream {
                 format!("udp send: {e}").into()
             })?;
 
+        // The DNS message ID is the first two bytes of the wire message. Sockets
+        // are pooled and reused, so a late or duplicate datagram from a previous
+        // query can arrive on this socket. Match the response ID against the
+        // query's and discard non-matching datagrams, reading until a matching
+        // response arrives or the overall timeout elapses. Without this, a stale
+        // datagram could be returned as the answer to a different query.
+        let want_id = match query.get(0..2) {
+            Some(id) => [id[0], id[1]],
+            None => return Err("udp exchange: query too short".into()),
+        };
+
+        let deadline = Instant::now() + self.timeout;
         let mut buf = vec![0u8; MAX_UDP_SIZE];
-        let result = tokio::time::timeout(self.timeout, sock.recv(&mut buf)).await;
-        match result {
-            Ok(Ok(n)) => {
-                self.put_socket(sock).await;
-                buf.truncate(n);
-                Ok(buf)
+        loop {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => return Err("udp exchange timed out".into()),
+            };
+
+            match tokio::time::timeout(remaining, sock.recv(&mut buf)).await {
+                Ok(Ok(n)) => {
+                    // Ignore datagrams that are too short to carry an ID or whose
+                    // ID does not match this query (a stale/duplicate response).
+                    if n < 2 || buf[0..2] != want_id {
+                        continue;
+                    }
+                    let mut resp = buf;
+                    resp.truncate(n);
+                    self.put_socket(sock).await;
+                    return Ok(resp);
+                }
+                Ok(Err(e)) => return Err(format!("udp recv: {e}").into()),
+                Err(_) => return Err("udp exchange timed out".into()),
             }
-            Ok(Err(e)) => Err(format!("udp recv: {e}").into()),
-            Err(_) => Err("udp exchange timed out".into()),
         }
     }
 }
@@ -429,20 +453,13 @@ async fn tcp_exchange(
     query: &[u8],
     timeout: Duration,
 ) -> PluginResult<Vec<u8>> {
-    // Write length-prefixed query.
+    // Write the query and read the response under a single timeout. Bounding
+    // only the read leaves the write able to block indefinitely if the upstream
+    // accepts the connection but stalls its receive window.
     let len = query.len() as u16;
-    stream.write_all(&len.to_be_bytes()).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("tcp write: {e}").into() },
-    )?;
-    stream
-        .write_all(query)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("tcp write: {e}").into()
-        })?;
-
-    // Read length-prefixed response.
-    let read = tokio::time::timeout(timeout, async {
+    let exchange = tokio::time::timeout(timeout, async {
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(query).await?;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u16::from_be_bytes(len_buf) as usize;
@@ -451,9 +468,9 @@ async fn tcp_exchange(
         Ok::<Vec<u8>, std::io::Error>(resp_buf)
     });
 
-    match read.await {
+    match exchange.await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(format!("tcp read: {e}").into()),
+        Ok(Err(e)) => Err(format!("tcp exchange: {e}").into()),
         Err(_) => Err("tcp exchange timed out".into()),
     }
 }
@@ -464,18 +481,12 @@ async fn tls_exchange(
     query: &[u8],
     timeout: Duration,
 ) -> PluginResult<Vec<u8>> {
+    // Bound writes and reads together so a stalled upstream receive window
+    // cannot block the exchange past the timeout.
     let len = query.len() as u16;
-    stream.write_all(&len.to_be_bytes()).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("tls write: {e}").into() },
-    )?;
-    stream
-        .write_all(query)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("tls write: {e}").into()
-        })?;
-
-    let read = tokio::time::timeout(timeout, async {
+    let exchange = tokio::time::timeout(timeout, async {
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(query).await?;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u16::from_be_bytes(len_buf) as usize;
@@ -484,9 +495,9 @@ async fn tls_exchange(
         Ok::<Vec<u8>, std::io::Error>(resp_buf)
     });
 
-    match read.await {
+    match exchange.await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(format!("tls read: {e}").into()),
+        Ok(Err(e)) => Err(format!("tls exchange: {e}").into()),
         Err(_) => Err("tls exchange timed out".into()),
     }
 }
@@ -1766,5 +1777,46 @@ mod tests {
         // Both should have their own Arc<ClientConfig>.
         assert!(Arc::strong_count(&u1.tls_config) == 1);
         assert!(Arc::strong_count(&u2.tls_config) == 1);
+    }
+
+    /// A stale datagram with a mismatched DNS message ID (e.g. a late response
+    /// from a prior query on a reused, pooled socket) must be discarded rather
+    /// than returned as the answer to the current query.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_exchange_skips_mismatched_id() {
+        // Fake upstream: on receiving a query, first reply with a wrong-ID
+        // datagram, then the correctly-IDed response.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; MAX_UDP_SIZE];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = &buf[..n];
+
+            // Stale datagram: copy the query but flip the ID so it cannot match.
+            let mut stale = query.to_vec();
+            stale[0] ^= 0xFF;
+            stale[1] ^= 0xFF;
+            // Tag the body so we can tell the two responses apart.
+            stale.push(0xAA);
+            server.send_to(&stale, peer).await.unwrap();
+
+            // Correct datagram: keep the query's ID, tag the body differently.
+            let mut good = query.to_vec();
+            good.push(0xBB);
+            server.send_to(&good, peer).await.unwrap();
+        });
+
+        let upstream =
+            UdpUpstream::new(server_addr).with_timeout(Duration::from_secs(2));
+        // Query wire: 2-byte ID followed by a minimal body.
+        let query = vec![0x12, 0x34, 0x00, 0x00, 0x00, 0x00];
+        let resp = upstream.exchange(&query).await.unwrap();
+
+        // We must get the correctly-IDed response (tagged 0xBB), not the stale
+        // one (tagged 0xAA).
+        assert_eq!(&resp[0..2], &query[0..2], "response ID must match query ID");
+        assert_eq!(*resp.last().unwrap(), 0xBB, "must skip the stale datagram");
     }
 }

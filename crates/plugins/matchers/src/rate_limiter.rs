@@ -48,6 +48,16 @@ impl RateLimiterConfig {
         let fields: Vec<&str> = s.split_whitespace().collect();
         let qps: f64 = fields.first().and_then(|v| v.parse().ok()).unwrap_or(20.0);
         let burst: u32 = fields.get(1).and_then(|v| v.parse().ok()).unwrap_or(40);
+        // Reject a non-positive or non-finite qps at config time. A zero qps
+        // means the bucket never refills (every client permanently blocked
+        // after the burst) and also feeds `Duration::from_secs_f64` an infinite
+        // value; failing fast here surfaces the misconfiguration clearly.
+        if !(qps.is_finite() && qps > 0.0) {
+            return Err(format!("rate_limiter: qps must be a positive number, got '{qps}'").into());
+        }
+        if burst == 0 {
+            return Err("rate_limiter: burst must be greater than 0".into());
+        }
         Ok(Self {
             qps,
             burst,
@@ -88,8 +98,21 @@ impl RateLimiter {
     pub fn new(config: RateLimiterConfig) -> Self {
         // A bucket refills fully in `burst / qps` seconds.
         // Consider it stale after 2× that duration (minimum 60 s).
-        let refill_secs = (config.burst as f64) / config.qps;
-        let stale_secs = (refill_secs * 2.0).max(60.0);
+        //
+        // Guard against a non-positive or non-finite qps: `burst / 0.0` is
+        // `inf`, and `Duration::from_secs_f64(inf)` panics. Fall back to a sane
+        // finite staleness window so a misconfigured `qps` cannot crash the
+        // process at construction time.
+        let refill_secs = if config.qps > 0.0 {
+            (config.burst as f64) / config.qps
+        } else {
+            0.0
+        };
+        let stale_secs = if refill_secs.is_finite() {
+            (refill_secs * 2.0).max(60.0)
+        } else {
+            60.0
+        };
         Self {
             stale_threshold: Duration::from_secs_f64(stale_secs),
             config,
@@ -103,8 +126,13 @@ impl RateLimiter {
         match ip {
             IpAddr::V4(v4) => {
                 let bits = u32::from(v4);
+                // Guard the shift: `mask4 == 0` would compute `u32::MAX << 32`,
+                // which is a shift overflow (panics in debug). A 0 mask means
+                // "group everything", i.e. mask of 0 bits.
                 let mask = if self.config.mask4 >= 32 {
                     u32::MAX
+                } else if self.config.mask4 == 0 {
+                    0
                 } else {
                     u32::MAX << (32 - self.config.mask4)
                 };
@@ -114,6 +142,8 @@ impl RateLimiter {
                 let bits = u128::from(v6);
                 let mask = if self.config.mask6 >= 128 {
                     u128::MAX
+                } else if self.config.mask6 == 0 {
+                    0
                 } else {
                     u128::MAX << (128 - self.config.mask6)
                 };
@@ -250,6 +280,49 @@ mod tests {
         let cfg = RateLimiterConfig::from_str_args("").unwrap();
         assert!((cfg.qps - 20.0).abs() < 0.01);
         assert_eq!(cfg.burst, 40);
+    }
+
+    #[test]
+    fn from_str_args_rejects_non_positive_qps() {
+        // qps = 0 previously produced `burst / 0.0 = inf`, and
+        // `Duration::from_secs_f64(inf)` panics at construction time. The parser
+        // must reject it instead of letting a bad config crash the process.
+        assert!(RateLimiterConfig::from_str_args("0").is_err());
+        assert!(RateLimiterConfig::from_str_args("-1").is_err());
+    }
+
+    #[test]
+    fn from_str_args_rejects_zero_burst() {
+        assert!(RateLimiterConfig::from_str_args("20 0").is_err());
+    }
+
+    #[test]
+    fn new_does_not_panic_on_zero_qps() {
+        // Even if a zero/negative qps reaches `new` directly (the fields are
+        // public), construction must not panic.
+        let rl = RateLimiter::new(RateLimiterConfig {
+            qps: 0.0,
+            burst: 40,
+            ..Default::default()
+        });
+        // And it stays usable: the initial burst is still honored.
+        assert!(rl.allow("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn mask_zero_does_not_panic() {
+        // mask4/mask6 == 0 means "group everything"; the shift must not overflow.
+        let rl = RateLimiter::new(RateLimiterConfig {
+            qps: 10.0,
+            burst: 5,
+            mask4: 0,
+            mask6: 0,
+        });
+        // Two different IPs collapse to the same (zero) masked key.
+        assert_eq!(
+            rl.mask_ip("10.0.0.1".parse().unwrap()),
+            rl.mask_ip("192.168.1.1".parse().unwrap())
+        );
     }
 
     #[test]

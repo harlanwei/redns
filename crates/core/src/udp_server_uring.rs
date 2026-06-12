@@ -29,7 +29,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 #[cfg(target_os = "linux")]
 use tokio_util::sync::CancellationToken;
 #[cfg(target_os = "linux")]
@@ -49,6 +49,17 @@ const BUF_GROUP_ID: u16 = 0;
 
 /// Capacity for the handler-to-eventloop response channel.
 const SEND_CHANNEL_CAPACITY: usize = 1024;
+
+/// Upper bound on concurrently in-flight handler tasks. Every received datagram
+/// spawns a handler task; without a cap a UDP flood would spawn tasks (and the
+/// upstream/memory load behind them) without bound. At capacity, further
+/// datagrams are dropped rather than queued, which is acceptable for UDP and
+/// applies backpressure to the flood instead of the server.
+const MAX_INFLIGHT_HANDLERS: usize = 2048;
+
+/// Backoff applied after a persistent io_uring submit error, so the event loop
+/// does not spin at 100% CPU while the ring is in a transient failure state.
+const SUBMIT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// User data encoding (single-shot mode only):
 /// - High bit set  = recv completion, low bits = buffer index.
@@ -453,6 +464,10 @@ pub struct UringUdpServer {
     buf_tail: u16,
     /// Enable multishot RecvMsgMulti (requires kernel ≥ 6.0).
     multishot: bool,
+    /// Bounds concurrently in-flight handler tasks so a UDP flood cannot spawn
+    /// tasks without limit. Permits are acquired before spawning and released
+    /// when the handler finishes.
+    inflight: Arc<Semaphore>,
 }
 
 // The raw pointers inside msghdr / iovec are self-referential and only
@@ -486,6 +501,7 @@ impl UringUdpServer {
             multishot_active: false,
             buf_tail: 0,
             multishot,
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDLERS)),
         })
     }
 
@@ -600,10 +616,22 @@ impl UringUdpServer {
                 query_wire: Some(Arc::new(query_data.to_vec())),
             };
 
+            // Bound the number of concurrently in-flight handlers. A permit is
+            // held for the lifetime of the spawned task; if none is available
+            // we drop the datagram rather than spawn unboundedly under a flood.
+            let permit = match self.inflight.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!("io_uring UDP: handler concurrency limit reached, dropping query");
+                    return;
+                }
+            };
+
             let handler = handler.clone();
             let tx = send_tx.clone();
 
             tokio::runtime::Handle::current().spawn(async move {
+                let _permit = permit;
                 match handler.handle(query, meta).await {
                     Ok(resp) => {
                         if let (Ok(resp_bytes), Some(peer)) = (resp.to_vec(), peer) {
@@ -656,9 +684,12 @@ impl UringUdpServer {
 
             self.drain_and_submit_sends(&mut send_rx);
 
-            // Submit & wait.
+            // Submit & wait. A persistently failing submit/submit_and_wait would
+            // otherwise spin this loop at 100% CPU; back off briefly so a
+            // transient error does not turn into a busy-loop.
             if let Err(e) = self.ring.submit() {
                 warn!(error = %e, "io_uring submit failed");
+                std::thread::sleep(SUBMIT_ERROR_BACKOFF);
                 continue;
             }
             match self.ring.submit_and_wait(1) {
@@ -666,6 +697,7 @@ impl UringUdpServer {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     warn!(error = %e, "io_uring submit_and_wait failed");
+                    std::thread::sleep(SUBMIT_ERROR_BACKOFF);
                     continue;
                 }
             }
@@ -791,21 +823,34 @@ impl UringUdpServer {
         };
 
         if result > 0 {
-            let raw = &buf_ring.buffers[bid as usize][..result as usize];
-            if let Ok(out) = io_uring::types::RecvMsgOut::parse(raw, msghdr) {
-                let peer = sockaddr_to_socket_addr(
-                    // name_data() is a &[u8] slice over the sockaddr bytes in the buffer.
-                    // Reinterpret as sockaddr_storage for our helper.
-                    unsafe {
-                        &*(out.name_data().as_ptr() as *const libc::sockaddr_storage)
-                    },
-                    out.incoming_name_len(),
-                );
-                self.dispatch_query(out.payload_data(), peer, handler, send_tx);
+            // `bid` and `result` are supplied by the kernel via the CQE. Validate
+            // both before indexing so a malformed/unexpected completion cannot
+            // panic the single event-loop thread (which would kill the server).
+            let bid_idx = bid as usize;
+            let len = result as usize;
+            match buf_ring.buffers.get(bid_idx) {
+                Some(b) if len <= b.len() => {
+                    let raw = &b[..len];
+                    if let Ok(out) = io_uring::types::RecvMsgOut::parse(raw, msghdr) {
+                        let peer = sockaddr_to_socket_addr(
+                            // name_data() is a &[u8] slice over the sockaddr bytes in
+                            // the buffer. Reinterpret as sockaddr_storage for our helper.
+                            unsafe {
+                                &*(out.name_data().as_ptr() as *const libc::sockaddr_storage)
+                            },
+                            out.incoming_name_len(),
+                        );
+                        self.dispatch_query(out.payload_data(), peer, handler, send_tx);
+                    }
+                }
+                _ => {
+                    warn!(bid = bid, result = result, "io_uring recv: invalid buffer id/len");
+                }
             }
         }
 
-        // Recycle the buffer.
+        // Recycle the buffer (always, even on an invalid completion, so the
+        // provided-buffer ring is not starved).
         let tail = self.buf_tail;
         buf_ring.recycle(bid, tail);
         self.buf_tail = tail.wrapping_add(1);

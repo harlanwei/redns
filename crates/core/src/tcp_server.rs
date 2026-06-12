@@ -20,6 +20,11 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default first read timeout.
 const FIRST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Timeout for writing a response back to the client. Bounds the per-connection
+/// task so a client that stops reading (a full receive window) cannot pin the
+/// task and its `MAX_CONNECTIONS` permit indefinitely (slowloris-on-write).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum number of concurrent in-flight TCP connections. Bounds task and
 /// memory growth under a connection flood; further connections wait in the OS
 /// accept backlog until a slot frees rather than spawning unbounded tasks.
@@ -140,8 +145,14 @@ pub async fn serve_tcp(
                                 match resp.to_vec() {
                                     Ok(resp_bytes) => {
                                         let len = (resp_bytes.len() as u16).to_be_bytes();
-                                        if stream.write_all(&len).await.is_err() { return; }
-                                        if stream.write_all(&resp_bytes).await.is_err() { return; }
+                                        let write = async {
+                                            stream.write_all(&len).await?;
+                                            stream.write_all(&resp_bytes).await
+                                        };
+                                        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+                                            Ok(Ok(())) => {}
+                                            _ => return,
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(error = %e, "failed to serialize TCP response");

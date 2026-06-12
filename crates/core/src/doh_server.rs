@@ -30,6 +30,11 @@ const MAX_CONNECTIONS: usize = 1024;
 /// Per-read timeout for HTTP request header/body reads.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Timeout for writing a response back to the client. Bounds the per-connection
+/// task so a client that stops reading (a full receive window) cannot pin the
+/// task and its `MAX_CONNECTIONS` permit indefinitely.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Backoff applied after an accept failure caused by fd exhaustion, to avoid
 /// busy-spinning while descriptors are unavailable.
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
@@ -351,9 +356,14 @@ async fn send_http_error(
         msg.len(),
         msg
     );
-    stream.write_all(response.as_bytes()).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("write error: {e}").into() },
-    )?;
+    tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(response.as_bytes()))
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "write error: timed out".into()
+        })?
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("write error: {e}").into()
+        })?;
     Ok(())
 }
 
@@ -365,14 +375,17 @@ async fn send_http_dns_response(
         "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(header.as_bytes()).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("write header: {e}").into() },
-    )?;
-    stream
-        .write_all(body)
+    let write = async {
+        stream.write_all(header.as_bytes()).await?;
+        stream.write_all(body).await
+    };
+    tokio::time::timeout(WRITE_TIMEOUT, write)
         .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "write response: timed out".into()
+        })?
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("write body: {e}").into()
+            format!("write response: {e}").into()
         })?;
     Ok(())
 }
