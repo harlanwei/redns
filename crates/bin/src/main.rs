@@ -6,7 +6,7 @@
 
 #[cfg(unix)]
 #[global_allocator]
-static GLOBAL: bc_mimalloc::MiMalloc = bc_mimalloc::MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod dashboard;
 
