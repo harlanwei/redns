@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use hickory_proto::op::Message;
 use hickory_proto::rr::RecordType;
 use lru::LruCache;
+use parking_lot::Mutex;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
@@ -15,14 +16,13 @@ use redns_core::{Context, RecursiveExecutable};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 /// Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -54,8 +54,14 @@ static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// A cached DNS response entry.
 struct CachedEntry {
-    /// Cached parsed DNS response.
-    resp: Message,
+    /// Pre-serialized DNS response wire bytes. All record TTL fields have been
+    /// normalized to `original_ttl`, so on a cache hit we only need to patch the
+    /// query ID (bytes 0-1) and the TTL offsets in place.
+    resp_wire: Arc<Vec<u8>>,
+    /// Byte offsets of the 4-byte TTL fields inside `resp_wire` (answers,
+    /// authorities, additionals). The OPT pseudo-record TTL is intentionally
+    /// excluded because it carries extended RCODE / DO bit data.
+    ttl_offsets: Vec<usize>,
     /// Time this entry was stored.
     stored_at: Instant,
     /// Original minimum TTL of the response records.
@@ -123,17 +129,85 @@ fn min_ttl(msg: &Message) -> u32 {
     if min == u32::MAX { 300 } else { min }
 }
 
-/// Adjust all TTLs in a response message.
-fn adjust_ttl(msg: &mut Message, remaining: u32) {
-    for rr in msg.answers_mut().iter_mut() {
-        rr.set_ttl(remaining);
+/// Extract the offsets of all record TTL fields in a DNS wire message.
+/// Skips the OPT pseudo-record (TYPE 41) because its TTL field is actually
+/// the extended RCODE / Z / DO bits.
+fn extract_ttl_offsets(wire: &[u8]) -> Vec<usize> {
+    if wire.len() < 12 {
+        return Vec::new();
     }
-    for rr in msg.name_servers_mut().iter_mut() {
-        rr.set_ttl(remaining);
+    let mut pos = 12; // skip fixed-size DNS header
+    let qdcount = u16::from_be_bytes([wire[4], wire[5]]) as usize;
+    for _ in 0..qdcount {
+        skip_name(wire, &mut pos);
+        if pos + 4 > wire.len() {
+            break;
+        }
+        pos += 4; // QTYPE + QCLASS
     }
-    for rr in msg.additionals_mut().iter_mut() {
-        rr.set_ttl(remaining);
+    let counts = [
+        u16::from_be_bytes([wire[6], wire[7]]) as usize,
+        u16::from_be_bytes([wire[8], wire[9]]) as usize,
+        u16::from_be_bytes([wire[10], wire[11]]) as usize,
+    ];
+    let mut offsets = Vec::new();
+    for count in counts {
+        for _ in 0..count {
+            skip_name(wire, &mut pos);
+            if pos + 10 > wire.len() {
+                break;
+            }
+            let rtype = u16::from_be_bytes([wire[pos], wire[pos + 1]]);
+            // TTL offset is after TYPE (2) + CLASS (2).
+            if rtype != 41 {
+                offsets.push(pos + 4);
+            }
+            pos += 4; // TYPE + CLASS
+            let rdlength = u16::from_be_bytes([wire[pos], wire[pos + 1]]) as usize;
+            pos += 2 + rdlength;
+        }
     }
+    offsets
+}
+
+/// Advance `pos` past a DNS domain name, following compression pointers.
+fn skip_name(wire: &[u8], pos: &mut usize) {
+    loop {
+        if *pos >= wire.len() {
+            return;
+        }
+        let len = wire[*pos] as usize;
+        if len == 0 {
+            *pos += 1;
+            return;
+        }
+        if len & 0xC0 == 0xC0 {
+            // Compression pointer: 2 bytes total, then stop following this name.
+            *pos += 2;
+            return;
+        }
+        *pos += 1 + len;
+    }
+}
+
+/// Patch all recorded TTL offsets in the wire with the given value.
+fn set_ttl_in_wire(wire: &mut [u8], offsets: &[usize], ttl: u32) {
+    let ttl_bytes = ttl.to_be_bytes();
+    for off in offsets {
+        if *off + 4 <= wire.len() {
+            wire[*off..*off + 4].copy_from_slice(&ttl_bytes);
+        }
+    }
+}
+
+/// Build a response wire suitable for storing: all record TTLs are normalized
+/// to `original_ttl` and the offsets of the TTL fields are returned.
+fn build_stored_wire(resp: &Message, original_ttl: u32) -> Option<(Vec<u8>, Vec<usize>)> {
+    let wire = resp.to_vec().ok()?;
+    let offsets = extract_ttl_offsets(&wire);
+    let mut wire = wire;
+    set_ttl_in_wire(&mut wire, &offsets, original_ttl);
+    Some((wire, offsets))
 }
 
 /// In-memory LRU DNS cache.
@@ -150,7 +224,10 @@ struct CacheInner {
     shard_count: usize,
     shards: Vec<Mutex<LruCache<CacheKey, CachedEntry>>>,
     shard_hasher: ahash::RandomState,
+    /// Deduplicates background lazy refreshes for the same key.
     inflight_refreshes: Mutex<HashSet<CacheKey>>,
+    /// Coalesces concurrent cache misses so only one query fetches upstream.
+    inflight_misses: Mutex<ahash::HashMap<CacheKey, Arc<Notify>>>,
     lazy_ttl: Duration,
     /// Captured downstream chain + server metadata for background refreshes.
     /// Set once on first `exec_recursive` call.
@@ -211,6 +288,7 @@ impl Cache {
             shards,
             shard_hasher: ahash::RandomState::new(),
             inflight_refreshes: Mutex::new(HashSet::new()),
+            inflight_misses: Mutex::new(ahash::HashMap::default()),
             lazy_ttl,
             refresh_chain: Mutex::new(None),
             hit_total: AtomicU64::new(0),
@@ -266,9 +344,7 @@ impl Cache {
     }
 
     fn get_shard(&self, key: &CacheKey) -> &Mutex<LruCache<CacheKey, CachedEntry>> {
-        let mut s = self.inner.shard_hasher.build_hasher();
-        key.hash(&mut s);
-        let hash = s.finish();
+        let hash = self.inner.shard_hasher.hash_one(key);
         &self.inner.shards[(hash as usize) % self.inner.shard_count]
     }
 }
@@ -299,7 +375,7 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
         let mut shards = Vec::with_capacity(cache.shards.len());
 
         for (index, shard) in cache.shards.iter().enumerate() {
-            let store = shard.lock().await;
+            let store = shard.lock();
             let entries = store.len();
             let capacity = store.cap().get();
             total_entries += entries;
@@ -324,12 +400,54 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
     snapshots
 }
 
+/// Result of a cache lookup: a fresh hit, a stale hit eligible for lazy
+/// refresh, or a miss that should be fetched upstream.
+enum CacheLookup {
+    Hit(Message),
+    Stale(Message),
+    Miss,
+}
+
+impl Cache {
+    /// Look up a key and build a response message for the current query ID.
+    fn lookup_and_build(&self, key: &CacheKey, query_id: u16) -> CacheLookup {
+        let shard = self.get_shard(key);
+        let mut store = shard.lock();
+        if let Some(entry) = store.get_mut(key) {
+            if !entry.is_expired() {
+                if let Some(resp) = self.build_response(entry, query_id, entry.remaining_ttl()) {
+                    return CacheLookup::Hit(resp);
+                }
+            } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
+                // Stale-while-refresh: serve with a 1-second TTL while a
+                // background refresh runs.
+                if let Some(resp) = self.build_response(entry, query_id, 1) {
+                    return CacheLookup::Stale(resp);
+                }
+            }
+        }
+        CacheLookup::Miss
+    }
+
+    /// Build a response `Message` from a cached entry by patching the query ID
+    /// and record TTLs in the stored wire bytes.
+    fn build_response(&self, entry: &CachedEntry, query_id: u16, ttl: u32) -> Option<Message> {
+        let mut wire = (*entry.resp_wire).clone();
+        if wire.len() >= 2 {
+            wire[0] = (query_id >> 8) as u8;
+            wire[1] = (query_id & 0xff) as u8;
+        }
+        set_ttl_in_wire(&mut wire, &entry.ttl_offsets, ttl);
+        Message::from_vec(&wire).ok()
+    }
+}
+
 #[async_trait]
 impl RecursiveExecutable for Cache {
     async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         // Capture the refresh chain on first call.
         {
-            let mut chain_slot = self.inner.refresh_chain.lock().await;
+            let mut chain_slot = self.inner.refresh_chain.lock();
             if chain_slot.is_none() {
                 *chain_slot = Some((next.clone(), ctx.server_meta.clone()));
             }
@@ -340,66 +458,70 @@ impl RecursiveExecutable for Cache {
             None => return next.exec_next(ctx).await,
         };
 
-        // Check cache.
-        let mut do_optimistic_refresh = false;
-        let mut cached_payload: Option<(Message, u32)> = None;
-        {
-            let shard = self.get_shard(&key);
-            let mut store = shard.lock().await;
-            if let Some(entry) = store.get_mut(&key) {
-                if !entry.is_expired() {
-                    // Fresh hit.
-                    let ttl = entry.remaining_ttl();
-                    cached_payload = Some((entry.resp.clone(), ttl));
-                } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
-                    // Stale but within lazy window — serve stale and refresh.
-                    // Note: stored_at is NOT updated here. The background refresh
-                    // will replace this entry on success, or it will eventually
-                    // age out past the lazy window if the refresh fails.
-                    do_optimistic_refresh = true;
-                    cached_payload = Some((entry.resp.clone(), 1));
+        loop {
+            match self.lookup_and_build(&key, ctx.query().id()) {
+                CacheLookup::Hit(resp) => {
+                    self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
+                    ctx.set_response(Some(resp));
+                    ctx.set_mark(MARK_CACHE_HIT);
+                    return Ok(());
                 }
+                CacheLookup::Stale(resp) => {
+                    self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
+                    ctx.set_response(Some(resp));
+                    ctx.set_mark(MARK_CACHE_HIT);
+                    self.spawn_refresh_for_key(
+                        &key,
+                        ctx.query().clone(),
+                        ctx.server_meta.clone(),
+                        next.clone(),
+                    )
+                    .await;
+                    return Ok(());
+                }
+                CacheLookup::Miss => {}
             }
+
+            // Coalesce concurrent cache misses for the same key.
+            let notify = {
+                let mut inflight = self.inner.inflight_misses.lock();
+                if let Some(n) = inflight.get(&key) {
+                    Some(n.clone())
+                } else {
+                    inflight.insert(key.clone(), Arc::new(Notify::new()));
+                    None
+                }
+            };
+
+            if let Some(notify) = notify {
+                notify.notified().await;
+                // Another query populated the cache (or failed). Retry lookup.
+                continue;
+            }
+
+            // We are the leader for this key.
+            self.inner.miss_total.fetch_add(1, Ordering::Relaxed);
+            let result = next.exec_next(ctx).await;
+
+            // Always store (when possible) and always notify waiters, even on
+            // error, so waiters do not hang forever.
+            self.store(&key, ctx);
+
+            let notify = {
+                let mut inflight = self.inner.inflight_misses.lock();
+                inflight.remove(&key)
+            };
+            if let Some(notify) = notify {
+                notify.notify_waiters();
+            }
+
+            return result;
         }
-
-        let served_from_cache = if let Some((mut resp, ttl)) = cached_payload {
-            self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
-            resp.set_id(ctx.query().id());
-            adjust_ttl(&mut resp, ttl);
-            ctx.set_response(Some(resp));
-            ctx.set_mark(MARK_CACHE_HIT);
-            true
-        } else {
-            false
-        };
-
-        if do_optimistic_refresh {
-            self.spawn_refresh_for_key(
-                &key,
-                ctx.query().clone(),
-                ctx.server_meta.clone(),
-                next.clone(),
-            )
-            .await;
-        }
-
-        if served_from_cache {
-            return Ok(());
-        }
-
-        // Cache miss — execute downstream.
-        self.inner.miss_total.fetch_add(1, Ordering::Relaxed);
-        next.exec_next(ctx).await?;
-
-        // Store the response in cache.
-        self.store(&key, ctx).await;
-
-        Ok(())
     }
 }
 
 impl Cache {
-    async fn store(&self, key: &CacheKey, ctx: &Context) {
+    fn store(&self, key: &CacheKey, ctx: &Context) {
         use hickory_proto::op::ResponseCode;
 
         if let Some(resp) = ctx.response() {
@@ -422,13 +544,18 @@ impl Cache {
                 return;
             }
 
+            let Some((wire, offsets)) = build_stored_wire(resp, ttl) else {
+                return;
+            };
+
             let shard = self.get_shard(key);
-            let mut store = shard.lock().await;
+            let mut store = shard.lock();
 
             store.push(
                 key.clone(),
                 CachedEntry {
-                    resp: resp.clone(),
+                    resp_wire: Arc::new(wire),
+                    ttl_offsets: offsets,
                     stored_at: Instant::now(),
                     original_ttl: ttl,
                 },
@@ -444,7 +571,7 @@ impl Cache {
         server_meta: redns_core::context::ServerMeta,
         mut chain: ChainWalker,
     ) {
-        let mut inflight = self.inner.inflight_refreshes.lock().await;
+        let mut inflight = self.inner.inflight_refreshes.lock();
         let should_spawn = inflight.insert(key.clone());
         drop(inflight);
 
@@ -458,9 +585,9 @@ impl Cache {
         let refresh_key = key.clone();
         tokio::spawn(async move {
             let _ = chain.exec_next(&mut refresh_ctx).await;
-            cache_clone.store(&refresh_key, &refresh_ctx).await;
+            cache_clone.store(&refresh_key, &refresh_ctx);
 
-            let mut inflight = cache_clone.inner.inflight_refreshes.lock().await;
+            let mut inflight = cache_clone.inner.inflight_refreshes.lock();
             inflight.remove(&refresh_key);
         });
     }
@@ -479,7 +606,7 @@ impl Cache {
         let mut count: usize = 0;
 
         for shard in &self.inner.shards {
-            let store = shard.lock().await;
+            let store = shard.lock();
             for (key, entry) in store.iter() {
                 let remaining = entry.remaining_ttl();
                 if remaining == 0 {
@@ -495,15 +622,12 @@ impl Cache {
                 entries_buf.write_all(&u16::from(key.qtype).to_be_bytes())?;
                 entries_buf.write_all(&remaining.to_be_bytes())?;
 
-                let msg_wire = match entry.resp.to_vec() {
-                    Ok(w) => w,
-                    Err(_) => continue,
-                };
+                let msg_wire = entry.resp_wire.as_slice();
                 if msg_wire.len() > u32::MAX as usize {
                     continue;
                 }
                 entries_buf.write_all(&(msg_wire.len() as u32).to_be_bytes())?;
-                entries_buf.write_all(&msg_wire)?;
+                entries_buf.write_all(msg_wire)?;
 
                 count += 1;
             }
@@ -623,22 +747,29 @@ impl Cache {
                 continue;
             }
 
-            let msg = match Message::from_vec(msg_wire) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            // Validate the wire before adopting the entry.
+            if Message::from_vec(msg_wire).is_err() {
+                continue;
+            }
 
             let key = CacheKey {
                 qname,
                 qtype: RecordType::from(qtype_u16),
             };
 
+            // Normalize the loaded wire so all record TTLs equal the remaining
+            // TTL, matching how freshly-stored responses are kept.
+            let mut wire = msg_wire.to_vec();
+            let offsets = extract_ttl_offsets(&wire);
+            set_ttl_in_wire(&mut wire, &offsets, effective_remaining);
+
             let shard = self.get_shard(&key);
-            let mut store = shard.lock().await;
+            let mut store = shard.lock();
             store.push(
                 key,
                 CachedEntry {
-                    resp: msg,
+                    resp_wire: Arc::new(wire),
+                    ttl_offsets: offsets,
                     stored_at: Instant::now(),
                     original_ttl: effective_remaining,
                 },
@@ -743,6 +874,17 @@ mod tests {
         assert_eq!(ctx.response().unwrap().answers().len(), 1);
     }
 
+    fn empty_entry(ttl: u32) -> CachedEntry {
+        let resp = Message::new();
+        let (wire, offsets) = build_stored_wire(&resp, ttl).unwrap();
+        CachedEntry {
+            resp_wire: Arc::new(wire),
+            ttl_offsets: offsets,
+            stored_at: Instant::now(),
+            original_ttl: ttl,
+        }
+    }
+
     #[tokio::test]
     async fn lru_eviction_respects_capacity() {
         let cache = Cache::new(2, Duration::from_secs(30), None);
@@ -754,18 +896,14 @@ mod tests {
                 qtype: RecordType::A,
             };
             let shard = cache.get_shard(&shard_key);
-            let mut store = shard.lock().await;
+            let mut store = shard.lock();
             for i in 0..5 {
                 store.put(
                     CacheKey {
                         qname: format!("key{i}"),
                         qtype: RecordType::A,
                     },
-                    CachedEntry {
-                        resp: Message::new(),
-                        stored_at: Instant::now(),
-                        original_ttl: 300,
-                    },
+                    empty_entry(300),
                 );
             }
             // Sharding is disabled for small caches, so capacity stays exact.
@@ -847,6 +985,46 @@ mod tests {
 
         // One initial upstream call + one deduplicated refresh.
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
+    }
+
+    /// Many concurrent queries for a cold key must result in exactly one
+    /// upstream fetch, not a thundering herd.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coalesces_concurrent_cache_misses() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Cache::new(128, Duration::from_secs(30), None);
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let calls = Arc::clone(&calls);
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let chain: Vec<ChainNode> = vec![
+                    ChainNode {
+                        matchers: vec![],
+                        executor: NodeExecutor::Recursive(Box::new(cache)),
+                    },
+                    ChainNode {
+                        matchers: vec![],
+                        executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
+                            ttl: 60,
+                            calls,
+                            delay: Duration::from_millis(100),
+                        })),
+                    },
+                ];
+                let seq = Sequence::new(chain);
+                let mut ctx = Context::new(make_query());
+                seq.exec(&mut ctx).await.unwrap();
+                assert!(ctx.response().is_some());
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
