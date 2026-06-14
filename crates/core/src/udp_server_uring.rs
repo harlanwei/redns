@@ -598,14 +598,23 @@ impl UringUdpServer {
     }
 
     /// Spawn the DNS handler for a received query.
+    ///
+    /// Takes the query bytes **by value**. This is load-bearing: in multishot
+    /// mode the bytes live in a kernel-provided buffer-ring slot that is
+    /// recycled the moment `process_multishot_cqe` returns. Taking ownership
+    /// forces the caller to copy the payload out of that slot *before*
+    /// recycling (and before this method returns), so the spawned handler task
+    /// can never read alias buffer memory while the kernel reuses it. It also
+    /// lets `query_wire` share the single owned allocation via `Arc` instead of
+    /// re-copying it.
     fn dispatch_query(
         &self,
-        query_data: &[u8],
+        query_data: Vec<u8>,
         peer: Option<SocketAddr>,
         handler: &Arc<dyn DnsHandler>,
         send_tx: &mpsc::Sender<UringSend>,
     ) {
-        if let Ok(query) = Message::from_vec(query_data) {
+        if let Ok(query) = Message::from_vec(&query_data) {
             let meta = QueryMeta {
                 protocol: Some("udp".to_string()),
                 from_udp: true,
@@ -613,7 +622,7 @@ impl UringUdpServer {
                 url_path: None,
                 server_name: None,
                 selected_upstreams: None,
-                query_wire: Some(Arc::new(query_data.to_vec())),
+                query_wire: Some(Arc::new(query_data)),
             };
 
             // Bound the number of concurrently in-flight handlers. A permit is
@@ -773,7 +782,7 @@ impl UringUdpServer {
 
         let peer = self.recv_ctxs[buf_idx].peer_addr();
         let data = self.recv_ctxs[buf_idx].buffer[..bytes].to_vec();
-        self.dispatch_query(&data, peer, handler, send_tx);
+        self.dispatch_query(data, peer, handler, send_tx);
         let _ = self.submit_recv(buf_idx);
     }
 
@@ -840,7 +849,17 @@ impl UringUdpServer {
                             },
                             out.incoming_name_len(),
                         );
-                        self.dispatch_query(out.payload_data(), peer, handler, send_tx);
+                        // Copy the payload out of the provided buffer BEFORE
+                        // dispatch and BEFORE the slot is recycled below. The
+                        // spawned handler runs asynchronously after this method
+                        // returns; if we passed `payload_data()` (a borrow into
+                        // the buffer-ring slot) instead, the kernel could reuse
+                        // that slot for the next datagram while the handler was
+                        // still reading it — clobbering the query bytes. Taking
+                        // ownership here guarantees the handler reads a stable
+                        // snapshot regardless of buffer-ring turnover.
+                        let payload = out.payload_data().to_vec();
+                        self.dispatch_query(payload, peer, handler, send_tx);
                     }
                 }
                 _ => {
