@@ -241,36 +241,6 @@ impl Upstream for UdpUpstream {
     }
 }
 
-// ── TCP (Simple, one-conn-per-query) ────────────────────────────
-
-/// Simple TCP upstream transport (one connection per query, kept for direct use).
-pub struct TcpUpstream {
-    addr: SocketAddr,
-    timeout: Duration,
-}
-
-impl TcpUpstream {
-    pub fn new(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            timeout: DEFAULT_TIMEOUT,
-        }
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-}
-
-#[async_trait]
-impl Upstream for TcpUpstream {
-    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let mut stream = tcp_connect(self.addr, self.timeout).await?;
-        stream_exchange(&mut stream, query, self.timeout).await
-    }
-}
-
 // ── Connection Pool (shared by TCP and TLS) ─────────────────────
 
 /// An idle connection with a timestamp for expiry tracking.
@@ -432,42 +402,6 @@ async fn tls_connect(
             format!("tls handshake: {e}").into()
         },
     )
-}
-
-/// TLS (DNS-over-TLS) upstream transport with session caching.
-///
-/// Phase 3: The `ClientConfig` is built once and reused, enabling
-/// TLS session resumption via rustls's built-in LRU session cache.
-pub struct TlsUpstream {
-    addr: SocketAddr,
-    server_name: String,
-    timeout: Duration,
-    tls_config: Arc<ClientConfig>,
-}
-
-impl TlsUpstream {
-    pub fn new(addr: SocketAddr, server_name: String) -> Self {
-        Self {
-            addr,
-            server_name,
-            timeout: DEFAULT_TIMEOUT,
-            tls_config: build_tls_config(),
-        }
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-}
-
-#[async_trait]
-impl Upstream for TlsUpstream {
-    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let mut tls =
-            tls_connect(self.addr, &self.server_name, &self.tls_config, self.timeout).await?;
-        stream_exchange(&mut tls, query, self.timeout).await
-    }
 }
 
 // ── TLS Pooled ──────────────────────────────────────────────────
@@ -1902,10 +1836,12 @@ mod tests {
     fn tls_config_reuse() {
         // Install crypto provider for rustls 0.23+.
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-        // Verify TLS config is created once with session cache.
-        let u1 = TlsUpstream::new("1.1.1.1:853".parse().unwrap(), "one.one.one.one".into());
-        let u2 = TlsUpstream::new("8.8.8.8:853".parse().unwrap(), "dns.google".into());
-        // Both should have their own Arc<ClientConfig>.
+        // Verify the pooled DoT upstream can be constructed with its own
+        // ClientConfig (which backs session resumption within the pooled
+        // connection lifecycle).
+        let u1 =
+            PooledTlsUpstream::new("1.1.1.1:853".parse().unwrap(), "one.one.one.one".into());
+        let u2 = PooledTlsUpstream::new("8.8.8.8:853".parse().unwrap(), "dns.google".into());
         assert!(Arc::strong_count(&u1.tls_config) == 1);
         assert!(Arc::strong_count(&u2.tls_config) == 1);
     }

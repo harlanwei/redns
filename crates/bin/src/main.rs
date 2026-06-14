@@ -265,33 +265,6 @@ fn register_builtins(builder: &mut ChainBuilder) {
         }),
     );
     builder.register_rec_exec(
-        "dual_selector",
-        Box::new(|args: &str| {
-            let prefer = if args.trim() == "ipv6" || args.trim() == "prefer_ipv6" {
-                redns_executables::dual_selector::Prefer::Ipv6
-            } else {
-                redns_executables::dual_selector::Prefer::Ipv4
-            };
-            Ok(Box::new(DualSelector::new(prefer)) as Box<dyn RecursiveExecutable>)
-        }),
-    );
-    builder.register_rec_exec(
-        "prefer_ipv4",
-        Box::new(|_| {
-            Ok(Box::new(DualSelector::new(
-                redns_executables::dual_selector::Prefer::Ipv4,
-            )) as Box<dyn RecursiveExecutable>)
-        }),
-    );
-    builder.register_rec_exec(
-        "prefer_ipv6",
-        Box::new(|_| {
-            Ok(Box::new(DualSelector::new(
-                redns_executables::dual_selector::Prefer::Ipv6,
-            )) as Box<dyn RecursiveExecutable>)
-        }),
-    );
-    builder.register_rec_exec(
         "reverse_lookup",
         Box::new(|args: &str| {
             let cfg = redns_executables::reverse_lookup::ReverseLookupConfig::from_str_args(args)?;

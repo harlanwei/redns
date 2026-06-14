@@ -43,6 +43,6 @@ pub use registry::PluginRegistry;
 pub use sequence::{ChainNode, ChainWalker, NodeExecutor, Sequence};
 pub use server::{DnsHandler, EntryHandler, QueryMeta};
 pub use upstream::{
-    DohUpstream, PooledTcpUpstream, PooledTlsUpstream, TcpUpstream, TlsUpstream, UdpUpstream,
-    Upstream, UpstreamMetrics, UpstreamWrapper,
+    DohUpstream, PooledTcpUpstream, PooledTlsUpstream, UdpUpstream, Upstream, UpstreamMetrics,
+    UpstreamWrapper,
 };
