@@ -163,6 +163,10 @@ fn extract_ttl_offsets(wire: &[u8]) -> Vec<usize> {
                 offsets.push(pos + 4);
             }
             pos += 4; // TYPE + CLASS
+            pos += 4; // TTL
+            if pos + 2 > wire.len() {
+                break;
+            }
             let rdlength = u16::from_be_bytes([wire[pos], wire[pos + 1]]) as usize;
             pos += 2 + rdlength;
         }
