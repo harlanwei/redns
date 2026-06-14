@@ -90,7 +90,7 @@ struct NewDnsLogEntry {
     qname: String,
     qtype: String,
     rcode: String,
-    upstreams_json: String,
+    upstream_names: Vec<String>,
     result: String,
     result_rows_json: String,
     latency_ms: u64,
@@ -116,7 +116,8 @@ impl Default for LogsQuery {
 
 #[derive(Debug, Clone)]
 pub struct DashboardStore {
-    db_path: Arc<String>,
+    logs_db_path: Arc<String>,
+    geoip_db_path: Arc<String>,
     log_tx: tokio::sync::mpsc::Sender<NewDnsLogEntry>,
     inflight_geoip: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     http_client: reqwest::Client,
@@ -125,11 +126,14 @@ pub struct DashboardStore {
 
 impl DashboardStore {
     pub fn new(db_path: impl Into<String>, dhcp_leases: Vec<String>) -> Result<Self, DynError> {
-        let db_path = db_path.into();
-        ensure_sqlite_file_exists(&db_path)?;
+        let logs_db_path = db_path.into();
+        ensure_sqlite_file_exists(&logs_db_path)?;
+        let geoip_db_path = geoip_db_path(&logs_db_path);
+        ensure_sqlite_file_exists(&geoip_db_path)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<NewDnsLogEntry>(10240);
         let store = Self {
-            db_path: Arc::new(db_path.clone()),
+            logs_db_path: Arc::new(logs_db_path.clone()),
+            geoip_db_path: Arc::new(geoip_db_path),
             log_tx: tx,
             inflight_geoip: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_client: reqwest::Client::new(),
@@ -137,7 +141,7 @@ impl DashboardStore {
         };
         store.init()?;
 
-        let path = store.db_path.clone();
+        let path = store.logs_db_path.clone();
         tokio::spawn(async move {
             let mut batch = Vec::new();
             loop {
@@ -159,30 +163,44 @@ impl DashboardStore {
                 let entries = std::mem::take(&mut batch);
                 let path_clone = path.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(mut conn) = Self::open_connection(&path_clone) {
-                        if let Ok(tx) = conn.transaction() {
-                            for entry in entries {
-                                let _ = tx.execute(
-                                    "INSERT INTO dns_logs (
-                                        ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms, answer_ttl
-                                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                                    params![
-                                        entry.ts_unix_ms as i64,
-                                        entry.client_ip,
-                                        entry.protocol,
-                                        entry.qname,
-                                        entry.qtype,
-                                        entry.rcode,
-                                        entry.result,
-                                        entry.result_rows_json,
-                                        entry.upstreams_json,
-                                        entry.latency_ms as i64,
-                                        entry.answer_ttl as i64,
-                                    ],
-                                );
-                            }
-                            let _ = tx.commit();
+                    if let Ok(mut conn) = Self::open_connection(&path_clone)
+                        && let Ok(tx) = conn.transaction()
+                    {
+                        let mut upstream_cache = HashMap::new();
+                        for entry in entries {
+                            let upstream_ids = match resolve_upstream_ids(
+                                &tx,
+                                &entry.upstream_names,
+                                &mut upstream_cache,
+                            ) {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    warn!(error = %e, "failed to resolve upstream ids");
+                                    continue;
+                                }
+                            };
+                            let upstream_ids_text = upstream_ids_to_text(&upstream_ids);
+                            let _ = tx.execute(
+                                "INSERT INTO dns_logs (
+                                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
+                                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                params![
+                                    entry.ts_unix_ms as i64,
+                                    entry.client_ip,
+                                    entry.protocol,
+                                    entry.qname,
+                                    entry.qtype,
+                                    entry.rcode,
+                                    entry.result,
+                                    entry.result_rows_json,
+                                    "[]",
+                                    upstream_ids_text,
+                                    entry.latency_ms as i64,
+                                    entry.answer_ttl as i64,
+                                ],
+                            );
                         }
+                        let _ = tx.commit();
                     }
                 }).await;
             }
@@ -192,8 +210,10 @@ impl DashboardStore {
     }
 
     fn init(&self) -> Result<(), DynError> {
-        let conn = Self::open_connection(&self.db_path)?;
-        conn.execute_batch(
+        // Tune and create the logs database.
+        Self::ensure_auto_vacuum(&self.logs_db_path)?;
+        let logs_conn = Self::open_connection(&self.logs_db_path)?;
+        logs_conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS dns_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,12 +226,29 @@ impl DashboardStore {
                 result TEXT NOT NULL,
                 result_rows_json TEXT NOT NULL DEFAULT '[]',
                 upstreams_json TEXT NOT NULL DEFAULT '[]',
-                latency_ms INTEGER NOT NULL
+                upstream_ids_text TEXT NOT NULL DEFAULT '',
+                latency_ms INTEGER NOT NULL,
+                answer_ttl INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_dns_logs_ts ON dns_logs(ts_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_client ON dns_logs(client_ip);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_qname ON dns_logs(qname);
 
+            CREATE TABLE IF NOT EXISTS upstream_names (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+            ",
+        )?;
+        Self::ensure_logs_migrations(&logs_conn)?;
+
+        // Migrate geoip data out of the old combined database, then set up the
+        // dedicated geoip database.
+        Self::migrate_geoip_cache(&self.logs_db_path, &self.geoip_db_path)?;
+        Self::ensure_auto_vacuum(&self.geoip_db_path)?;
+        let geoip_conn = Self::open_connection(&self.geoip_db_path)?;
+        geoip_conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS geoip_cache (
                 ip TEXT PRIMARY KEY,
                 city TEXT,
@@ -223,11 +260,11 @@ impl DashboardStore {
             );
             ",
         )?;
-        Self::ensure_migrations(&conn)?;
+        Self::ensure_geoip_migrations(&geoip_conn)?;
         Ok(())
     }
 
-    fn ensure_migrations(conn: &Connection) -> Result<(), DynError> {
+    fn ensure_logs_migrations(conn: &Connection) -> Result<(), DynError> {
         if !Self::has_column(conn, "dns_logs", "result_rows_json")? {
             conn.execute(
                 "ALTER TABLE dns_logs ADD COLUMN result_rows_json TEXT NOT NULL DEFAULT '[]'",
@@ -240,6 +277,22 @@ impl DashboardStore {
                 [],
             )?;
         }
+        if !Self::has_column(conn, "dns_logs", "upstream_ids_text")? {
+            conn.execute(
+                "ALTER TABLE dns_logs ADD COLUMN upstream_ids_text TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::has_column(conn, "dns_logs", "answer_ttl")? {
+            conn.execute(
+                "ALTER TABLE dns_logs ADD COLUMN answer_ttl INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_geoip_migrations(conn: &Connection) -> Result<(), DynError> {
         if !Self::has_column(conn, "geoip_cache", "isp")? {
             conn.execute("ALTER TABLE geoip_cache ADD COLUMN isp TEXT", [])?;
         }
@@ -248,12 +301,6 @@ impl DashboardStore {
         }
         if !Self::has_column(conn, "geoip_cache", "hosting")? {
             conn.execute("ALTER TABLE geoip_cache ADD COLUMN hosting INTEGER", [])?;
-        }
-        if !Self::has_column(conn, "dns_logs", "answer_ttl")? {
-            conn.execute(
-                "ALTER TABLE dns_logs ADD COLUMN answer_ttl INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
         }
         Ok(())
     }
@@ -280,6 +327,88 @@ impl DashboardStore {
         Ok(conn)
     }
 
+    /// Enable incremental auto-vacuum. For new databases this is a header-only
+    /// change; for existing databases a one-time VACUUM is required to rewrite
+    /// the file with the new setting.
+    fn ensure_auto_vacuum(path: &str) -> Result<(), DynError> {
+        let conn = Connection::open(path)?;
+        let current: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if current == 2 {
+            return Ok(());
+        }
+        // Try setting incremental on an empty database.
+        if conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;").is_ok() {
+            return Ok(());
+        }
+        // Tables already exist: VACUUM to apply the new auto-vacuum mode.
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        Ok(())
+    }
+
+    /// If the logs database still contains a geoip_cache table from the old
+    /// single-file layout, copy its rows into the dedicated geoip database and
+    /// drop the migrated table from the logs database.
+    fn migrate_geoip_cache(logs_path: &str, geoip_path: &str) -> Result<(), DynError> {
+        let logs_conn = Self::open_connection(logs_path)?;
+        let has_geoip_table: bool = logs_conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'geoip_cache')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_geoip_table {
+            return Ok(());
+        }
+
+        info!("migrating geoip_cache from logs database to dedicated geoip database");
+        Self::ensure_auto_vacuum(geoip_path)?;
+        let mut geoip_conn = Self::open_connection(geoip_path)?;
+        geoip_conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS geoip_cache (
+                ip TEXT PRIMARY KEY,
+                city TEXT,
+                asn TEXT,
+                isp TEXT,
+                proxy INTEGER,
+                hosting INTEGER,
+                expires_at INTEGER NOT NULL
+            );",
+        )?;
+        Self::ensure_geoip_migrations(&geoip_conn)?;
+
+        let mut select = logs_conn.prepare(
+            "SELECT ip, city, asn, isp, proxy, hosting, expires_at FROM geoip_cache",
+        )?;
+        let rows = select.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<bool>>(4)?,
+                row.get::<_, Option<bool>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+
+        let tx = geoip_conn.transaction()?;
+        for row in rows {
+            let (ip, city, asn, isp, proxy, hosting, expires_at) = row?;
+            tx.execute(
+                "INSERT OR REPLACE INTO geoip_cache (ip, city, asn, isp, proxy, hosting, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![ip, city, asn, isp, proxy, hosting, expires_at],
+            )?;
+        }
+        tx.commit()?;
+
+        // Drop the old table so it no longer consumes space in the logs DB.
+        logs_conn.execute("DROP TABLE IF EXISTS geoip_cache", [])?;
+        // Reclaim the freed pages immediately.
+        logs_conn.execute_batch("PRAGMA incremental_vacuum;")?;
+        info!("geoip_cache migration complete");
+        Ok(())
+    }
+
     async fn record(&self, entry: NewDnsLogEntry) -> Result<(), DynError> {
         self.log_tx
             .try_send(entry)
@@ -287,21 +416,33 @@ impl DashboardStore {
     }
 
     pub async fn fetch_logs(&self, query: LogsQuery) -> Result<PaginatedLogsResponse, DynError> {
-        let path = self.db_path.clone();
+        let path = self.logs_db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<PaginatedLogsResponse, DynError> {
             let conn = Self::open_connection(&path)?;
             let page_size = query.page_size.clamp(1, 200);
             let page = query.page.max(1);
             let pattern = like_pattern(&query.filter);
 
+            // The filter matches literal text columns and also upstream names
+            // that have been normalized to ids in upstream_ids_text.
+            let filter_sql = "client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1
+                 OR EXISTS (
+                     SELECT 1 FROM upstream_names u
+                     WHERE u.name LIKE ?1
+                       AND (' ' || upstream_ids_text || ' ') LIKE ('% ' || u.id || ' %')
+                 )";
+
             let summary = conn.query_row(
-                "SELECT
-                    COUNT(*),
-                    COUNT(DISTINCT client_ip),
-                    COALESCE(SUM(CASE WHEN lower(rcode) <> 'noerror' THEN 1 ELSE 0 END), 0),
-                    AVG(latency_ms)
-                 FROM dns_logs
-                 WHERE client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1",
+                &format!(
+                    "SELECT
+                        COUNT(*),
+                        COUNT(DISTINCT client_ip),
+                        COALESCE(SUM(CASE WHEN lower(rcode) <> 'noerror' THEN 1 ELSE 0 END), 0),
+                        AVG(latency_ms)
+                     FROM dns_logs
+                     WHERE {}",
+                    filter_sql
+                ),
                 params![pattern.clone()],
                 |row| {
                     let avg: Option<f64> = row.get(3)?;
@@ -323,15 +464,20 @@ impl DashboardStore {
             let bounded_offset = (bounded_page - 1) * page_size;
 
             let mut stmt = conn.prepare(
-                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, latency_ms, answer_ttl
-                 FROM dns_logs
-                 WHERE client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1
-                 ORDER BY id DESC
-                 LIMIT ?2 OFFSET ?3",
+                &format!(
+                    "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
+                     FROM dns_logs
+                     WHERE {}
+                     ORDER BY id DESC
+                     LIMIT ?2 OFFSET ?3",
+                    filter_sql
+                ),
             )?;
             let rows = stmt.query_map(
                 params![pattern, page_size as i64, bounded_offset as i64],
                 |row| {
+                    let upstream_ids_text: String = row.get(10)?;
+                    let upstreams_json: String = row.get(9)?;
                     Ok(DnsLogEntry {
                         id: row.get::<_, i64>(0)? as u64,
                         ts_unix_ms: row.get::<_, i64>(1)? as u64,
@@ -342,9 +488,10 @@ impl DashboardStore {
                         rcode: row.get(6)?,
                         result: row.get(7)?,
                         result_rows: parse_json_string_vec(&row.get::<_, String>(8)?),
-                        upstreams: parse_json_string_vec(&row.get::<_, String>(9)?),
-                        latency_ms: row.get::<_, i64>(10)? as u64,
-                        answer_ttl: row.get::<_, i64>(11)? as u32,
+                        upstreams: decode_upstream_names(&conn, &upstream_ids_text, &upstreams_json)
+                            .unwrap_or_default(),
+                        latency_ms: row.get::<_, i64>(11)? as u64,
+                        answer_ttl: row.get::<_, i64>(12)? as u32,
                     })
                 },
             )?;
@@ -368,7 +515,7 @@ impl DashboardStore {
     }
 
     pub async fn fetch_clients(&self) -> Result<ClientStatsResponse, DynError> {
-        let path = self.db_path.clone();
+        let path = self.logs_db_path.clone();
         let dhcp_leases = self.dhcp_leases.clone();
         tokio::task::spawn_blocking(move || -> Result<ClientStatsResponse, DynError> {
             let conn = Self::open_connection(&path)?;
@@ -425,11 +572,15 @@ impl DashboardStore {
     }
 
     pub async fn clear_logs(&self) -> Result<(), DynError> {
-        let path = self.db_path.clone();
+        let path = self.logs_db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), DynError> {
             let conn = Self::open_connection(&path)?;
             conn.execute("DELETE FROM dns_logs", [])?;
             conn.execute("DELETE FROM sqlite_sequence WHERE name='dns_logs'", [])?;
+            // Also clear the lookup table: no log rows reference these ids anymore.
+            conn.execute("DELETE FROM upstream_names", [])?;
+            // Reclaim all free pages and truncate the WAL to shrink the file.
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
             Ok(())
         })
         .await
@@ -441,7 +592,7 @@ impl DashboardStore {
     }
 
     async fn prune_expired_logs_at(&self, now: SystemTime) -> Result<u64, DynError> {
-        let path = self.db_path.clone();
+        let path = self.logs_db_path.clone();
         let cutoff_ms = dns_log_retention_cutoff_ms(now);
         tokio::task::spawn_blocking(move || -> Result<u64, DynError> {
             let conn = Self::open_connection(&path)?;
@@ -450,7 +601,13 @@ impl DashboardStore {
                 params![cutoff_ms as i64],
             )? as u64;
             if deleted > 0 {
-                conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+                // incremental_vacuum returns free pages to the filesystem when
+                // auto_vacuum=INCREMENTAL. Truncate the WAL to keep the -wal
+                // file from growing unbounded.
+                conn.execute_batch(
+                    "PRAGMA incremental_vacuum;
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )?;
             }
             Ok(deleted)
         })
@@ -459,7 +616,7 @@ impl DashboardStore {
     }
 
     pub async fn get_geoip(&self, ip: &str) -> Result<GeoIpData, DynError> {
-        let path = self.db_path.clone();
+        let path = self.geoip_db_path.clone();
 
         // Normalize the IP for caching:
         // Use full path for IPv4, but use the /64 subnet prefix for IPv6.
@@ -534,7 +691,7 @@ impl DashboardStore {
             notify.notified().await;
 
             // Retry reading from cache after another task completed it
-            let path = self.db_path.clone();
+            let path = self.geoip_db_path.clone();
             let ip_owned = ip_owned.clone();
             let retry_cached: Option<GeoIpData> = tokio::task::spawn_blocking(move || -> Result<Option<GeoIpData>, DynError> {
                 let conn = Self::open_connection(&path)?;
@@ -912,6 +1069,24 @@ pub fn default_sqlite_path(config_file: &str) -> String {
     base_dir.join("redns.db").to_string_lossy().into_owned()
 }
 
+/// Derive the dedicated GeoIP SQLite path from the logs database path.
+/// For `.../redns.db` this returns `.../redns.geoip.db`.
+fn geoip_db_path(logs_db_path: &str) -> String {
+    let path = Path::new(logs_db_path);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| "redns".into());
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy())
+        .unwrap_or_else(|| "db".into());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{stem}.geoip.{ext}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub struct DashboardDnsHandler {
     inner: Arc<dyn DnsHandler>,
     store: Arc<DashboardStore>,
@@ -968,7 +1143,7 @@ impl DnsHandler for DashboardDnsHandler {
             ),
         };
 
-        let upstreams = dedupe_keep_order(selected_upstreams.lock().clone());
+        let upstream_names = dedupe_keep_order(selected_upstreams.lock().clone());
 
         let entry = NewDnsLogEntry {
             ts_unix_ms: SystemTime::now()
@@ -980,7 +1155,7 @@ impl DnsHandler for DashboardDnsHandler {
             qname,
             qtype,
             rcode,
-            upstreams_json: serde_json::to_string(&upstreams).unwrap_or_else(|_| "[]".to_string()),
+            upstream_names,
             result: result_summary,
             result_rows_json: serde_json::to_string(&result_rows)
                 .unwrap_or_else(|_| "[]".to_string()),
@@ -1493,6 +1668,94 @@ fn dedupe_keep_order(items: Vec<String>) -> Vec<String> {
     deduped
 }
 
+/// Convert a list of upstream id numbers into the compact space-separated
+/// text form stored in `dns_logs.upstream_ids_text`.
+fn upstream_ids_to_text(ids: &[u64]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Resolve upstream display names to small integer ids, inserting new names
+/// into the `upstream_names` table as needed. A per-batch in-memory cache
+/// avoids repeated lookups for the same name.
+fn resolve_upstream_ids(
+    tx: &rusqlite::Transaction,
+    names: &[String],
+    cache: &mut HashMap<String, u64>,
+) -> Result<Vec<u64>, DynError> {
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some(id) = cache.get(name) {
+            ids.push(*id);
+            continue;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO upstream_names (name) VALUES (?1)",
+            params![name],
+        )?;
+        let id: i64 = tx.query_row(
+            "SELECT id FROM upstream_names WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        cache.insert(name.clone(), id as u64);
+        ids.push(id as u64);
+    }
+    Ok(ids)
+}
+
+/// Decode a space-separated upstream id list back to display names. Falls back
+/// to parsing `upstreams_json` for rows written before the lookup table was
+/// introduced.
+fn decode_upstream_names(
+    conn: &Connection,
+    upstream_ids_text: &str,
+    upstreams_json: &str,
+) -> Result<Vec<String>, DynError> {
+    if !upstream_ids_text.is_empty() {
+        let ids: Result<Vec<u64>, _> = upstream_ids_text
+            .split_whitespace()
+            .map(|s| s.parse::<u64>())
+            .collect();
+        if let Ok(ids) = ids {
+            return resolve_ids_to_upstream_names(conn, &ids);
+        }
+    }
+    Ok(parse_json_string_vec(upstreams_json))
+}
+
+/// Resolve a list of upstream ids to display names using the lookup table.
+fn resolve_ids_to_upstream_names(conn: &Connection, ids: &[u64]) -> Result<Vec<String>, DynError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT id, name FROM upstream_names WHERE id IN ({})",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let id_params: Vec<rusqlite::types::Value> = ids
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(*id as i64))
+        .collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(id_params.iter()), |row| {
+        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::with_capacity(ids.len());
+    for row in rows {
+        let (id, name) = row?;
+        map.insert(id, name);
+    }
+    let mut names = Vec::with_capacity(ids.len());
+    for id in ids {
+        names.push(map.get(id).cloned().unwrap_or_else(|| format!("#{id}")));
+    }
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,7 +1776,7 @@ mod tests {
             qname: qname.to_string(),
             qtype: "A".to_string(),
             rcode: "NOERROR".to_string(),
-            upstreams_json: "[\"upstream-a\"]".to_string(),
+            upstream_names: vec!["upstream-a".to_string()],
             result: "ok".to_string(),
             result_rows_json: "[]".to_string(),
             latency_ms: 12,
@@ -1521,10 +1784,15 @@ mod tests {
         }
     }
 
-    fn cleanup_db(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    fn cleanup_db(logs_path: &Path) {
+        let _ = std::fs::remove_file(logs_path);
+        let _ = std::fs::remove_file(logs_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(logs_path.with_extension("db-shm"));
+        let geoip_path_str = geoip_db_path(&logs_path.to_string_lossy());
+        let geoip_path = Path::new(&geoip_path_str);
+        let _ = std::fs::remove_file(geoip_path);
+        let _ = std::fs::remove_file(geoip_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(geoip_path.with_extension("db-shm"));
     }
 
     #[tokio::test]
