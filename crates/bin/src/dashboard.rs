@@ -162,7 +162,7 @@ impl DashboardStore {
 
                 let entries = std::mem::take(&mut batch);
                 let path_clone = path.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let handle = tokio::task::spawn_blocking(move || {
                     if let Ok(mut conn) = Self::open_connection(&path_clone)
                         && let Ok(tx) = conn.transaction()
                     {
@@ -180,7 +180,7 @@ impl DashboardStore {
                                 }
                             };
                             let upstream_ids_text = upstream_ids_to_text(&upstream_ids);
-                            let _ = tx.execute(
+                            if let Err(e) = tx.execute(
                                 "INSERT INTO dns_logs (
                                     ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
                                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -198,12 +198,18 @@ impl DashboardStore {
                                     entry.latency_ms as i64,
                                     entry.answer_ttl as i64,
                                 ],
-                            );
+                            ) {
+                                warn!(error = %e, "failed to insert dns_log row");
+                            }
                         }
-                        let _ = tx.commit();
+                        if let Err(e) = tx.commit() {
+                            warn!(error = %e, "failed to commit dns_logs batch");
+                        }
                     }
-                }).await;
-            }
+                });
+                if let Err(e) = handle.await {
+                    warn!(error = %e, "dns_logs batch writer task failed");
+                }            }
         });
 
         Ok(store)
