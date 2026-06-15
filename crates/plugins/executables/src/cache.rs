@@ -20,7 +20,7 @@ use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
@@ -49,7 +49,7 @@ pub struct CachePersistConfig {
     pub dump_interval: Duration,
 }
 
-static CACHE_REGISTRY: OnceLock<StdMutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
+static CACHE_REGISTRY: OnceLock<Mutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
 static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// A cached DNS response entry.
@@ -353,13 +353,13 @@ impl Cache {
     }
 }
 
-fn cache_registry() -> &'static StdMutex<Vec<Weak<CacheInner>>> {
-    CACHE_REGISTRY.get_or_init(|| StdMutex::new(Vec::new()))
+fn cache_registry() -> &'static Mutex<Vec<Weak<CacheInner>>> {
+    CACHE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn register_cache(inner: &Arc<CacheInner>) {
     let registry = cache_registry();
-    let mut guard = registry.lock().unwrap();
+    let mut guard = registry.lock();
     guard.retain(|cache| cache.upgrade().is_some());
     guard.push(Arc::downgrade(inner));
 }
@@ -367,7 +367,7 @@ fn register_cache(inner: &Arc<CacheInner>) {
 pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
     let caches: Vec<Arc<CacheInner>> = {
         let registry = cache_registry();
-        let mut guard = registry.lock().unwrap();
+    let mut guard = registry.lock();
         guard.retain(|cache| cache.upgrade().is_some());
         guard.iter().filter_map(|cache| cache.upgrade()).collect()
     };

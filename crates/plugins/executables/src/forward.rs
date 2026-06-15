@@ -13,7 +13,8 @@ use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -311,7 +312,7 @@ impl UpstreamSelector {
 
         // Check cache.
         {
-            let cache = self.cached_order.read().unwrap();
+            let cache = self.cached_order.read();
             if let Some((ref order, ref ts)) = *cache {
                 if ts.elapsed().as_secs() < WEIGHT_CACHE_TTL_SECS && order.len() >= count {
                     return order[..count].to_vec();
@@ -323,7 +324,7 @@ impl UpstreamSelector {
         let selected = self.weighted_sample(&scores, count);
 
         {
-            let mut cache = self.cached_order.write().unwrap();
+            let mut cache = self.cached_order.write();
             *cache = Some((selected.clone(), Instant::now()));
         }
         selected

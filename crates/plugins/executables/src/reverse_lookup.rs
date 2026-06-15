@@ -16,7 +16,7 @@ use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 /// Reverse lookup configuration.
@@ -75,7 +75,7 @@ impl ReverseLookup {
 
     /// Look up the cached domain for an IP.
     fn lookup(&self, addr: &IpAddr) -> Option<String> {
-        let cache = self.cache.read().unwrap();
+        let cache = self.cache.read();
         cache.get(addr).and_then(|entry| {
             if entry.expires > Instant::now() {
                 Some(entry.domain.clone())
@@ -93,7 +93,7 @@ impl ReverseLookup {
         // Use the query name as the canonical domain if available.
         let qname = query.queries().first().map(|q| q.name().to_ascii());
 
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write();
         for rr in response.answers() {
             let ip: Option<IpAddr> = match rr.data() {
                 RData::A(a) => Some(IpAddr::V4(a.0)),
