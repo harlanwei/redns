@@ -318,10 +318,6 @@ impl Matcher for OrMatcher {
     }
 }
 
-// Make wrappers Send + Sync (they wrap Send + Sync inner types).
-unsafe impl Send for BoxedMatcher {}
-unsafe impl Sync for BoxedMatcher {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
