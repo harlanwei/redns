@@ -114,7 +114,7 @@ pub async fn serve_tcp(
                         }
 
                         let msg_len = u16::from_be_bytes(len_buf) as usize;
-                        if msg_len == 0 || msg_len > 65535 { return; }
+                        if msg_len == 0 { return; }
 
                         let mut msg_buf = vec![0u8; msg_len];
                         match tokio::time::timeout(timeout, stream.read_exact(&mut msg_buf)).await {
