@@ -1,4 +1,4 @@
-// Copyright (C) 2025, Wei Chen
+// Copyright (C) 2026, Harlan Wei
 //
 // This file is part of redns.
 
