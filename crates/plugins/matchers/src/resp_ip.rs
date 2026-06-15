@@ -20,6 +20,16 @@ impl CidrRange {
         if let Some((addr_str, len_str)) = s.split_once('/') {
             let network: IpAddr = addr_str.parse()?;
             let prefix_len: u8 = len_str.parse()?;
+            let max_len = match network {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if prefix_len > max_len {
+                return Err(format!(
+                    "prefix length {prefix_len} is too large for {network} (max {max_len})"
+                )
+                .into());
+            }
             Ok(Self {
                 network,
                 prefix_len,
@@ -174,5 +184,14 @@ mod tests {
         });
         let ctx = Context::new(msg);
         assert!(!m.match_ctx(&ctx).unwrap());
+    }
+
+    #[test]
+    fn rejects_prefix_len_too_large() {
+        let mut m = RespIpMatcher::new();
+        assert!(m.add_cidr("10.0.0.0/33").is_err());
+        assert!(m.add_cidr("::1/129").is_err());
+        assert!(m.add_cidr("10.0.0.0/32").is_ok());
+        assert!(m.add_cidr("::1/128").is_ok());
     }
 }
