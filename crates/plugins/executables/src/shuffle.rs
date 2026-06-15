@@ -40,6 +40,9 @@ impl Executable for Shuffle {
             if self.ns {
                 shuffle_slice(resp.name_servers_mut());
             }
+            if self.extra {
+                shuffle_slice(resp.additionals_mut());
+            }
         }
         Ok(())
     }
@@ -93,5 +96,36 @@ mod tests {
         ctx.set_response(Some(resp));
         s.exec(&mut ctx).await.unwrap();
         assert_eq!(ctx.response().unwrap().answers().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn shuffle_extra_section() {
+        let s = Shuffle {
+            answer: false,
+            ns: false,
+            extra: true,
+        };
+        let mut msg = Message::new();
+        msg.set_id(1)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query);
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("example.com.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        let mut ctx = Context::new(msg);
+        let mut resp = Message::new();
+        for i in 0..5 {
+            resp.add_additional(Record::from_rdata(
+                Name::from_ascii("example.com.").unwrap(),
+                300,
+                RData::A(Ipv4Addr::new(10, 0, 0, i).into()),
+            ));
+        }
+        ctx.set_response(Some(resp));
+        s.exec(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response().unwrap().additionals().len(), 5);
     }
 }
