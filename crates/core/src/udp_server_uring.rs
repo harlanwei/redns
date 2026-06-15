@@ -260,6 +260,26 @@ impl RecvCtx {
 }
 
 // ---------------------------------------------------------------------------
+// Multishot template context
+// ---------------------------------------------------------------------------
+
+/// Backing storage for the multishot `RecvMsgMulti` template `msghdr`.
+///
+/// The kernel keeps a reference to the `iovec` for the lifetime of the
+/// multishot request, so the `iovec` itself (not just the buffer it points
+/// to) must live at a stable address. Boxing the whole template guarantees
+/// that: the `msghdr.msg_iov` pointer wired in `setup_multishot` stays valid
+/// until the server is dropped.
+#[cfg(target_os = "linux")]
+struct MultishotTemplate {
+    iovec: libc::iovec,
+    _iov_buf: Box<[u8; MAX_UDP_SIZE]>,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MultishotTemplate {}
+
+// ---------------------------------------------------------------------------
 // Send context
 // ---------------------------------------------------------------------------
 
@@ -456,8 +476,10 @@ pub struct UringUdpServer {
     buf_ring: Option<BufRing>,
     /// Multishot: template msghdr submitted with RecvMsgMulti.
     msghdr_template: Option<libc::msghdr>,
-    /// Multishot: dummy iov_base for the msghdr template.
-    _iov_buf: Option<Box<[u8; MAX_UDP_SIZE]>>,
+    /// Multishot: heap-allocated backing storage (`iovec` + dummy buffer)
+    /// that `msghdr_template.msg_iov` points into. Kept alive for the
+    /// lifetime of the server so the kernel never sees a dangling pointer.
+    multishot_template: Option<Box<MultishotTemplate>>,
     /// Multishot: whether the multishot SQE is still active (has MORE pending).
     multishot_active: bool,
     /// Running tail counter for buffer recycling.
@@ -497,7 +519,7 @@ impl UringUdpServer {
             shutdown: Arc::new(AtomicBool::new(false)),
             buf_ring: None,
             msghdr_template: None,
-            _iov_buf: None,
+            multishot_template: None,
             multishot_active: false,
             buf_tail: 0,
             multishot,
@@ -512,21 +534,28 @@ impl UringUdpServer {
     fn setup_multishot(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let buf_ring = BufRing::new(&self.ring, BUF_GROUP_ID, NUM_BUFFERS)?;
 
-        // Dummy iov – kernel writes to provided buffers, not to this.
-        let mut iov_buf = Box::new([0u8; MAX_UDP_SIZE]);
-        let mut iovec = libc::iovec {
-            iov_base: iov_buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: MAX_UDP_SIZE,
-        };
+        // Heap-allocate the template so the `iovec` (which `msghdr.msg_iov`
+        // will point at) gets a stable address for the server's lifetime.
+        // The kernel writes incoming datagrams into the provided buffer ring,
+        // not into `_iov_buf`; the buffer exists only so `iovec.iov_base` is
+        // a valid (writable) pointer if the kernel ever consults it.
+        let mut template = Box::new(MultishotTemplate {
+            iovec: libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: MAX_UDP_SIZE,
+            },
+            _iov_buf: Box::new([0u8; MAX_UDP_SIZE]),
+        });
+        template.iovec.iov_base = template._iov_buf.as_mut_ptr() as *mut libc::c_void;
 
         let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
         msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        msghdr.msg_iov = &mut iovec as *mut _;
+        msghdr.msg_iov = &mut template.iovec as *mut _;
         msghdr.msg_iovlen = 1;
 
         self.buf_ring = Some(buf_ring);
         self.msghdr_template = Some(msghdr);
-        self._iov_buf = Some(iov_buf);
+        self.multishot_template = Some(template);
         self.multishot_active = false;
         self.buf_tail = 0;
 
