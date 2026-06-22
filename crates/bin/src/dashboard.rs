@@ -1327,45 +1327,48 @@ async fn handle_dashboard_request(
             .await?;
         }
         ("GET", _) => {
-            let mut file_path = PathBuf::from(&state.static_dir);
-            let mut rel_path = path.trim_start_matches('/');
-            if rel_path.is_empty() {
-                rel_path = "index.html";
-            }
-            file_path.push(rel_path);
+            // Resolve the requested path under the static dir, rejecting anything
+            // that escapes it. The request `path` is attacker-controlled (taken
+            // straight from the HTTP request line, so browsers' `..` collapsing
+            // does not apply); without containment enforcement a raw request
+            // like `GET /../../../../etc/passwd` would read and return any file
+            // the process can access. Canonicalize both the base and the target
+            // and require the target to live inside the base.
+            let base = PathBuf::from(&state.static_dir);
+            let rel_path = path.trim_start_matches('/');
+            let target = if rel_path.is_empty() {
+                base.join("index.html")
+            } else {
+                base.join(rel_path)
+            };
 
             let mut file_contents = vec![];
-            let content_type = mime_guess::from_path(&file_path)
+            let content_type = mime_guess::from_path(&target)
                 .first_or_octet_stream()
                 .to_string();
 
-            match tokio::fs::File::open(&file_path).await {
-                Ok(mut file) => {
-                    file.read_to_end(&mut file_contents).await?;
+            let served = serve_contained_file(&target, &base, &mut file_contents).await;
+            match served {
+                Some(ServedFile::File) => {
                     write_response(&mut stream, "200 OK", &content_type, &file_contents).await?;
                 }
-                Err(_) => {
-                    // SPA fallback: Serve index.html if file isn't found
-                    let mut index_path = PathBuf::from(&state.static_dir);
-                    index_path.push("index.html");
-                    if let Ok(mut file) = tokio::fs::File::open(&index_path).await {
-                        file.read_to_end(&mut file_contents).await?;
-                        write_response(
-                            &mut stream,
-                            "200 OK",
-                            "text/html; charset=utf-8",
-                            &file_contents,
-                        )
-                        .await?;
-                    } else {
-                        write_response(
-                            &mut stream,
-                            "404 Not Found",
-                            "application/json; charset=utf-8",
-                            b"{\"error\":\"not found\"}",
-                        )
-                        .await?;
-                    }
+                Some(ServedFile::SpaFallback) => {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        &file_contents,
+                    )
+                    .await?;
+                }
+                None => {
+                    write_response(
+                        &mut stream,
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        b"{\"error\":\"not found\"}",
+                    )
+                    .await?;
                 }
             }
         }
@@ -1494,6 +1497,78 @@ async fn write_response(
     stream.write_all(resp.as_bytes()).await?;
     stream.write_all(body).await?;
     Ok(())
+}
+
+/// Outcome of a static-file request.
+enum ServedFile {
+    /// A file was read into `out`.
+    File,
+    /// The file was missing; the SPA `index.html` was served instead.
+    SpaFallback,
+}
+
+/// Read `target` into `out` only if it resolves to a path inside `base`.
+///
+/// `target` is derived from the (attacker-controlled) request path, so the
+/// request can contain `..` segments that the kernel would honor at `open()`
+/// time — e.g. `GET /../../etc/passwd` would otherwise read a file outside the
+/// static dir. We canonicalize both paths and reject any target that does not
+/// start with the canonical base. Symlinks inside the base are fine because
+/// their canonicalized form is what we check.
+///
+/// On a missing-but-contained file, serves the SPA `index.html` fallback
+/// (also containment-checked). Returns `None` if nothing can be served.
+async fn serve_contained_file(
+    target: &Path,
+    base: &Path,
+    out: &mut Vec<u8>,
+) -> Option<ServedFile> {
+    // Canonicalizing the base fails if it doesn't exist; fall back to a
+    // lexically-normalized form so a missing static dir still yields a 404
+    // rather than a 500.
+    let base_canon = tokio::fs::canonicalize(base)
+        .await
+        .unwrap_or_else(|_| base.to_path_buf());
+
+    if read_contained(target, &base_canon, out).await {
+        return Some(ServedFile::File);
+    }
+
+    // SPA fallback: serve index.html from the base root.
+    let index = base.join("index.html");
+    if read_contained(&index, &base_canon, out).await {
+        return Some(ServedFile::SpaFallback);
+    }
+
+    None
+}
+
+/// Read `path` into `out` only if it resolves to a location inside `base_canon`.
+///
+/// The target path is derived from an attacker-controlled request line, so it
+/// may contain `..` segments the kernel would honor at `open()` time. We
+/// canonicalize the parent directory and re-append the file name (this resolves
+/// any symlinks in the directory portion while tolerating a not-yet-existing
+/// final component), then require the resolved path to live under the base.
+async fn read_contained(path: &Path, base_canon: &Path, out: &mut Vec<u8>) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+
+    let parent_canon = match tokio::fs::canonicalize(parent).await {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let resolved = parent_canon.join(file_name);
+    if !resolved.starts_with(base_canon) {
+        return false;
+    }
+    let mut f = match tokio::fs::File::open(&resolved).await {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    f.read_to_end(out).await.is_ok()
 }
 
 fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
@@ -2081,5 +2156,91 @@ fd00::dead dev br-lan FAILED
         // fd00::99:1111 was already in dhcp_map, should NOT be overwritten
         let existing = dhcp_map.get("fd00::99:1111").unwrap();
         assert!(existing.mac.is_none()); // original had no MAC
+    }
+
+    /// Set up a temp static dir with index.html, app.js, and a sibling secret
+    /// file outside the dir, returning (static_dir, outside_secret_path).
+    fn make_static_dir() -> (PathBuf, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("redns-static-{unique}"));
+        let static_dir = root.join("dist");
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(static_dir.join("index.html"), "<html>spa</html>").unwrap();
+        std::fs::write(static_dir.join("app.js"), "console.log('app');").unwrap();
+
+        // A sensitive file that lives *outside* the static dir.
+        let outside = root.join("secret.txt");
+        std::fs::write(&outside, "TOPSECRET").unwrap();
+
+        (static_dir, outside)
+    }
+
+    #[tokio::test]
+    async fn serve_contained_file_serves_file_inside_static_dir() {
+        let (static_dir, _outside) = make_static_dir();
+        let mut out = Vec::new();
+        let served =
+            serve_contained_file(&static_dir.join("app.js"), &static_dir, &mut out).await;
+        assert!(matches!(served, Some(ServedFile::File)));
+        assert_eq!(&out, b"console.log('app');");
+        std::fs::remove_dir_all(static_dir.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn serve_contained_file_falls_back_to_index_for_missing() {
+        let (static_dir, _outside) = make_static_dir();
+        let mut out = Vec::new();
+        let served =
+            serve_contained_file(&static_dir.join("does-not-exist.js"), &static_dir, &mut out)
+                .await;
+        assert!(matches!(served, Some(ServedFile::SpaFallback)));
+        assert_eq!(&out, b"<html>spa</html>");
+        std::fs::remove_dir_all(static_dir.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn serve_contained_file_blocks_traversal_to_outside_file() {
+        let (static_dir, outside) = make_static_dir();
+
+        // The exact attack: a request line path with `..` segments pointing at
+        // the secret file outside the static dir. `base.join` does not collapse
+        // the `..`, so the kernel would honor it at open() time. The guard must
+        // refuse to read it.
+        let target = static_dir.join("../../secret.txt");
+        assert!(target.ends_with("secret.txt") || target.to_string_lossy().contains("secret.txt"));
+
+        let mut out = Vec::new();
+        let served = serve_contained_file(&target, &static_dir, &mut out).await;
+
+        // Must NOT serve the secret bytes. Because `index.html` exists, the SPA
+        // fallback kicks in — but crucially the secret file is never returned.
+        assert!(out != b"TOPSECRET", "traversal leaked the outside file");
+        // Either the SPA fallback is served, or nothing is served.
+        assert!(matches!(served, Some(ServedFile::SpaFallback) | None));
+
+        // The outside file still exists (we never deleted it); confirm we could
+        // not read it via the static handler.
+        std::fs::remove_dir_all(outside.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn serve_contained_file_404_when_nothing_servable() {
+        // Static dir with no index.html and a missing target → no fallback.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let static_dir = std::env::temp_dir().join(format!("redns-static-empty-{unique}"));
+        std::fs::create_dir_all(&static_dir).unwrap();
+
+        let mut out = Vec::new();
+        let served =
+            serve_contained_file(&static_dir.join("missing.js"), &static_dir, &mut out).await;
+        assert!(matches!(served, None));
+        assert!(out.is_empty());
+        std::fs::remove_dir_all(&static_dir).ok();
     }
 }
