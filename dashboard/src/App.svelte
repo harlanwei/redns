@@ -5,11 +5,12 @@
   import UpstreamsView from './lib/components/UpstreamsView.svelte';
   import CacheView from './lib/components/CacheView.svelte';
   import type { TabId } from './lib/types/dashboard';
+  import { initTheme } from './lib/utils/theme.svelte';
 
   let activeTab = $state<TabId>('logs');
 </script>
 
-<div class="min-h-screen bg-gray-50 flex flex-col font-sans">
+<div class="min-h-screen flex flex-col font-sans">
   <TopNav {activeTab} onTabChange={(tab) => (activeTab = tab)} />
 
   <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
