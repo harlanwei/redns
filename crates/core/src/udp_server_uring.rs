@@ -751,8 +751,20 @@ impl UringUdpServer {
                 if result < 0 {
                     warn!(result = result, "io_uring operation failed");
                     if self.multishot {
-                        // Only sends have non-zero user_data in multishot mode.
-                        if let Some(idx) = send_slab_idx(user_data) {
+                        if user_data == 0 {
+                            // The multishot recv itself errored. An error CQE
+                            // terminates the multishot operation just like a
+                            // non-MORE completion, so without re-arming here the
+                            // server would never receive another datagram on
+                            // this socket. Unlike process_multishot_cqe there is
+                            // no provided-buffer to recycle (the kernel did not
+                            // hand one back on an error), so just submit a fresh
+                            // RecvMsgMulti.
+                            self.multishot_active = false;
+                            if let Err(e) = self.submit_multishot_recv() {
+                                error!(error = %e, "failed to re-arm multishot recvmsg after error");
+                            }
+                        } else if let Some(idx) = send_slab_idx(user_data) {
                             self.send_ctxs.remove(idx);
                         }
                     } else if is_recv_completion(user_data) {
