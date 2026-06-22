@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 redns-core = { path = "../../core" }
 hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
-dashmap = "6"
 ipnet = "2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

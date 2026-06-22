@@ -329,13 +329,6 @@ fn register_builtins(builder: &mut ChainBuilder) {
         ),
     );
     builder.register_matcher(
-        "rate_limiter",
-        Box::new(|args: &str| {
-            let cfg = redns_matchers::rate_limiter::RateLimiterConfig::from_str_args(args)?;
-            Ok(Box::new(RateLimiter::new(cfg)) as Box<dyn Matcher>)
-        }),
-    );
-    builder.register_matcher(
         "env",
         Box::new(|args: &str| Ok(Box::new(EnvMatcher::from_str_args(args)) as Box<dyn Matcher>)),
     );
