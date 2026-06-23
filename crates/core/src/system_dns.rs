@@ -15,12 +15,25 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! System DNS fallback resolution via Ethernet interface.
+//! System DNS fallback resolution via the upstream (Internet) interface.
 //!
-//! When the plugin chain produces a SERVFAIL response, this module provides
-//! a fallback that reads the system DNS servers from `/etc/resolv.conf`,
-//! discovers an active Ethernet interface, and sends the query directly
-//! through that interface.
+//! When the plugin chain produces a SERVFAIL response, this module forwards the
+//! query to the DNS servers assigned to the WAN / Internet network interface —
+//! the ones obtained over DHCP or PPP from the ISP.
+//!
+//! # Where the WAN servers live
+//!
+//! On OpenWrt (the target platform) `/etc/resolv.conf` points at the *local*
+//! resolver — typically `nameserver 127.0.0.1`, which is this very program.
+//! Reading it and forwarding there would loop straight back into ourselves. The
+//! DHCP/PPP-assigned upstream servers are instead written to
+//! `/tmp/resolv.conf.d/resolv.conf.auto`. We therefore read that file first and,
+//! on any platform, skip loopback nameservers so the fallback can never query
+//! itself.
+//!
+//! The query is sent with the OS picking the route, so it naturally egresses the
+//! interface that owns the route to each WAN DNS server. No interface-name
+//! guessing or source-address pinning is needed.
 
 use crate::plugin::PluginResult;
 use hickory_proto::op::{Message, ResponseCode};
@@ -28,7 +41,7 @@ use std::io::BufRead;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Default timeout for system DNS queries.
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,38 +49,28 @@ const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum DNS UDP payload size for receiving.
 const MAX_UDP_SIZE: usize = 4096;
 
-/// Interface name prefixes that identify Ethernet (wired) interfaces.
-/// Covers traditional names (`eth*`) and systemd Predictable Network
-/// Interface Names (`en*` for Ethernet, `em*` for on-board, `p*` for
-/// PCI hotplug slots).
-const ETHERNET_PREFIXES: &[&str] = &["eth", "en", "em", "p"];
+/// Candidate `resolv.conf` files, in priority order.
+///
+/// On OpenWrt the WAN-assigned (DHCP/PPP) DNS servers are written to
+/// `resolv.conf.auto`, while `/etc/resolv.conf` points at the local resolver
+/// (`127.0.0.1`) — i.e. this program. We must read the WAN list, not the local
+/// one, or the fallback would loop back into ourselves. `/etc/resolv.conf` is
+/// kept last as a fallback for non-OpenWrt hosts; its loopback entries are
+/// filtered out by [`system_nameservers`].
+const RESOLV_CONF_PATHS: &[&str] = &[
+    "/tmp/resolv.conf.d/resolv.conf.auto",
+    "/tmp/resolv.conf.auto",
+    "/etc/resolv.conf",
+];
 
-/// Returns the first active, non-loopback, non-link-local IPv4 address
-/// whose interface name matches an Ethernet prefix.
-fn find_ethernet_interface_ip() -> Option<IpAddr> {
-    let ifaddrs = nix::ifaddrs::getifaddrs().ok()?;
-    for ifaddr in ifaddrs {
-        let name = ifaddr.interface_name.as_str();
-        if !ETHERNET_PREFIXES.iter().any(|p| name.starts_with(p)) {
-            continue;
-        }
-        if let Some(ipv4) = ifaddr.address.as_ref().and_then(|a| a.as_sockaddr_in()).map(|s| s.ip()) {
-            let ip = IpAddr::V4(ipv4);
-            if !ip.is_loopback() && !ip.is_unspecified() {
-                debug!(interface = %name, ip = %ip, "found Ethernet interface");
-                return Some(ip);
-            }
-        }
-    }
-    None
-}
-
-/// Parses `/etc/resolv.conf` and returns the list of nameserver IP addresses.
-fn parse_resolv_conf() -> Vec<IpAddr> {
-    let file = match std::fs::File::open("/etc/resolv.conf") {
+/// Parses a `resolv.conf`-format file and returns its `nameserver` IPs.
+///
+/// A missing file yields an empty list (expected — we probe several paths).
+fn parse_resolv_conf(path: &str) -> Vec<IpAddr> {
+    let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            warn!(error = %e, "failed to open /etc/resolv.conf");
+            debug!(error = %e, path, "resolv.conf not readable");
             return Vec::new();
         }
     };
@@ -86,15 +89,54 @@ fn parse_resolv_conf() -> Vec<IpAddr> {
         .collect()
 }
 
-/// Sends a DNS query wire message to a nameserver via UDP, bound to the
-/// given source IP, and returns the parsed response message.
+/// Returns the WAN/Internet-assigned DNS servers to use for the fallback.
+///
+/// Probes [`RESOLV_CONF_PATHS`] in order and returns the nameservers from the
+/// first file that yields at least one usable (non-loopback) entry. Loopback
+/// servers are dropped so the fallback never queries this resolver itself, and
+/// duplicates are removed while preserving order.
+fn system_nameservers() -> Vec<IpAddr> {
+    for path in RESOLV_CONF_PATHS {
+        let mut seen: Vec<IpAddr> = Vec::new();
+        for ip in parse_resolv_conf(path) {
+            // Skip loopback: on OpenWrt /etc/resolv.conf points at 127.0.0.1,
+            // which is this program — forwarding there would loop.
+            if ip.is_loopback() {
+                continue;
+            }
+            if !seen.contains(&ip) {
+                seen.push(ip);
+            }
+        }
+        if !seen.is_empty() {
+            debug!(path, count = seen.len(), "using WAN DNS servers for fallback");
+            return seen;
+        }
+    }
+    Vec::new()
+}
+
+/// Sends a DNS query wire message to a nameserver via UDP and returns the parsed
+/// response.
+///
+/// The socket binds to the unspecified address (matching the nameserver's
+/// family) and lets the OS route the datagram, so it egresses whichever
+/// interface owns the route to `nameserver` — for WAN-assigned servers, the
+/// Internet interface.
 async fn resolve_via_udp(
     query_wire: &[u8],
     nameserver: IpAddr,
-    source_ip: IpAddr,
     timeout: Duration,
 ) -> PluginResult<Message> {
-    let bind_addr = SocketAddr::new(source_ip, 0);
+    let bind_addr: SocketAddr = if nameserver.is_ipv4() {
+        "0.0.0.0:0"
+            .parse()
+            .expect("hardcoded IPv4 bind address is valid")
+    } else {
+        "[::]:0"
+            .parse()
+            .expect("hardcoded IPv6 bind address is valid")
+    };
     let ns_addr = SocketAddr::new(nameserver, 53);
 
     let sock = UdpSocket::bind(bind_addr).await.map_err(
@@ -135,13 +177,15 @@ async fn resolve_via_udp(
     )
 }
 
-/// Attempts to resolve a DNS query using the system DNS server(s) read from
-/// `/etc/resolv.conf`, sending the query through the first available Ethernet
-/// interface.
+/// Attempts to resolve a DNS query using the WAN/Internet-assigned DNS servers.
 ///
-/// Returns `Ok(Some(response))` if a successful (non-SERVFAIL) answer is
-/// obtained, `Ok(None)` if no Ethernet interface or nameserver is available,
-/// or `Err` if all nameservers fail.
+/// The servers come from the upstream interface's `resolv.conf` (DHCP/PPP),
+/// preferring OpenWrt's `resolv.conf.auto` over `/etc/resolv.conf` and skipping
+/// loopback entries (see [`system_nameservers`]).
+///
+/// Returns `Ok(Some(response))` if a nameserver returns a usable answer
+/// (`NoError` or `NXDomain`), `Ok(None)` if no WAN nameserver is available, or
+/// `Err` only if the query cannot be serialized.
 pub async fn system_fallback_resolve(query: &Message) -> PluginResult<Option<Message>> {
     let query_wire = match query.to_vec() {
         Ok(w) => w,
@@ -151,25 +195,18 @@ pub async fn system_fallback_resolve(query: &Message) -> PluginResult<Option<Mes
         }
     };
 
-    let source_ip = match find_ethernet_interface_ip() {
-        Some(ip) => ip,
-        None => {
-            debug!("no Ethernet interface found for system DNS fallback");
-            return Ok(None);
-        }
-    };
-
-    let nameservers = parse_resolv_conf();
+    let nameservers = system_nameservers();
     if nameservers.is_empty() {
-        debug!("no nameservers found in /etc/resolv.conf");
+        debug!("no WAN DNS servers available for system fallback");
         return Ok(None);
     }
 
     for ns in &nameservers {
-        debug!(nameserver = %ns, source = %source_ip, "attempting system DNS fallback");
-        match resolve_via_udp(&query_wire, *ns, source_ip, SYSTEM_DNS_TIMEOUT).await {
-            Ok(resp) if resp.response_code() == ResponseCode::NoError
-                || resp.response_code() == ResponseCode::NXDomain =>
+        debug!(nameserver = %ns, "attempting system DNS fallback");
+        match resolve_via_udp(&query_wire, *ns, SYSTEM_DNS_TIMEOUT).await {
+            Ok(resp)
+                if resp.response_code() == ResponseCode::NoError
+                    || resp.response_code() == ResponseCode::NXDomain =>
             {
                 debug!(nameserver = %ns, rcode = ?resp.response_code(), "system DNS fallback succeeded");
                 return Ok(Some(resp));
@@ -189,61 +226,65 @@ pub async fn system_fallback_resolve(query: &Message) -> PluginResult<Option<Mes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// Write `contents` to a unique temp file and return its path.
+    fn temp_resolv(contents: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "redns-resolv-test-{}-{}.conf",
+            std::process::id(),
+            // A cheap per-call discriminator.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        path
+    }
 
     #[test]
     fn parse_resolv_conf_valid() {
-        let input = b"# comment\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n";
-        let lines: Vec<_> = std::io::BufReader::new(&input[..])
-            .lines()
-            .filter_map(|l| {
-                let l = l.ok()?;
-                let l = l.trim();
-                if !l.starts_with("nameserver") {
-                    return None;
-                }
-                l["nameserver".len()..].trim().parse::<IpAddr>().ok()
-            })
-            .collect();
+        let path = temp_resolv("# comment\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+        let servers = parse_resolv_conf(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
 
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "8.8.8.8".parse::<IpAddr>().unwrap());
-        assert_eq!(lines[1], "8.8.4.4".parse::<IpAddr>().unwrap());
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0], "8.8.8.8".parse::<IpAddr>().unwrap());
+        assert_eq!(servers[1], "8.8.4.4".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn parse_resolv_conf_skips_comments_and_invalid() {
-        let input = b"# nameserver 1.2.3.4\nsearch example.com\nnameserver not-an-ip\nnameserver 1.1.1.1\n";
-        let lines: Vec<_> = std::io::BufReader::new(&input[..])
-            .lines()
-            .filter_map(|l| {
-                let l = l.ok()?;
-                let l = l.trim();
-                if !l.starts_with("nameserver") {
-                    return None;
-                }
-                l["nameserver".len()..].trim().parse::<IpAddr>().ok()
-            })
-            .collect();
+        let path = temp_resolv(
+            "# nameserver 1.2.3.4\nsearch example.com\nnameserver not-an-ip\nnameserver 1.1.1.1\n",
+        );
+        let servers = parse_resolv_conf(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
 
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], "1.1.1.1".parse::<IpAddr>().unwrap());
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0], "1.1.1.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
-    fn parse_resolv_conf_empty() {
-        let input = b"# no nameservers\n";
-        let lines: Vec<_> = std::io::BufReader::new(&input[..])
-            .lines()
-            .filter_map(|l| {
-                let l = l.ok()?;
-                let l = l.trim();
-                if !l.starts_with("nameserver") {
-                    return None;
-                }
-                l["nameserver".len()..].trim().parse::<IpAddr>().ok()
-            })
-            .collect();
+    fn parse_resolv_conf_missing_file_is_empty() {
+        let servers = parse_resolv_conf("/nonexistent/redns/resolv.conf");
+        assert!(servers.is_empty());
+    }
 
-        assert!(lines.is_empty());
+    #[test]
+    fn parse_resolv_conf_parses_ipv6() {
+        let path = temp_resolv("nameserver 2001:4860:4860::8888\n");
+        let servers = parse_resolv_conf(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0],
+            "2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        );
     }
 }

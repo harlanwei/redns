@@ -22,7 +22,6 @@ h3-quinn = "0.0.10"
 http = "1.4.0"
 bytes = "1.11.1"
 parking_lot = "0.12"
-nix = { version = "0.31", features = ["net"] }
 
 # io_uring support for UDP server (Linux-only)
 [target.'cfg(target_os = "linux")'.dependencies]
