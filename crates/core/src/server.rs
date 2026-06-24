@@ -63,8 +63,10 @@ pub trait DnsHandler: Send + Sync {
 /// - If the executable returns an error → SERVFAIL response.
 /// - If the executable returns Ok but sets no response → NOERROR response.
 /// - The response's `RecursionAvailable` flag is always set (forwarder assumption).
-/// - When `best_effort` is enabled, SERVFAIL responses trigger a fallback
-///   attempt via the system DNS over the Ethernet interface.
+/// - When `best_effort` is enabled, the query is retried against the
+///   WAN-assigned system DNS as a last resort — but only when every upstream
+///   either returned SERVFAIL or could not be reached at all. Any other result
+///   (NOERROR, NXDOMAIN, REFUSED, …) is a real answer and is never second-guessed.
 pub struct EntryHandler {
     entry: Arc<dyn Executable>,
     best_effort: bool,
@@ -129,7 +131,22 @@ impl DnsHandler for EntryHandler {
         let served_from_cache =
             result.is_ok() && ctx.response().is_some() && ctx.has_mark(MARK_CACHE_HIT);
 
-        let is_servfail = match &result {
+        // Best-effort system DNS is a *last resort*: it fires only when the
+        // entire upstream strategy produced nothing usable — every upstream
+        // either answered SERVFAIL or could not be reached at all.
+        //
+        // - A chain `Err` means no response came back from any upstream
+        //   (timeouts / transport failures across the board, e.g. the
+        //   "no valid response from primary or secondary" exhaustion). That is
+        //   the "connection problems with all upstreams" case.
+        // - An `Ok(())` carrying a SERVFAIL rcode means the upstreams were
+        //   reached but all of them returned SERVFAIL.
+        //
+        // Any other outcome — NOERROR, NXDOMAIN, REFUSED, etc. — is a real
+        // answer from an upstream and must never be second-guessed against the
+        // system (ISP) resolver, otherwise queries would leak out of the
+        // encrypted upstreams on ordinary results.
+        let all_upstreams_failed = match &result {
             Err(_) => true,
             Ok(()) => ctx
                 .response()
@@ -148,7 +165,7 @@ impl DnsHandler for EntryHandler {
             }
         };
 
-        if is_servfail && self.best_effort {
+        if all_upstreams_failed && self.best_effort {
             match tokio::time::timeout(
                 DEFAULT_QUERY_TIMEOUT,
                 system_fallback_resolve(&query),
