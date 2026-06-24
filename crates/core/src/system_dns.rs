@@ -17,9 +17,14 @@
 
 //! System DNS fallback resolution via the upstream (Internet) interface.
 //!
-//! When the plugin chain produces a SERVFAIL response, this module forwards the
-//! query to the DNS servers assigned to the WAN / Internet network interface —
-//! the ones obtained over DHCP or PPP from the ISP.
+//! When the plugin chain produces no response at all — every upstream timed
+//! out or hit a transport failure — this module forwards the query to the DNS
+//! servers assigned to the WAN / Internet network interface (the ones obtained
+//! over DHCP or PPP from the ISP). It is never invoked when an upstream
+//! *produced* a response (including SERVFAIL): that is treated as
+//! authoritative, since a SERVFAIL may be a validating upstream rejecting a
+//! DNSSEC-bogus answer, and re-resolving it through a non-validating resolver
+//! would defeat DNSSEC and leak the query.
 //!
 //! # Where the WAN servers live
 //!

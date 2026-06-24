@@ -11,6 +11,10 @@
 //! - If `always_standby` is true, the secondary starts immediately alongside
 //!   the primary but only its result is used if the primary fails/times out.
 //! - Uses the first valid (non-None) response.
+//! - A SERVFAIL is treated as a terminal answer, not retried against the
+//!   secondary: it is how a validating upstream rejects a DNSSEC-bogus
+//!   response, and re-resolving it would defeat DNSSEC and leak the qname.
+//!   Only `Refused` (and a missing response) fall through to the other branch.
 
 use hickory_proto::op::{Message, ResponseCode};
 use redns_core::context::{Context, KV_SELECTED_UPSTREAM};
@@ -84,10 +88,22 @@ fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
     }
 }
 
+/// Evaluates a branch's response and, if usable, writes it into `ctx`.
+///
+/// Returns `true` (accepted) when the response is usable and has been written
+/// into `ctx`, so the fallback can stop. Returns `false` (rejected) when there
+/// is no response or the response warrants trying the other branch.
+///
+/// A SERVFAIL is *accepted* — treated as a terminal answer, not retried against
+/// the secondary. SERVFAIL is how a validating upstream rejects a DNSSEC-bogus
+/// answer, and re-resolving it (via the secondary or the outer best-effort
+/// system-DNS fallback) would serve a record the upstream refused to vouch for,
+/// defeating DNSSEC and leaking the qname. Only `Refused` (and a missing
+/// response) fall through to the other branch.
 fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
     if let Some(resp) = outcome.response {
         let rcode = resp.response_code();
-        if rcode == ResponseCode::Refused || rcode == ResponseCode::ServFail {
+        if rcode == ResponseCode::Refused {
             return false;
         }
         ctx.set_response(Some(resp));
@@ -272,5 +288,137 @@ impl Executable for Fallback {
         }
 
         Err("fallback: no valid response from primary or secondary".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+    use redns_core::plugin::Executable;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_query() -> Message {
+        let mut msg = Message::new();
+        msg.set_id(1)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query);
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("example.com.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        msg
+    }
+
+    /// Builds a response with the given rcode for `query`.
+    fn resp_with_rcode(query: &Message, rcode: ResponseCode) -> Message {
+        let mut resp = Message::new();
+        resp.set_id(query.id());
+        resp.set_message_type(MessageType::Response);
+        resp.set_response_code(rcode);
+        if let Some(q) = query.queries().first() {
+            resp.add_query(q.clone());
+        }
+        resp
+    }
+
+    /// Executable that sets a fixed pre-built response on the context and
+    /// counts how many times it ran.
+    struct FixedResp {
+        resp: Message,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Executable for FixedResp {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut resp = self.resp.clone();
+            resp.set_id(ctx.query().id());
+            ctx.set_response(Some(resp));
+            Ok(())
+        }
+    }
+
+    /// Executable that returns a NOERROR response with an A record, counting
+    /// invocations.
+    struct OkResp {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Executable for OkResp {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let q = ctx.question().unwrap().clone();
+            let mut resp = Message::new();
+            resp.set_id(ctx.query().id());
+            resp.set_message_type(MessageType::Response);
+            resp.set_response_code(ResponseCode::NoError);
+            resp.add_query(q);
+            ctx.set_response(Some(resp));
+            Ok(())
+        }
+    }
+
+    /// A SERVFAIL from the primary must be adopted as a terminal answer: the
+    /// secondary is never consulted, and the SERVFAIL flows back to the caller
+    /// (rather than the chain erroring out). SERVFAIL is how a validating
+    /// upstream rejects a DNSSEC-bogus response, so re-resolving it via the
+    /// secondary would defeat DNSSEC.
+    #[tokio::test]
+    async fn servfail_primary_is_terminal() {
+        let q = make_query();
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let primary: Arc<dyn Executable> = Arc::new(FixedResp {
+            resp: resp_with_rcode(&q, ResponseCode::ServFail),
+            calls: primary_calls.clone(),
+        });
+        let secondary: Arc<dyn Executable> = Arc::new(OkResp {
+            calls: secondary_calls.clone(),
+        });
+        let fb = Fallback::new(primary, secondary, Duration::from_millis(0), false);
+
+        let mut ctx = Context::new(q);
+        // It must succeed (not return the "no valid response" error).
+        fb.exec(&mut ctx).await.expect("SERVFAIL should be adopted");
+        assert_eq!(primary_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            secondary_calls.load(Ordering::Relaxed),
+            0,
+            "secondary must not be consulted when primary is a SERVFAIL"
+        );
+        let resp = ctx.response().expect("response set");
+        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+    }
+
+    /// A REFUSED from the primary is NOT terminal — the secondary is
+    /// consulted, and its NOERROR is adopted.
+    #[tokio::test]
+    async fn refused_primary_falls_through_to_secondary() {
+        let q = make_query();
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let primary: Arc<dyn Executable> = Arc::new(FixedResp {
+            resp: resp_with_rcode(&q, ResponseCode::Refused),
+            calls: primary_calls.clone(),
+        });
+        let secondary: Arc<dyn Executable> = Arc::new(OkResp {
+            calls: secondary_calls.clone(),
+        });
+        let fb = Fallback::new(primary, secondary, Duration::from_millis(0), false);
+
+        let mut ctx = Context::new(q);
+        fb.exec(&mut ctx).await.expect("secondary NOERROR adopted");
+        assert_eq!(primary_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            secondary_calls.load(Ordering::Relaxed),
+            1,
+            "secondary must be tried after a REFUSED primary"
+        );
+        let resp = ctx.response().expect("response set");
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
     }
 }

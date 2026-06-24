@@ -34,8 +34,14 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
-    /// When enabled, attempt to resolve SERVFAIL queries using the system DNS
-    /// via the Ethernet interface as a last-resort fallback.
+    /// When enabled, retry a query against the WAN-assigned system DNS as a
+    /// last resort — but only when NO upstream produced a response at all
+    /// (every upstream timed out or hit a transport failure). Any response an
+    /// upstream did produce, including SERVFAIL, is treated as authoritative and
+    /// returned as-is. This avoids silently defeating DNSSEC: a SERVFAIL is how
+    /// a validating upstream rejects a DNSSEC-bogus answer, and re-resolving it
+    /// through the (typically non-validating) system DNS would serve a record
+    /// the upstream refused to vouch for and leak the query.
     #[serde(default)]
     pub best_effort: bool,
     /// EDNS0 UDP payload size advertised in queries sent to upstreams.
