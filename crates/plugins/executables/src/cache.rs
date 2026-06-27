@@ -60,8 +60,10 @@ struct CachedEntry {
     resp_wire: Arc<Vec<u8>>,
     /// Byte offsets of the 4-byte TTL fields inside `resp_wire` (answers,
     /// authorities, additionals). The OPT pseudo-record TTL is intentionally
-    /// excluded because it carries extended RCODE / DO bit data.
-    ttl_offsets: Vec<usize>,
+    /// excluded because it carries extended RCODE / DO bit data. Stored behind
+    /// an `Arc` so a cache hit can clone it out from under the shard lock in
+    /// O(1) instead of allocating a fresh `Vec`.
+    ttl_offsets: Arc<[usize]>,
     /// Time this entry was stored.
     stored_at: Instant,
     /// Original minimum TTL of the response records.
@@ -414,36 +416,61 @@ enum CacheLookup {
 
 impl Cache {
     /// Look up a key and build a response message for the current query ID.
+    ///
+    /// The shard lock is held only long enough to clone the cheap `Arc`s and
+    /// read the TTL; the full wire clone, TTL patch, and DNS parse all happen
+    /// after the guard is dropped so concurrent lookups on the same shard are
+    /// not serialized behind parse cost.
     fn lookup_and_build(&self, key: &CacheKey, query_id: u16) -> CacheLookup {
-        let shard = self.get_shard(key);
-        let mut store = shard.lock();
-        if let Some(entry) = store.get_mut(key) {
-            if !entry.is_expired() {
-                if let Some(resp) = self.build_response(entry, query_id, entry.remaining_ttl()) {
-                    return CacheLookup::Hit(resp);
+        // Captured under the lock: (wire, offsets, ttl, is_stale).
+        let captured = {
+            let shard = self.get_shard(key);
+            let mut store = shard.lock();
+            match store.get_mut(key) {
+                Some(entry) if !entry.is_expired() => Some((
+                    Arc::clone(&entry.resp_wire),
+                    Arc::clone(&entry.ttl_offsets),
+                    entry.remaining_ttl(),
+                    false,
+                )),
+                Some(entry) if entry.is_within_lazy_window(self.inner.lazy_ttl) => {
+                    // Stale-while-refresh: serve with a 1-second TTL while a
+                    // background refresh runs.
+                    Some((
+                        Arc::clone(&entry.resp_wire),
+                        Arc::clone(&entry.ttl_offsets),
+                        1,
+                        true,
+                    ))
                 }
-            } else if entry.is_within_lazy_window(self.inner.lazy_ttl) {
-                // Stale-while-refresh: serve with a 1-second TTL while a
-                // background refresh runs.
-                if let Some(resp) = self.build_response(entry, query_id, 1) {
-                    return CacheLookup::Stale(resp);
+                _ => None,
+            }
+        };
+
+        match captured {
+            Some((wire, offsets, ttl, is_stale)) => {
+                match build_response(&wire, &offsets, query_id, ttl) {
+                    Some(resp) if is_stale => CacheLookup::Stale(resp),
+                    Some(resp) => CacheLookup::Hit(resp),
+                    None => CacheLookup::Miss,
                 }
             }
+            None => CacheLookup::Miss,
         }
-        CacheLookup::Miss
     }
+}
 
-    /// Build a response `Message` from a cached entry by patching the query ID
-    /// and record TTLs in the stored wire bytes.
-    fn build_response(&self, entry: &CachedEntry, query_id: u16, ttl: u32) -> Option<Message> {
-        let mut wire = (*entry.resp_wire).clone();
-        if wire.len() >= 2 {
-            wire[0] = (query_id >> 8) as u8;
-            wire[1] = (query_id & 0xff) as u8;
-        }
-        set_ttl_in_wire(&mut wire, &entry.ttl_offsets, ttl);
-        Message::from_vec(&wire).ok()
+/// Build a response `Message` from a cached entry's stored wire by patching the
+/// query ID and record TTLs. Operates on cloned-out data so it can run without
+/// holding the shard lock.
+fn build_response(resp_wire: &[u8], offsets: &[usize], query_id: u16, ttl: u32) -> Option<Message> {
+    let mut wire = resp_wire.to_vec();
+    if wire.len() >= 2 {
+        wire[0] = (query_id >> 8) as u8;
+        wire[1] = (query_id & 0xff) as u8;
     }
+    set_ttl_in_wire(&mut wire, offsets, ttl);
+    Message::from_vec(&wire).ok()
 }
 
 #[async_trait]
@@ -559,7 +586,7 @@ impl Cache {
                 key.clone(),
                 CachedEntry {
                     resp_wire: Arc::new(wire),
-                    ttl_offsets: offsets,
+                    ttl_offsets: offsets.into(),
                     stored_at: Instant::now(),
                     original_ttl: ttl,
                 },
@@ -644,13 +671,20 @@ impl Cache {
         buf.write_all(&(count as u32).to_be_bytes())?;
         buf.write_all(&entries_buf)?;
 
-        let tmp_path = format!("{}.tmp", path.display());
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(&buf)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, path)?;
+        // Offload the blocking write + fsync + rename off the async worker.
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let tmp_path = format!("{}.tmp", path.display());
+            {
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(&buf)?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, &path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("cache dump task panicked: {e}")))??;
 
         Ok(count)
     }
@@ -660,7 +694,10 @@ impl Cache {
     /// Entries that have expired between dump and load are skipped.
     /// Returns the number of entries loaded.
     async fn load_from_file(&self, path: &Path) -> io::Result<usize> {
-        let data = std::fs::read(path)?;
+        let path = path.to_path_buf();
+        let data = tokio::task::spawn_blocking(move || std::fs::read(&path))
+            .await
+            .map_err(|e| io::Error::other(format!("cache load task panicked: {e}")))??;
 
         if data.len() < FILE_MAGIC.len() + 1 + 8 + 4 {
             return Err(io::Error::new(
@@ -773,7 +810,7 @@ impl Cache {
                 key,
                 CachedEntry {
                     resp_wire: Arc::new(wire),
-                    ttl_offsets: offsets,
+                    ttl_offsets: offsets.into(),
                     stored_at: Instant::now(),
                     original_ttl: effective_remaining,
                 },
@@ -883,7 +920,7 @@ mod tests {
         let (wire, offsets) = build_stored_wire(&resp, ttl).unwrap();
         CachedEntry {
             resp_wire: Arc::new(wire),
-            ttl_offsets: offsets,
+            ttl_offsets: offsets.into(),
             stored_at: Instant::now(),
             original_ttl: ttl,
         }

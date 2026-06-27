@@ -14,9 +14,10 @@ use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
-use std::collections::HashMap;
+use lru::LruCache;
 use std::net::IpAddr;
-use parking_lot::RwLock;
+use std::num::NonZeroUsize;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 /// Reverse lookup configuration.
@@ -62,20 +63,22 @@ struct CacheEntry {
 /// Reverse IP→domain cache.
 pub struct ReverseLookup {
     config: ReverseLookupConfig,
-    cache: RwLock<HashMap<IpAddr, CacheEntry>>,
+    cache: Mutex<LruCache<IpAddr, CacheEntry>>,
 }
 
 impl ReverseLookup {
     pub fn new(config: ReverseLookupConfig) -> Self {
+        let cap = NonZeroUsize::new(config.size.max(1)).unwrap();
         Self {
             config,
-            cache: RwLock::new(HashMap::new()),
+            cache: Mutex::new(LruCache::new(cap)),
         }
     }
 
     /// Look up the cached domain for an IP.
     fn lookup(&self, addr: &IpAddr) -> Option<String> {
-        let cache = self.cache.read();
+        let mut cache = self.cache.lock();
+        // `get` bumps recency, which is what we want for an LRU PTR cache.
         cache.get(addr).and_then(|entry| {
             if entry.expires > Instant::now() {
                 Some(entry.domain.clone())
@@ -93,7 +96,7 @@ impl ReverseLookup {
         // Use the query name as the canonical domain if available.
         let qname = query.queries().first().map(|q| q.name().to_ascii());
 
-        let mut cache = self.cache.write();
+        let mut cache = self.cache.lock();
         for rr in response.answers() {
             let ip: Option<IpAddr> = match rr.data() {
                 RData::A(a) => Some(IpAddr::V4(a.0)),
@@ -102,30 +105,15 @@ impl ReverseLookup {
             };
             if let Some(ip) = ip {
                 let domain = qname.clone().unwrap_or_else(|| rr.name().to_ascii());
-                cache.insert(
+                // `LruCache` bounds capacity itself, evicting the least-recently
+                // used entry in O(1) — no full-map scan or sort under the lock.
+                cache.put(
                     ip,
                     CacheEntry {
                         domain,
                         expires: now + ttl,
                     },
                 );
-            }
-        }
-
-        // Evict when over capacity.
-        if cache.len() > self.config.size {
-            // First pass: remove expired entries (cheap).
-            cache.retain(|_, e| e.expires > now);
-
-            // Second pass: if still over capacity, evict soonest-expiring entries.
-            if cache.len() > self.config.size {
-                let excess = cache.len() - self.config.size;
-                let mut by_expiry: Vec<(IpAddr, Instant)> =
-                    cache.iter().map(|(k, e)| (*k, e.expires)).collect();
-                by_expiry.sort_unstable_by_key(|(_, exp)| *exp);
-                for (ip, _) in by_expiry.into_iter().take(excess) {
-                    cache.remove(&ip);
-                }
             }
         }
     }
@@ -293,5 +281,46 @@ mod tests {
         let cfg = ReverseLookupConfig::from_str_args("").unwrap();
         assert_eq!(cfg.size, 64 * 1024);
         assert_eq!(cfg.ttl, 7200);
+    }
+
+    #[test]
+    fn evicts_least_recently_used_at_capacity() {
+        let rl = ReverseLookup::new(ReverseLookupConfig {
+            size: 2,
+            handle_ptr: true,
+            ttl: 7200,
+        });
+
+        let mk = |last_octet: u8, name: &str| {
+            let mut query = Message::new();
+            query.add_query({
+                let mut q = Query::new();
+                q.set_name(Name::from_ascii(name).unwrap())
+                    .set_query_type(RecordType::A);
+                q
+            });
+            let mut resp = Message::new();
+            resp.add_answer(Record::from_rdata(
+                Name::from_ascii(name).unwrap(),
+                60,
+                RData::A(std::net::Ipv4Addr::new(10, 0, 0, last_octet).into()),
+            ));
+            (query, resp)
+        };
+
+        let (q1, r1) = mk(1, "a.example.");
+        let (q2, r2) = mk(2, "b.example.");
+        let (q3, r3) = mk(3, "c.example.");
+
+        rl.save_ips(&q1, &r1);
+        rl.save_ips(&q2, &r2);
+        // Touch entry 1 so entry 2 becomes least-recently-used.
+        assert!(rl.lookup(&"10.0.0.1".parse().unwrap()).is_some());
+        // Inserting a third entry must evict entry 2, not entry 1.
+        rl.save_ips(&q3, &r3);
+
+        assert!(rl.lookup(&"10.0.0.1".parse().unwrap()).is_some());
+        assert!(rl.lookup(&"10.0.0.3".parse().unwrap()).is_some());
+        assert!(rl.lookup(&"10.0.0.2".parse().unwrap()).is_none());
     }
 }
