@@ -9,6 +9,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod dashboard;
+mod http;
 
 use clap::{Parser, Subcommand};
 use redns_core::chain_builder::ChainBuilder;
@@ -903,14 +904,12 @@ async fn handle_api_request(
     mut stream: tokio::net::TcpStream,
     upstreams: Arc<[Arc<UpstreamWrapper>]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    let Some((head, _body)) = crate::http::read_request_head(&mut stream).await? else {
         return Ok(());
-    }
-    let request = String::from_utf8_lossy(&buf[..n]);
+    };
+    let request = String::from_utf8_lossy(&head);
 
     // Parse the request line.
     let first_line = request.lines().next().unwrap_or("");

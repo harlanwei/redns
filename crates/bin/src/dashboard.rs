@@ -1216,13 +1216,11 @@ async fn handle_dashboard_request(
     mut stream: TcpStream,
     state: Arc<DashboardState>,
 ) -> Result<(), DynError> {
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    let Some((head, _body)) = crate::http::read_request_head(&mut stream).await? else {
         return Ok(());
-    }
+    };
 
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let request = String::from_utf8_lossy(&head);
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     let method = parts.first().copied().unwrap_or("");
