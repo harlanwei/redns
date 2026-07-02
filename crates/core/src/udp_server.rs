@@ -6,6 +6,7 @@
 
 use crate::server::{DnsHandler, QueryMeta};
 use hickory_proto::op::Message;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
@@ -43,6 +44,23 @@ fn default_udp_workers() -> usize {
     (parallelism * 2).clamp(1, MAX_UDP_WORKERS)
 }
 
+fn build_udp_query(
+    query_wire: Arc<Vec<u8>>,
+    client_ip: IpAddr,
+) -> Result<(Message, QueryMeta), hickory_proto::ProtoError> {
+    let query = Message::from_vec(query_wire.as_slice())?;
+    let meta = QueryMeta {
+        protocol: Some("udp".to_string()),
+        from_udp: true,
+        client_addr: Some(client_ip),
+        url_path: None,
+        server_name: None,
+        selected_upstreams: None,
+        query_wire: Some(query_wire),
+    };
+    Ok((query, meta))
+}
+
 async fn udp_worker(
     socket: Arc<UdpSocket>,
     handler: Arc<dyn DnsHandler>,
@@ -62,8 +80,11 @@ async fn udp_worker(
                     }
                 };
 
-                let query = match Message::from_vec(&buf[..n]) {
-                    Ok(q) => q,
+                // Own the received wire bytes once so downstream handlers can
+                // reuse them instead of re-serializing the query later.
+                let query_wire = Arc::new(buf[..n].to_vec());
+                let (query, meta) = match build_udp_query(query_wire, peer.ip()) {
+                    Ok(v) => v,
                     Err(e) => {
                         debug!(error = %e, "invalid UDP DNS query");
                         continue;
@@ -86,16 +107,6 @@ async fn udp_worker(
                     }
                 };
 
-                let meta = QueryMeta {
-                    protocol: Some("udp".to_string()),
-                    from_udp: true,
-                    client_addr: Some(peer.ip()),
-                    url_path: None,
-                    server_name: None,
-                    selected_upstreams: None,
-                    query_wire: None,
-                };
-
                 // Handle the query in its own task so the receive loop is free to
                 // accept the next datagram immediately. A panic here unwinds only
                 // this task, not the worker.
@@ -104,17 +115,12 @@ async fn udp_worker(
                 tokio::spawn(async move {
                     // Hold the permit for the handler's lifetime; released on drop.
                     let _permit = permit;
-                    match handler.handle(query, meta).await {
-                        Ok(resp) => match resp.to_vec() {
-                            Ok(resp_bytes) => {
-                                if let Err(e) = socket.send_to(&resp_bytes, peer).await {
-                                    warn!(error = %e, peer = %peer, "failed to send UDP response");
-                                }
+                    match handler.handle_udp(query, meta).await {
+                        Ok(resp_bytes) => {
+                            if let Err(e) = socket.send_to(&resp_bytes, peer).await {
+                                warn!(error = %e, peer = %peer, "failed to send UDP response");
                             }
-                            Err(e) => {
-                                warn!(error = %e, "failed to serialize response");
-                            }
-                        },
+                        }
                         Err(e) => {
                             error!(error = %e, "handler error");
                         }
@@ -301,6 +307,21 @@ mod tests {
 
         cancel.cancel();
         let _ = server.await;
+    }
+
+    #[test]
+    fn build_udp_query_preserves_raw_wire() {
+        let query = make_query();
+        let expected_wire = Arc::new(query.clone());
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let (parsed, meta) = build_udp_query(expected_wire.clone(), client_ip).unwrap();
+
+        assert_eq!(parsed.id(), 1);
+        assert_eq!(meta.protocol.as_deref(), Some("udp"));
+        assert!(meta.from_udp);
+        assert_eq!(meta.client_addr, Some(client_ip));
+        assert_eq!(meta.query_wire.unwrap().as_slice(), expected_wire.as_slice());
     }
 
     /// A slow handler must not stall the receive loop. While one query is awaiting

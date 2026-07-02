@@ -1104,27 +1104,84 @@ impl DashboardDnsHandler {
     }
 }
 
+fn dashboard_query_details(query: &Message, meta: &QueryMeta) -> (String, String, String, String) {
+    let (qname, qtype) = query
+        .queries()
+        .first()
+        .map(|q| (q.name().to_ascii(), format!("{:?}", q.query_type())))
+        .unwrap_or_else(|| (String::new(), String::new()));
+
+    let client_ip = meta
+        .client_addr
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let protocol = meta.protocol.clone().unwrap_or_else(|| {
+        if meta.from_udp {
+            "udp".to_string()
+        } else {
+            "tcp".to_string()
+        }
+    });
+
+    (qname, qtype, client_ip, protocol)
+}
+
+fn summarize_dashboard_result(resp: &Message, qname: &str) -> (String, String, Vec<String>, u32) {
+    let rcode = resp.response_code();
+    let (summary, rows) = persisted_dns_result(resp, qname);
+    let ttl = min_answer_ttl(resp);
+    (format!("{:?}", rcode), summary, rows, ttl)
+}
+
+fn summarize_dashboard_error(err: impl Into<String>) -> (String, String, Vec<String>, u32) {
+    let err = err.into();
+    (
+        "ERROR".to_string(),
+        err.clone(),
+        vec![format!("error: {err}")],
+        0u32,
+    )
+}
+
+async fn persist_dashboard_log(
+    store: &DashboardStore,
+    qname: String,
+    qtype: String,
+    client_ip: String,
+    protocol: String,
+    selected_upstreams: Arc<Mutex<Vec<String>>>,
+    elapsed: Duration,
+    summary: (String, String, Vec<String>, u32),
+) {
+    let (rcode, result_summary, result_rows, answer_ttl) = summary;
+    let upstream_names = dedupe_keep_order(selected_upstreams.lock().clone());
+
+    let entry = NewDnsLogEntry {
+        ts_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        client_ip,
+        protocol,
+        qname,
+        qtype,
+        rcode,
+        upstream_names,
+        result: result_summary,
+        result_rows_json: serde_json::to_string(&result_rows).unwrap_or_else(|_| "[]".to_string()),
+        latency_ms: latency_ms_ceil(elapsed),
+        answer_ttl,
+    };
+    if let Err(e) = store.record(entry).await {
+        warn!(error = %e, "dashboard failed to persist dns log entry");
+    }
+}
+
 #[async_trait::async_trait]
 impl DnsHandler for DashboardDnsHandler {
     async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message> {
-        let (qname, qtype) = query
-            .queries()
-            .first()
-            .map(|q| (q.name().to_ascii(), format!("{:?}", q.query_type())))
-            .unwrap_or_else(|| (String::new(), String::new()));
-
-        let client_ip = meta
-            .client_addr
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let protocol = meta.protocol.clone().unwrap_or_else(|| {
-            if meta.from_udp {
-                "udp".to_string()
-            } else {
-                "tcp".to_string()
-            }
-        });
+        let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
 
         let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut meta = meta;
@@ -1133,44 +1190,55 @@ impl DnsHandler for DashboardDnsHandler {
         let start = Instant::now();
         let result = self.inner.handle(query, meta).await;
         let elapsed = start.elapsed();
-
-        let (rcode, result_summary, result_rows, answer_ttl) = match &result {
-            Ok(resp) => {
-                let rcode = resp.response_code();
-                let (summary, rows) = persisted_dns_result(resp, &qname);
-                let ttl = min_answer_ttl(resp);
-                (format!("{:?}", rcode), summary, rows, ttl)
-            }
-            Err(e) => (
-                "ERROR".to_string(),
-                e.to_string(),
-                vec![format!("error: {}", e)],
-                0u32,
-            ),
+        let summary = match result.as_ref() {
+            Ok(resp) => summarize_dashboard_result(resp, &qname),
+            Err(e) => summarize_dashboard_error(e.to_string()),
         };
-
-        let upstream_names = dedupe_keep_order(selected_upstreams.lock().clone());
-
-        let entry = NewDnsLogEntry {
-            ts_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            client_ip,
-            protocol,
+        persist_dashboard_log(
+            &self.store,
             qname,
             qtype,
-            rcode,
-            upstream_names,
-            result: result_summary,
-            result_rows_json: serde_json::to_string(&result_rows)
-                .unwrap_or_else(|_| "[]".to_string()),
-            latency_ms: latency_ms_ceil(elapsed),
-            answer_ttl,
+            client_ip,
+            protocol,
+            selected_upstreams,
+            elapsed,
+            summary,
+        )
+        .await;
+
+        result
+    }
+
+    async fn handle_udp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
+        let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
+
+        let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut meta = meta;
+        meta.selected_upstreams = Some(selected_upstreams.clone());
+
+        let start = Instant::now();
+        let result = self.inner.handle_udp(query, meta).await;
+        let elapsed = start.elapsed();
+        let summary = match result.as_ref() {
+            Ok(resp_wire) => match Message::from_vec(resp_wire) {
+                Ok(resp) => summarize_dashboard_result(&resp, &qname),
+                Err(e) => summarize_dashboard_error(format!(
+                    "failed to decode UDP response for dashboard logging: {e}"
+                )),
+            },
+            Err(e) => summarize_dashboard_error(e.to_string()),
         };
-        if let Err(e) = self.store.record(entry).await {
-            warn!(error = %e, "dashboard failed to persist dns log entry");
-        }
+        persist_dashboard_log(
+            &self.store,
+            qname,
+            qtype,
+            client_ip,
+            protocol,
+            selected_upstreams,
+            elapsed,
+            summary,
+        )
+        .await;
 
         result
     }

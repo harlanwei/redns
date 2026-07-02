@@ -56,6 +56,17 @@ pub struct QueryMeta {
 pub trait DnsHandler: Send + Sync {
     /// Handle a DNS query. Returns the response message.
     async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message>;
+
+    /// Handle a UDP DNS query and return the final wire-format response.
+    ///
+    /// The default implementation reuses [`DnsHandler::handle`] and performs
+    /// UDP size enforcement during serialization so non-truncated responses are
+    /// encoded only once on the hot path.
+    async fn handle_udp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
+        let max_payload = udp_max_payload(&query);
+        let resp = self.handle(query, meta).await?;
+        serialize_udp_response(resp, max_payload)
+    }
 }
 
 /// Wraps a sequence [`Executable`] as a [`DnsHandler`].
@@ -220,14 +231,6 @@ impl DnsHandler for EntryHandler {
         // Forwarder: always set RA.
         resp.set_recursion_available(true);
 
-        // For UDP, ensure the response fits the client's advertised buffer. If
-        // it doesn't, return a truncated response (TC bit set, answer sections
-        // dropped) so the client retries over TCP (RFC 1035 §4.2.1). TCP/DoH
-        // are length-prefixed/streamed and need no truncation.
-        if meta.from_udp {
-            resp = truncate_for_udp(resp, &query);
-        }
-
         Ok(resp)
     }
 }
@@ -235,28 +238,31 @@ impl DnsHandler for EntryHandler {
 /// Maximum UDP response size assumed when the client advertises no EDNS0 buffer.
 const MIN_UDP_RESPONSE_SIZE: usize = 512;
 
-/// Ensures a UDP response fits the client's advertised buffer.
-///
-/// The limit is the client's EDNS0 `max_payload` (read from the original
-/// query), floored at the classic 512-byte DNS limit. If the wire form exceeds
-/// it, the response is truncated: the TC bit is set and answer sections are
-/// dropped, signalling the client to retry over TCP. The `RecursionAvailable`
-/// flag is re-applied since [`Message::truncate`] rebuilds the message.
-fn truncate_for_udp(resp: Message, query: &Message) -> Message {
-    let max_payload = query
+/// Returns the maximum UDP payload the client advertised for this query.
+fn udp_max_payload(query: &Message) -> usize {
+    query
         .extensions()
         .as_ref()
         .map(|e| e.max_payload() as usize)
         .filter(|&p| p >= MIN_UDP_RESPONSE_SIZE)
-        .unwrap_or(MIN_UDP_RESPONSE_SIZE);
+        .unwrap_or(MIN_UDP_RESPONSE_SIZE)
+}
 
+/// Serialize a UDP response, truncating only when the encoded wire form does
+/// not fit the client's advertised payload size.
+fn serialize_udp_response(resp: Message, max_payload: usize) -> PluginResult<Vec<u8>> {
     match resp.to_vec() {
-        Ok(wire) if wire.len() > max_payload => {
+        Ok(wire) if wire.len() <= max_payload => Ok(wire),
+        Ok(_) => {
             let mut truncated = resp.truncate();
             truncated.set_recursion_available(true);
             truncated
+                .to_vec()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("failed to serialize truncated UDP response: {e}").into()
+                })
         }
-        _ => resp,
+        Err(e) => Err(format!("failed to serialize UDP response: {e}").into()),
     }
 }
 
@@ -416,7 +422,7 @@ mod tests {
             from_udp: true,
             ..Default::default()
         };
-        let resp = handler.handle(make_query(), meta).await.unwrap();
+        let resp = Message::from_vec(&handler.handle_udp(make_query(), meta).await.unwrap()).unwrap();
         assert!(resp.truncated(), "TC bit should be set");
         assert!(resp.answers().is_empty(), "answers should be dropped");
         assert!(resp.recursion_available());

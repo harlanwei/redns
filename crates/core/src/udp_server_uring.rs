@@ -670,10 +670,15 @@ impl UringUdpServer {
 
             tokio::runtime::Handle::current().spawn(async move {
                 let _permit = permit;
-                match handler.handle(query, meta).await {
-                    Ok(resp) => {
-                        if let (Ok(resp_bytes), Some(peer)) = (resp.to_vec(), peer) {
-                            let _ = tx.send(UringSend { response: resp_bytes, peer }).await;
+                match handler.handle_udp(query, meta).await {
+                    Ok(resp_bytes) => {
+                        if let Some(peer) = peer {
+                            let _ = tx
+                                .send(UringSend {
+                                    response: resp_bytes,
+                                    peer,
+                                })
+                                .await;
                         }
                     }
                     Err(e) => {
