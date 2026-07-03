@@ -12,6 +12,15 @@
   let upstreamSortAsc = $state(false);
 
   let sortedUpstreams = $derived(sortUpstreams(upstreams, upstreamSortCol, upstreamSortAsc));
+  let upstreamQueryTotal = $derived(upstreams.reduce((sum, us) => sum + us.query_total, 0));
+  let upstreamErrorTotal = $derived(upstreams.reduce((sum, us) => sum + us.error_total, 0));
+  let upstreamInflightTotal = $derived(upstreams.reduce((sum, us) => sum + us.inflight_total, 0));
+  let upstreamCompletedTotal = $derived(upstreams.reduce((sum, us) => sum + us.completed_total, 0));
+  let upstreamWeightedLatency = $derived(
+    upstreamCompletedTotal > 0
+      ? upstreams.reduce((sum, us) => sum + us.avg_latency_ms * us.completed_total, 0) / upstreamCompletedTotal
+      : 0,
+  );
 
   function getErrorMessage(err: unknown, fallback: string) {
     if (err instanceof Error && err.message) return err.message;
@@ -50,55 +59,70 @@
   <ErrorAlert message={error} />
 {/if}
 
-<div class="glass rounded-2xl border border-line/60 shadow-card overflow-hidden" in:fade>
-  <div class="p-4 sm:p-6 border-b border-line/60 glass-panel flex justify-between items-center gap-4">
-    <div class="flex items-center gap-3">
-      <div class="w-10 h-10 rounded-xl bg-grad-accent flex items-center justify-center shadow-glow shrink-0">
-        <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" /></svg>
-      </div>
-      <div>
-        <h2 class="text-lg font-bold text-ink">Upstream Servers</h2>
-        <p class="text-sm text-faint mt-0.5">Click a column header to sort</p>
-      </div>
+<section class="rounded-md border border-line bg-surface shadow-card overflow-hidden" aria-label="Upstream server metrics" in:fade>
+  <div class="p-4 sm:p-5 border-b border-line bg-panel flex justify-between items-center gap-4">
+    <div>
+      <h2 class="text-base font-semibold text-ink">Upstream servers</h2>
+      <p class="text-sm text-faint mt-0.5">Click a column header to sort</p>
     </div>
-    <button onclick={fetchUpstreams} class="inline-flex items-center gap-1.5 text-sm text-accent hover:text-accent-2 font-medium transition-colors px-3 py-1.5 rounded-lg hover:bg-accent-soft">
+    <button onclick={fetchUpstreams} class="inline-flex items-center gap-1.5 text-sm text-accent-2 font-semibold transition-colors px-3 py-1.5 rounded-md border border-accent/25 bg-accent-soft hover:bg-accent-fill hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-accent">
       <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
       Refresh
     </button>
   </div>
+  {#if upstreams.length > 0}
+    <div class="grid border-b border-line bg-surface sm:grid-cols-4 sm:divide-x sm:divide-line">
+      <div class="p-4">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Queries</div>
+        <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{upstreamQueryTotal.toLocaleString()}</div>
+      </div>
+      <div class="border-t border-line p-4 sm:border-t-0">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Errors</div>
+        <div class="mt-2 text-2xl font-bold text-danger-text tabular-nums">{upstreamErrorTotal.toLocaleString()}</div>
+      </div>
+      <div class="border-t border-line p-4 sm:border-t-0">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Inflight</div>
+        <div class="mt-2 text-2xl font-bold text-info-text tabular-nums">{upstreamInflightTotal.toLocaleString()}</div>
+      </div>
+      <div class="border-t border-line p-4 sm:border-t-0">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Avg latency</div>
+        <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{upstreamWeightedLatency.toFixed(1)}<span class="text-sm text-faint">ms</span></div>
+      </div>
+    </div>
+  {/if}
   <div class="overflow-x-auto">
     <table class="min-w-full divide-y divide-line/60 text-xs sm:text-sm">
-      <thead class="glass-panel">
+      <thead class="bg-accent-soft/45">
         <tr>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-left font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('name')}>
-            Upstream <span class="text-accent">{upstreamSortCol === 'name' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-left font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('name')}>
+            Upstream <span class="text-accent-2">{upstreamSortCol === 'name' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-left font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('protocol')}>
-            Type <span class="text-accent">{upstreamSortCol === 'protocol' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-left font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('protocol')}>
+            Type <span class="text-accent-2">{upstreamSortCol === 'protocol' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('query_total')}>
-            Queries <span class="text-accent">{upstreamSortCol === 'query_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('query_total')}>
+            Queries <span class="text-accent-2">{upstreamSortCol === 'query_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('completed_total')}>
-            Completed <span class="text-accent">{upstreamSortCol === 'completed_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('completed_total')}>
+            Completed <span class="text-accent-2">{upstreamSortCol === 'completed_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('canceled_total')}>
-            Canceled <span class="text-accent">{upstreamSortCol === 'canceled_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('canceled_total')}>
+            Canceled <span class="text-accent-2">{upstreamSortCol === 'canceled_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('adopted_total')}>
-            Adopted <span class="text-accent">{upstreamSortCol === 'adopted_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('adopted_total')}>
+            Adopted <span class="text-accent-2">{upstreamSortCol === 'adopted_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('final_selected_total')}>
-            Selected <span class="text-accent">{upstreamSortCol === 'final_selected_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('final_selected_total')}>
+            Selected <span class="text-accent-2">{upstreamSortCol === 'final_selected_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('rejected_rcode_total')}>
-            Rejected <span class="text-accent">{upstreamSortCol === 'rejected_rcode_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('rejected_rcode_total')}>
+            Rejected <span class="text-accent-2">{upstreamSortCol === 'rejected_rcode_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('error_total')}>
-            Errors <span class="text-accent">{upstreamSortCol === 'error_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('error_total')}>
+            Errors <span class="text-accent-2">{upstreamSortCol === 'error_total' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
-          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-wider cursor-pointer hover:bg-accent-soft/40 transition-colors whitespace-nowrap" onclick={() => sortBy('avg_latency_ms')}>
-            Avg Latency <span class="text-accent">{upstreamSortCol === 'avg_latency_ms' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
+          <th scope="col" class="px-2 sm:px-4 py-3 text-right font-semibold text-muted uppercase tracking-[0.08em] cursor-pointer hover:bg-accent-soft/50 transition-colors whitespace-nowrap" onclick={() => sortBy('avg_latency_ms')}>
+            Avg Latency <span class="text-accent-2">{upstreamSortCol === 'avg_latency_ms' ? (upstreamSortAsc ? '↑' : '↓') : ''}</span>
           </th>
         </tr>
       </thead>
@@ -121,7 +145,7 @@
         {:else if upstreams.length === 0}
           <tr><td colspan="10" class="px-6 py-16 text-center">
             <div class="inline-flex flex-col items-center gap-3 text-faint">
-              <div class="w-14 h-14 rounded-2xl bg-panel border border-line flex items-center justify-center">
+              <div class="w-14 h-14 rounded-md bg-accent-soft border border-accent/20 text-accent-2 flex items-center justify-center">
                 <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2"/></svg>
               </div>
               <span class="text-sm font-medium">No upstreams found</span>
@@ -132,8 +156,8 @@
             {@const q = Math.max(us.query_total, 1)}
             <tr class="hover:bg-accent-soft/60 transition-colors">
               <td class="px-2 sm:px-4 py-4 whitespace-nowrap font-medium text-ink">{us.name}</td>
-              <td class="px-2 sm:px-4 py-4 whitespace-nowrap"><span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-semibold bg-neutral-bg text-neutral-text border border-line">{formatProtocol(us.protocol)}</span></td>
-              <td class="px-2 sm:px-4 py-4 whitespace-nowrap text-right text-ink font-semibold tabular-nums">{us.query_total.toLocaleString()}</td>
+              <td class="px-2 sm:px-4 py-4 whitespace-nowrap"><span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-semibold bg-accent-soft text-accent-2 border border-accent/20">{formatProtocol(us.protocol)}</span></td>
+              <td class="px-2 sm:px-4 py-4 whitespace-nowrap text-right text-accent-2 font-semibold tabular-nums">{us.query_total.toLocaleString()}</td>
               <td class="px-2 sm:px-4 py-4 whitespace-nowrap text-right font-medium text-ink tabular-nums">{us.completed_total.toLocaleString()}</td>
               <td class="px-2 sm:px-4 py-4 whitespace-nowrap text-right text-faint font-medium tabular-nums">{us.canceled_total.toLocaleString()}</td>
               <td class="px-2 sm:px-4 py-4 whitespace-nowrap text-right font-medium text-ink tabular-nums">
@@ -161,4 +185,4 @@
       </tbody>
     </table>
   </div>
-</div>
+</section>

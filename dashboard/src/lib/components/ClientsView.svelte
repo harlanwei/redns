@@ -27,10 +27,6 @@
     }
   }
 
-  function clientLabel(client: { hostname: string | null; ips: string[] }): string {
-    return client.hostname ?? client.ips[0] ?? 'unknown';
-  }
-
   onMount(() => {
     fetchClients();
   });
@@ -40,25 +36,39 @@
   <ErrorAlert message={error} />
 {/if}
 
-<div class="glass rounded-2xl border border-line/60 shadow-card overflow-hidden" in:fade>
-  <div class="p-4 sm:p-6 border-b border-line/60 glass-panel flex justify-between items-center gap-4">
-    <div class="flex items-center gap-3">
-      <div class="w-10 h-10 rounded-xl bg-grad-accent flex items-center justify-center shadow-glow shrink-0">
-        <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-1.13a4 4 0 100-8 4 4 0 000 8zm6 0a3 3 0 100-6 3 3 0 000 6zm-12 0a3 3 0 100-6 3 3 0 000 6z" /></svg>
-      </div>
-      <div>
-        <h2 class="text-lg font-bold text-ink">Top Clients</h2>
-        <p class="text-sm text-faint mt-0.5">{clientsResponse ? `${clientsResponse.total_clients} clients · ${clientsResponse.total_queries.toLocaleString()} queries` : 'Client query volume'}</p>
-      </div>
+<section class="rounded-md border border-line bg-surface shadow-card overflow-hidden" aria-label="Client query volume" in:fade>
+  <div class="p-4 sm:p-5 border-b border-line bg-panel flex justify-between items-center gap-4">
+    <div>
+      <h2 class="text-base font-semibold text-ink">Top clients</h2>
+      <p class="text-sm text-faint mt-0.5">{clientsResponse ? `${clientsResponse.total_clients} clients · ${clientsResponse.total_queries.toLocaleString()} queries` : 'Client query volume'}</p>
     </div>
-    <button onclick={fetchClients} class="inline-flex items-center gap-1.5 text-sm text-accent hover:text-accent-2 font-medium transition-colors px-3 py-1.5 rounded-lg hover:bg-accent-soft">
+    <button onclick={fetchClients} class="inline-flex items-center gap-1.5 text-sm text-accent-2 font-semibold transition-colors px-3 py-1.5 rounded-md border border-accent/25 bg-accent-soft hover:bg-accent-fill hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-accent">
       <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
       Refresh
     </button>
   </div>
+  {#if clientsResponse}
+    <div class="grid border-b border-line bg-surface sm:grid-cols-3 sm:divide-x sm:divide-line">
+      <div class="p-4">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Clients</div>
+        <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{clientsResponse.total_clients.toLocaleString()}</div>
+      </div>
+      <div class="border-t border-line p-4 sm:border-t-0">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Queries</div>
+        <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{clientsResponse.total_queries.toLocaleString()}</div>
+      </div>
+      <div class="border-t border-line p-4 sm:border-t-0">
+        <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Top source</div>
+        <div class="mt-2 truncate text-base font-semibold text-ink" title={clientsResponse.top_client ?? 'No client'}>
+          {clientsResponse.top_client ?? 'No client'}
+        </div>
+        <div class="mt-1 text-xs font-semibold text-accent-2 tabular-nums">{clientsResponse.top_volume.toLocaleString()} queries</div>
+      </div>
+    </div>
+  {/if}
   <div class="overflow-x-auto">
     <table class="min-w-full divide-y divide-line/60">
-      <thead class="glass-panel">
+      <thead class="bg-accent-soft/45">
         <tr>
           <th scope="col" class="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-muted uppercase tracking-wider">Client</th>
           <th scope="col" class="px-4 sm:px-6 py-3 text-right text-xs font-semibold text-muted uppercase tracking-wider">Total Queries</th>
@@ -77,7 +87,7 @@
         {:else if clientsResponse?.items.length === 0}
           <tr><td colspan="3" class="px-6 py-16 text-center">
             <div class="inline-flex flex-col items-center gap-3 text-faint">
-              <div class="w-14 h-14 rounded-2xl bg-panel border border-line flex items-center justify-center">
+              <div class="w-14 h-14 rounded-md bg-accent-soft border border-accent/20 text-accent-2 flex items-center justify-center">
                 <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-1.13a4 4 0 100-8 4 4 0 000 8z"/></svg>
               </div>
               <span class="text-sm font-medium">No client data found</span>
@@ -89,9 +99,9 @@
               <td class="px-4 sm:px-6 py-4 text-sm">
                 <div class="flex items-center gap-3">
                   {#if i < 3}
-                    <span class="w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold text-white shadow-sm" style="background: var(--ui-accent-grad);">{i + 1}</span>
+                    <span class="w-7 h-7 rounded-md bg-accent-fill flex items-center justify-center text-xs font-bold text-white">{i + 1}</span>
                   {:else}
-                    <span class="w-7 h-7 rounded-lg bg-neutral-bg border border-line flex items-center justify-center text-xs font-bold text-muted">{i + 1}</span>
+                    <span class="w-7 h-7 rounded-md bg-neutral-bg border border-line flex items-center justify-center text-xs font-bold text-muted">{i + 1}</span>
                   {/if}
                   <div class="min-w-0">
                     <div class="font-medium text-ink">
@@ -115,7 +125,7 @@
               <td class="px-4 sm:px-6 py-4 whitespace-nowrap text-sm text-right font-semibold text-ink tabular-nums">{client.query_total.toLocaleString()}</td>
               <td class="px-4 sm:px-6 py-4 whitespace-nowrap text-sm w-full min-w-[150px] max-w-xs">
                 <div class="w-full bg-line/60 rounded-full h-2 overflow-hidden">
-                  <div class="bg-grad-accent h-2 rounded-full transition-all duration-500" style="width: {(client.query_total / Math.max(clientsResponse.top_volume, 1)) * 100}%"></div>
+                  <div class="bg-accent h-2 rounded-full transition-all duration-500" style="width: {(client.query_total / Math.max(clientsResponse.top_volume, 1)) * 100}%"></div>
                 </div>
               </td>
             </tr>
@@ -124,4 +134,4 @@
       </tbody>
     </table>
   </div>
-</div>
+</section>

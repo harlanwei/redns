@@ -3,7 +3,12 @@
   import type { TabId } from '../types/dashboard';
   import { theme, toggleTheme } from '../utils/theme.svelte';
 
-  const tabs: TabId[] = ['logs', 'clients', 'cache', 'upstreams'];
+  const tabs: { id: TabId; label: string }[] = [
+    { id: 'logs', label: 'Query stream' },
+    { id: 'clients', label: 'Clients' },
+    { id: 'cache', label: 'Cache' },
+    { id: 'upstreams', label: 'Upstreams' },
+  ];
 
   let { activeTab, onTabChange } = $props<{
     activeTab: TabId;
@@ -18,41 +23,79 @@
   }
 </script>
 
-<header class="bg-grad-header text-header-text z-20 sticky top-0 border-b border-white/10 shadow-lg">
-  <div class="absolute inset-0 pointer-events-none opacity-60" style="background: radial-gradient(600px 200px at 90% -40%, rgba(124,143,252,0.35), transparent 70%);"></div>
-  <div class="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-    <div class="flex justify-between h-16 items-center">
-      <div class="flex items-center gap-3">
-        <div class="relative w-10 h-10 rounded-xl bg-grad-accent animate-drift flex items-center justify-center font-extrabold shadow-lg ring-1 ring-white/20">
-          R
-          <span class="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full bg-success-2 ring-2 ring-header animate-soft-pulse"></span>
+<aside class="hidden lg:sticky lg:top-0 lg:flex lg:h-dvh lg:flex-col lg:border-r lg:border-white/10 lg:bg-header lg:text-header-text">
+  <div class="flex h-full flex-col p-4">
+    <div class="flex items-center gap-3 px-2 py-2">
+      <div class="relative flex h-10 w-10 items-center justify-center rounded-md bg-accent-fill font-extrabold text-white ring-1 ring-white/20">
+        R
+        <span class="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-success-2 ring-2 ring-header" aria-hidden="true"></span>
+      </div>
+      <div class="leading-tight">
+        <h1 class="text-xl font-bold tracking-tight">ReDNS</h1>
+        <p class="text-[11px] font-semibold uppercase tracking-[0.12em] text-header-muted -mt-0.5">Resolver Console</p>
+      </div>
+    </div>
+
+    <nav class="mt-8 space-y-1" aria-label="Dashboard sections">
+      {#each tabs as tab}
+        <button
+          onclick={() => selectTab(tab.id)}
+          aria-current={activeTab === tab.id ? 'page' : undefined}
+          class="group block w-full rounded-md px-3 py-2.5 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-white/50 {activeTab === tab.id ? 'bg-accent-fill text-white' : 'text-header-muted hover:bg-white/10 hover:text-white'}"
+        >
+          <span class="block text-sm font-semibold">{tab.label}</span>
+        </button>
+      {/each}
+    </nav>
+
+    <div class="mt-auto space-y-3">
+      <div class="border-t border-white/10 pt-4">
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-xs font-semibold uppercase tracking-[0.08em] text-header-muted">Resolver</span>
+          <span class="inline-flex items-center gap-1.5 rounded-md bg-success-bg px-2 py-1 text-xs font-semibold text-success-text">
+            <span class="h-1.5 w-1.5 rounded-full bg-success-2" aria-hidden="true"></span>
+            Ready
+          </span>
         </div>
-        <div class="leading-tight">
-          <h1 class="text-xl font-bold tracking-tight">ReDNS</h1>
-          <p class="text-[11px] uppercase tracking-[0.18em] text-header-muted -mt-0.5">DNS Dashboard</p>
+        <div class="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+          <div class="text-header-muted">Retention</div>
+          <div class="text-right font-semibold text-white">24h</div>
+          <div class="text-header-muted">Theme</div>
+          <div class="text-right font-semibold capitalize text-white">{theme.value}</div>
         </div>
       </div>
 
-      <nav class="hidden sm:flex items-center space-x-1 p-1 rounded-xl bg-white/5 ring-1 ring-white/10">
-        {#each tabs as tab}
-          <button
-            onclick={() => selectTab(tab)}
-            class="relative px-4 py-1.5 rounded-lg text-sm font-medium capitalize transition-all duration-200 {activeTab === tab ? 'text-white' : 'text-header-muted hover:text-white'}"
-          >
-            {#if activeTab === tab}
-              <span class="absolute inset-0 rounded-lg bg-grad-accent shadow-glow opacity-95"></span>
-            {/if}
-            <span class="relative">{tab}</span>
-          </button>
-        {/each}
-      </nav>
+      <button
+        onclick={toggleTheme}
+        class="flex w-full items-center justify-between rounded-md border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-header-muted transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+      >
+        <span>Appearance</span>
+        <span class="capitalize text-white">{theme.value}</span>
+      </button>
+    </div>
+  </div>
+</aside>
+
+<header class="sticky top-0 z-20 border-b border-white/10 bg-header text-header-text shadow-soft lg:hidden">
+  <div class="px-4 sm:px-6">
+    <div class="flex min-h-16 items-center justify-between gap-4 py-2">
+      <div class="flex items-center gap-3">
+        <div class="relative flex h-9 w-9 items-center justify-center rounded-md bg-accent-fill font-extrabold text-white ring-1 ring-white/20">
+          R
+          <span class="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-success-2 ring-2 ring-header" aria-hidden="true"></span>
+        </div>
+        <div class="leading-tight">
+          <h1 class="text-xl font-bold tracking-tight">ReDNS</h1>
+          <p class="text-[11px] font-semibold uppercase tracking-[0.12em] text-header-muted -mt-0.5">Resolver Console</p>
+        </div>
+      </div>
 
       <div class="flex items-center gap-1.5">
         <button
           onclick={toggleTheme}
           aria-label="Toggle theme"
           title={theme.value === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-          class="p-2 rounded-lg text-header-muted hover:bg-white/10 hover:text-white transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+          class="rounded-md p-2 text-header-muted transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
         >
           {#if theme.value === 'dark'}
             <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -67,8 +110,9 @@
 
         <button
           onclick={() => (mobileMenuOpen = !mobileMenuOpen)}
-          class="sm:hidden p-2 rounded-lg text-header-muted hover:bg-white/10 hover:text-white transition-colors"
+          class="rounded-md p-2 text-header-muted transition-colors hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
           aria-label="Menu"
+          aria-expanded={mobileMenuOpen}
         >
           <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             {#if mobileMenuOpen}
@@ -83,17 +127,18 @@
   </div>
 
   {#if mobileMenuOpen}
-    <div class="sm:hidden bg-header-2/95 backdrop-blur border-t border-white/10" transition:slide>
-      <div class="px-3 pt-3 pb-4 space-y-1">
+    <div class="border-t border-white/10 bg-header-2" transition:slide>
+      <nav class="space-y-1 px-3 py-4" aria-label="Dashboard sections">
         {#each tabs as tab}
           <button
-            onclick={() => selectTab(tab)}
-            class="block w-full text-left px-4 py-2.5 rounded-lg text-base font-medium capitalize transition-colors {activeTab === tab ? 'bg-grad-accent text-white shadow-glow' : 'text-header-muted hover:bg-white/10 hover:text-white'}"
+            onclick={() => selectTab(tab.id)}
+            aria-current={activeTab === tab.id ? 'page' : undefined}
+            class="block w-full rounded-md px-3 py-2.5 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-white/50 {activeTab === tab.id ? 'bg-accent-fill text-white' : 'text-header-muted hover:bg-white/10 hover:text-white'}"
           >
-            {tab}
+            <span class="block text-sm font-semibold">{tab.label}</span>
           </button>
         {/each}
-      </div>
+      </nav>
     </div>
   {/if}
 </header>

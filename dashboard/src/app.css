@@ -1,3 +1,4 @@
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Pixel&display=swap");
 @import "tailwindcss";
 @config "../tailwind.config.js";
 
@@ -16,125 +17,115 @@
 :root {
   color-scheme: light;
 
-  --ui-canvas: #eef1f7;
-  --ui-canvas-2: #e3e8f2;
-  --ui-surface: #ffffff;
-  --ui-surface-2: #ffffff;
-  --ui-panel: #f4f6fb;
-  --ui-line: #e2e7f0;
-  --ui-line-2: #cfd7e4;
+  --ui-canvas: #f5f7fb;
+  --ui-canvas-2: #e7eef8;
+  --ui-surface: #fcfdff;
+  --ui-surface-2: #f7faff;
+  --ui-panel: #eef3fa;
+  --ui-line: #d6e0ec;
+  --ui-line-2: #b7c6da;
 
-  --ui-ink: #0d1526;
-  --ui-muted: #475069;
-  --ui-faint: #8a94aa;
+  --ui-ink: #101828;
+  --ui-muted: #465568;
+  --ui-faint: #64748b;
 
-  --ui-accent: #3b5bdb;
-  --ui-accent-2: #5c7cfa;
-  --ui-accent-3: #748ffc;
-  --ui-accent-soft: #eaf0ff;
-  --ui-accent-grad: linear-gradient(135deg, #3b5bdb 0%, #5c7cfa 55%, #748ffc 100%);
+  --ui-accent: #2776ea;
+  --ui-accent-fill: #155fcb;
+  --ui-accent-2: #155fcb;
+  --ui-accent-3: #73aaff;
+  --ui-accent-soft: #e8f1ff;
   --ui-on-accent: #ffffff;
 
-  --ui-header: #0b1b3a;
-  --ui-header-2: #122a5e;
-  --ui-header-3: #1e3a8a;
+  --ui-header: #111827;
+  --ui-header-2: #172033;
+  --ui-header-3: #1f2d46;
   --ui-header-text: #ffffff;
-  --ui-header-muted: #aab9d8;
-  --ui-header-grad: linear-gradient(120deg, #091532 0%, #0e2350 45%, #1c3c8c 100%);
+  --ui-header-muted: #aab6c8;
 
   --ui-success: #059669;
   --ui-success-2: #10b981;
   --ui-success-bg: #ecfdf5;
   --ui-success-text: #047857;
-  --ui-success-grad: linear-gradient(135deg, #059669 0%, #10b981 100%);
 
   --ui-danger: #dc2626;
   --ui-danger-2: #ef4444;
   --ui-danger-bg: #fef2f2;
   --ui-danger-text: #b91c1c;
-  --ui-danger-grad: linear-gradient(135deg, #dc2626 0%, #f43f5e 100%);
 
   --ui-warn: #d97706;
   --ui-warn-2: #f59e0b;
   --ui-warn-bg: #fffbeb;
   --ui-warn-text: #b45309;
-  --ui-warn-grad: linear-gradient(135deg, #d97706 0%, #f59e0b 100%);
 
-  --ui-info: #2563eb;
-  --ui-info-2: #3b82f6;
-  --ui-info-bg: #eff6ff;
-  --ui-info-text: #1d4ed8;
-  --ui-info-grad: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+  --ui-info: #0e7490;
+  --ui-info-2: #0891b2;
+  --ui-info-bg: #ecfeff;
+  --ui-info-text: #0e7490;
 
-  --ui-neutral-bg: #f1f5f9;
-  --ui-neutral-text: #475569;
+  --ui-neutral-bg: #edf2f8;
+  --ui-neutral-text: #465568;
 
-  --ui-shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px -8px rgba(15, 23, 42, 0.1);
-  --ui-shadow-soft: 0 1px 2px rgba(15, 23, 42, 0.04);
-  --ui-shadow-lift: 0 4px 12px -2px rgba(15, 23, 42, 0.08), 0 20px 40px -12px rgba(15, 23, 42, 0.16);
-  --ui-shadow-glow: 0 0 0 1px rgba(91, 124, 250, 0.12), 0 8px 30px -6px rgba(59, 91, 219, 0.28);
+  --ui-shadow-card: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 12px -10px rgba(16, 24, 40, 0.16);
+  --ui-shadow-soft: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --ui-shadow-lift: 0 4px 10px -4px rgba(16, 24, 40, 0.12), 0 18px 32px -20px rgba(16, 24, 40, 0.22);
+  --ui-shadow-glow: 0 0 0 1px rgba(39, 118, 234, 0.18);
 }
 
 .dark {
   color-scheme: dark;
 
-  --ui-canvas: #070c18;
-  --ui-canvas-2: #0a1428;
-  --ui-surface: #111b31;
-  --ui-surface-2: #16223d;
-  --ui-panel: #0e1830;
-  --ui-line: #22304d;
-  --ui-line-2: #32456a;
+  --ui-canvas: #070a10;
+  --ui-canvas-2: #0d1320;
+  --ui-surface: #111827;
+  --ui-surface-2: #172033;
+  --ui-panel: #0d1524;
+  --ui-line: #25324a;
+  --ui-line-2: #364863;
 
-  --ui-ink: #e8eefb;
-  --ui-muted: #9faecb;
-  --ui-faint: #61718f;
+  --ui-ink: #e8eef8;
+  --ui-muted: #a8b5c8;
+  --ui-faint: #8794aa;
 
-  --ui-accent: #6b8bff;
-  --ui-accent-2: #8aa2ff;
-  --ui-accent-3: #a8baff;
-  --ui-accent-soft: rgba(107, 139, 255, 0.14);
-  --ui-accent-grad: linear-gradient(135deg, #4c6bff 0%, #6b8bff 55%, #8aa2ff 100%);
+  --ui-accent: #2776ea;
+  --ui-accent-fill: #155fcb;
+  --ui-accent-2: #73aaff;
+  --ui-accent-3: #b8d6ff;
+  --ui-accent-soft: color-mix(in srgb, var(--ui-accent) 14%, transparent);
   --ui-on-accent: #ffffff;
 
-  --ui-header: #060d1c;
-  --ui-header-2: #0a1631;
-  --ui-header-3: #1a2f63;
-  --ui-header-text: #e8eefb;
-  --ui-header-muted: #7d8eb0;
-  --ui-header-grad: linear-gradient(120deg, #04081a 0%, #0a1530 45%, #1b2f6a 100%);
+  --ui-header: #070a10;
+  --ui-header-2: #0d1320;
+  --ui-header-3: #111827;
+  --ui-header-text: #e8eef8;
+  --ui-header-muted: #a8b5c8;
 
-  --ui-success: #34d399;
+  --ui-success: #10b981;
   --ui-success-2: #6ee7b7;
-  --ui-success-bg: rgba(52, 211, 153, 0.12);
+  --ui-success-bg: color-mix(in srgb, var(--ui-success) 12%, transparent);
   --ui-success-text: #6ee7b7;
-  --ui-success-grad: linear-gradient(135deg, #10b981 0%, #34d399 100%);
 
-  --ui-danger: #f87171;
+  --ui-danger: #ef4444;
   --ui-danger-2: #fca5a5;
-  --ui-danger-bg: rgba(248, 113, 113, 0.12);
+  --ui-danger-bg: color-mix(in srgb, var(--ui-danger) 12%, transparent);
   --ui-danger-text: #fca5a5;
-  --ui-danger-grad: linear-gradient(135deg, #f43f5e 0%, #fb7185 100%);
 
   --ui-warn: #fbbf24;
   --ui-warn-2: #fcd34d;
-  --ui-warn-bg: rgba(251, 191, 36, 0.12);
+  --ui-warn-bg: color-mix(in srgb, var(--ui-warn) 12%, transparent);
   --ui-warn-text: #fcd34d;
-  --ui-warn-grad: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%);
 
-  --ui-info: #60a5fa;
-  --ui-info-2: #93c5fd;
-  --ui-info-bg: rgba(96, 165, 250, 0.14);
-  --ui-info-text: #93c5fd;
-  --ui-info-grad: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%);
+  --ui-info: #22d3ee;
+  --ui-info-2: #67e8f9;
+  --ui-info-bg: color-mix(in srgb, var(--ui-info) 14%, transparent);
+  --ui-info-text: #67e8f9;
 
-  --ui-neutral-bg: rgba(159, 174, 203, 0.12);
-  --ui-neutral-text: #c6d1e8;
+  --ui-neutral-bg: color-mix(in srgb, var(--ui-muted) 12%, transparent);
+  --ui-neutral-text: #c8d7d0;
 
-  --ui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 30px -10px rgba(0, 0, 0, 0.5);
+  --ui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.36), 0 8px 12px -10px rgba(0, 0, 0, 0.65);
   --ui-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.3);
   --ui-shadow-lift: 0 8px 20px -4px rgba(0, 0, 0, 0.5), 0 24px 50px -16px rgba(0, 0, 0, 0.6);
-  --ui-shadow-glow: 0 0 0 1px rgba(107, 139, 255, 0.22), 0 10px 36px -6px rgba(107, 139, 255, 0.4);
+  --ui-shadow-glow: 0 0 0 1px color-mix(in srgb, var(--ui-accent) 22%, transparent);
 }
 
 @theme inline {
@@ -151,6 +142,7 @@
   --color-faint: var(--ui-faint);
 
   --color-accent: var(--ui-accent);
+  --color-accent-fill: var(--ui-accent-fill);
   --color-accent-2: var(--ui-accent-2);
   --color-accent-3: var(--ui-accent-3);
   --color-accent-soft: var(--ui-accent-soft);
@@ -190,10 +182,10 @@
   --shadow-lift: var(--ui-shadow-lift);
   --shadow-glow: var(--ui-shadow-glow);
 
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-    Helvetica, Arial, sans-serif;
-  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas,
-    "Liberation Mono", monospace;
+  --font-sans: "Geist", "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Pixel", ui-monospace, "JetBrains Mono", "SF Mono", Menlo,
+    Monaco, Consolas, "Liberation Mono", monospace;
 }
 
 @layer base {
@@ -204,25 +196,22 @@
     -moz-osx-font-smoothing: grayscale;
   }
 
-  /* Layered, theme-aware ambient background — subtle accent aurora top-right
-     and warm glow bottom-left so the canvas never feels flat. */
+  /* Layered, theme-aware operational canvas. */
   #app::before {
     content: "";
     position: fixed;
     inset: 0;
     z-index: -1;
     pointer-events: none;
-    background:
-      radial-gradient(900px 520px at 100% -8%, color-mix(in srgb, var(--ui-accent) 16%, transparent), transparent 60%),
-      radial-gradient(700px 480px at -10% 105%, color-mix(in srgb, var(--ui-header-3) 14%, transparent), transparent 60%);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--ui-canvas-2) 48%, transparent), transparent 38%);
     background-attachment: fixed;
   }
 
   /* Smooth, theme-aware color transitions — gated behind .ready so the very
      first paint doesn't fade in. The .ready class is added after mount. */
-  html.ready *,
-  html.ready *::before,
-  html.ready *::after {
+  html.ready :where(a, button, input, select, textarea, [role="button"], tr, .skeleton),
+  html.ready :where(a, button, input, select, textarea, [role="button"], tr, .skeleton)::before,
+  html.ready :where(a, button, input, select, textarea, [role="button"], tr, .skeleton)::after {
     transition: background-color 0.18s ease, border-color 0.18s ease,
       color 0.18s ease, fill 0.18s ease, stroke 0.18s ease, box-shadow 0.18s ease,
       transform 0.18s ease;
@@ -253,35 +242,6 @@
 }
 
 @layer components {
-  /* ---- Glass surfaces: translucent + blurred with layered borders. ---- */
-  .glass {
-    background-color: color-mix(in srgb, var(--ui-surface) 82%, transparent);
-    backdrop-filter: blur(16px) saturate(140%);
-    -webkit-backdrop-filter: blur(16px) saturate(140%);
-  }
-  .glass-panel {
-    background-color: color-mix(in srgb, var(--ui-panel) 72%, transparent);
-    backdrop-filter: blur(12px) saturate(140%);
-    -webkit-backdrop-filter: blur(12px) saturate(140%);
-  }
-
-  /* ---- Gradient text helper (for hero numerals / titles). ---- */
-  .text-grad-accent {
-    background: var(--ui-accent-grad);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-  }
-
-  /* ---- Animated gradient sheen used on primary buttons & active bars. ---- */
-  .bg-grad-accent {
-    background-image: var(--ui-accent-grad);
-    background-size: 180% 180%;
-  }
-  .bg-grad-header {
-    background-image: var(--ui-header-grad);
-  }
-
   /* ---- Loading shimmer skeleton. ---- */
   .skeleton {
     position: relative;
@@ -307,13 +267,13 @@
     }
   }
 
-  /* ---- Slow gradient drift for hero accents. ---- */
+  /* ---- Legacy animation hooks: intentionally quiet for product UI. ---- */
   @keyframes grad-drift {
     0%, 100% { background-position: 0% 50%; }
     50% { background-position: 100% 50%; }
   }
   .animate-drift {
-    animation: grad-drift 8s ease infinite;
+    animation: none;
   }
 
   /* ---- Soft pulse for live/active dots. ---- */
@@ -323,5 +283,16 @@
   }
   .animate-soft-pulse {
     animation: soft-pulse 1.8s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }
