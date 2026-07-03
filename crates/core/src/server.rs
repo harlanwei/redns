@@ -57,6 +57,14 @@ pub trait DnsHandler: Send + Sync {
     /// Handle a DNS query. Returns the response message.
     async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message>;
 
+    /// Handle a TCP DNS query and return the final wire-format response.
+    async fn handle_tcp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
+        self.handle(query, meta)
+            .await?
+            .to_vec()
+            .map_err(|e| format!("failed to serialize TCP response: {e}").into())
+    }
+
     /// Handle a UDP DNS query and return the final wire-format response.
     ///
     /// The default implementation reuses [`DnsHandler::handle`] and performs
@@ -66,6 +74,64 @@ pub trait DnsHandler: Send + Sync {
         let max_payload = udp_max_payload(&query);
         let resp = self.handle(query, meta).await?;
         serialize_udp_response(resp, max_payload)
+    }
+}
+
+enum ResponsePayload {
+    Message(Message),
+    Wire(Vec<u8>),
+}
+
+impl ResponsePayload {
+    fn set_recursion_available(&mut self) {
+        match self {
+            Self::Message(resp) => {
+                resp.set_recursion_available(true);
+            }
+            Self::Wire(wire) => set_recursion_available_in_wire(wire),
+        }
+    }
+
+    fn response_code(&self) -> Option<ResponseCode> {
+        match self {
+            Self::Message(resp) => Some(resp.response_code()),
+            Self::Wire(wire) => dns_header_rcode(wire),
+        }
+    }
+
+    fn into_message(mut self) -> PluginResult<Message> {
+        self.set_recursion_available();
+        match self {
+            Self::Message(resp) => Ok(resp),
+            Self::Wire(wire) => Message::from_vec(&wire)
+                .map_err(|e| format!("failed to decode wire response: {e}").into()),
+        }
+    }
+
+    fn into_tcp_wire(mut self) -> PluginResult<Vec<u8>> {
+        self.set_recursion_available();
+        match self {
+            Self::Message(resp) => resp
+                .to_vec()
+                .map_err(|e| format!("failed to serialize TCP response: {e}").into()),
+            Self::Wire(wire) => Ok(wire),
+        }
+    }
+
+    fn into_udp_wire(mut self, max_payload: usize) -> PluginResult<Vec<u8>> {
+        self.set_recursion_available();
+        match self {
+            Self::Message(resp) => serialize_udp_response(resp, max_payload),
+            Self::Wire(wire) if wire.len() <= max_payload => Ok(wire),
+            Self::Wire(wire) => {
+                let resp = Message::from_vec(&wire).map_err(
+                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("failed to decode oversized UDP response: {e}").into()
+                    },
+                )?;
+                serialize_udp_response(resp, max_payload)
+            }
+        }
     }
 }
 
@@ -99,38 +165,31 @@ impl EntryHandler {
 
     /// Creates a new entry handler with best-effort system DNS fallback.
     pub fn with_best_effort(entry: Arc<dyn Executable>, best_effort: bool) -> Self {
-        Self {
-            entry,
-            best_effort,
-        }
+        Self { entry, best_effort }
     }
-}
 
-#[async_trait]
-impl DnsHandler for EntryHandler {
-    async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message> {
+    async fn handle_payload(
+        &self,
+        query: Message,
+        meta: QueryMeta,
+    ) -> PluginResult<ResponsePayload> {
         // Basic query validation.
         if query.message_type() == MessageType::Response || query.queries().len() != 1 {
-            return Ok(servfail_response(&query));
+            return Ok(ResponsePayload::Message(servfail_response(&query)));
         }
 
-        // Safe: validated above that exactly one question exists. Binding
-        // `qname` as a `&Name` (not a String) keeps it allocation-free; `query`
-        // is never mutated, so this borrow lives for the whole handler. The
-        // `tracing` macros only evaluate field expressions when the level is
-        // enabled, so no `to_ascii`/`format!` allocation happens on the hot
-        // path when debug logging is off.
-        let question = &query.queries()[0];
-        let qname = question.name();
-        debug!(
-            qname = %qname,
-            qtype = ?question.query_type(),
-            id = query.id(),
-            "handling query"
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let question = &query.queries()[0];
+            debug!(
+                qname = %question.name(),
+                qtype = ?question.query_type(),
+                id = query.id(),
+                "handling query"
+            );
+        }
 
         let start = std::time::Instant::now();
-        let mut ctx = Context::new(query.clone());
+        let mut ctx = Context::new(query);
         ctx.server_meta.from_udp = meta.from_udp;
         ctx.server_meta.client_addr = meta.client_addr;
         ctx.server_meta.url_path = meta.url_path;
@@ -138,14 +197,14 @@ impl DnsHandler for EntryHandler {
         ctx.set_query_wire(meta.query_wire.clone());
         let result = self.entry.exec(&mut ctx).await;
         let elapsed = start.elapsed();
-        let selected_upstream = if result.is_ok() && ctx.response().is_some() {
+        let selected_upstream = if result.is_ok() && ctx.has_response_output() {
             ctx.get_value::<Arc<UpstreamWrapper>>(KV_SELECTED_UPSTREAM)
                 .cloned()
         } else {
             None
         };
         let served_from_cache =
-            result.is_ok() && ctx.response().is_some() && ctx.has_mark(MARK_CACHE_HIT);
+            result.is_ok() && ctx.has_response_output() && ctx.has_mark(MARK_CACHE_HIT);
 
         // Best-effort system DNS is a *last resort*: it fires only when NO
         // upstream produced a response at all — i.e. the chain returned an
@@ -163,31 +222,34 @@ impl DnsHandler for EntryHandler {
         // as authoritative.
         let no_upstream_response = result.is_err();
 
-        let mut resp = match result {
-            Ok(()) => ctx
-                .response()
-                .cloned()
-                .unwrap_or_else(|| noerror_response(&query)),
+        let mut payload = match result {
+            Ok(()) => match ctx.take_response_wire() {
+                Some(wire) => ResponsePayload::Wire(wire),
+                None => ResponsePayload::Message(
+                    ctx.response()
+                        .cloned()
+                        .unwrap_or_else(|| noerror_response(ctx.query())),
+                ),
+            },
             Err(e) => {
+                let qname = qname_for_log(&ctx);
                 warn!(error = %e, qname = %qname, elapsed = ?elapsed, "entry handler error");
-                servfail_response(&query)
+                ResponsePayload::Message(servfail_response(ctx.query()))
             }
         };
 
         if no_upstream_response && self.best_effort {
+            let qname = qname_for_log(&ctx);
             warn!(
                 qname = %qname,
                 "attempting best-effort system DNS fallback (no upstream responded)"
             );
-            match tokio::time::timeout(
-                DEFAULT_QUERY_TIMEOUT,
-                system_fallback_resolve(&query),
-            )
-            .await
+            match tokio::time::timeout(DEFAULT_QUERY_TIMEOUT, system_fallback_resolve(ctx.query()))
+                .await
             {
                 Ok(Ok(Some(system_resp))) => {
                     debug!(qname = %qname, "using system DNS fallback response");
-                    resp = system_resp;
+                    payload = ResponsePayload::Message(system_resp);
                 }
                 Ok(Ok(None)) => {
                     debug!(qname = %qname, "system DNS fallback unavailable");
@@ -212,26 +274,42 @@ impl DnsHandler for EntryHandler {
             upstream.record_final_selected();
         }
 
-        if served_from_cache
-            && let Some(selected_upstreams) = meta.selected_upstreams.as_ref()
-        {
+        if served_from_cache && let Some(selected_upstreams) = meta.selected_upstreams.as_ref() {
             let mut selected = selected_upstreams.lock();
             if !selected.iter().any(|name| name == "__C__") {
                 selected.push("__C__".to_string());
             }
         }
 
-        debug!(
-            qname = %qname,
-            rcode = ?resp.response_code(),
-            elapsed = ?elapsed,
-            "query completed"
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let qname = qname_for_log(&ctx);
+            debug!(
+                qname = %qname,
+                rcode = ?payload.response_code(),
+                elapsed = ?elapsed,
+                "query completed"
+            );
+        }
 
-        // Forwarder: always set RA.
-        resp.set_recursion_available(true);
+        Ok(payload)
+    }
+}
 
-        Ok(resp)
+#[async_trait]
+impl DnsHandler for EntryHandler {
+    async fn handle(&self, query: Message, meta: QueryMeta) -> PluginResult<Message> {
+        self.handle_payload(query, meta).await?.into_message()
+    }
+
+    async fn handle_tcp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
+        self.handle_payload(query, meta).await?.into_tcp_wire()
+    }
+
+    async fn handle_udp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
+        let max_payload = udp_max_payload(&query);
+        self.handle_payload(query, meta)
+            .await?
+            .into_udp_wire(max_payload)
     }
 }
 
@@ -264,6 +342,23 @@ fn serialize_udp_response(resp: Message, max_payload: usize) -> PluginResult<Vec
         }
         Err(e) => Err(format!("failed to serialize UDP response: {e}").into()),
     }
+}
+
+fn set_recursion_available_in_wire(wire: &mut [u8]) {
+    if wire.len() >= 4 {
+        wire[3] |= 0x80;
+    }
+}
+
+fn dns_header_rcode(wire: &[u8]) -> Option<ResponseCode> {
+    wire.get(3)
+        .map(|flags| ResponseCode::from_low(flags & 0x0f))
+}
+
+fn qname_for_log(ctx: &Context) -> String {
+    ctx.question()
+        .map(|q| q.name().to_ascii())
+        .unwrap_or_default()
 }
 
 fn empty_response(query: &Message) -> Message {
@@ -355,6 +450,22 @@ mod tests {
         }
     }
 
+    struct RawWireExec;
+    #[async_trait]
+    impl Executable for RawWireExec {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            let mut resp = Message::new();
+            resp.set_id(ctx.query().id());
+            resp.set_message_type(MessageType::Response);
+            resp.set_response_code(ResponseCode::NoError);
+            if let Some(q) = ctx.query().queries().first() {
+                resp.add_query(q.clone());
+            }
+            ctx.set_response_wire(Some(resp.to_vec().unwrap()));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn no_response_returns_noerror() {
         let handler = EntryHandler::new(Arc::new(NopExec));
@@ -388,13 +499,45 @@ mod tests {
         assert!(resp.recursion_available());
     }
 
+    #[tokio::test]
+    async fn raw_wire_response_is_returned_with_recursion_available() {
+        let handler = EntryHandler::new(Arc::new(RawWireExec));
+
+        let msg_resp = handler
+            .handle(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
+        assert_eq!(msg_resp.response_code(), ResponseCode::NoError);
+        assert!(msg_resp.recursion_available());
+
+        let tcp_wire = handler
+            .handle_tcp(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
+        let tcp_resp = Message::from_vec(&tcp_wire).unwrap();
+        assert!(tcp_resp.recursion_available());
+
+        let udp_wire = handler
+            .handle_udp(
+                make_query(),
+                QueryMeta {
+                    from_udp: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let udp_resp = Message::from_vec(&udp_wire).unwrap();
+        assert!(udp_resp.recursion_available());
+    }
+
     /// Executable that stuffs the response with enough answer records to blow
     /// past the 512-byte classic UDP limit.
     struct BigResponseExec;
     #[async_trait]
     impl Executable for BigResponseExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-            use hickory_proto::rr::{rdata::TXT, Name, RData, Record};
+            use hickory_proto::rr::{Name, RData, Record, rdata::TXT};
             let mut resp = Message::new();
             resp.set_id(ctx.query().id());
             resp.set_message_type(MessageType::Response);
@@ -422,7 +565,8 @@ mod tests {
             from_udp: true,
             ..Default::default()
         };
-        let resp = Message::from_vec(&handler.handle_udp(make_query(), meta).await.unwrap()).unwrap();
+        let resp =
+            Message::from_vec(&handler.handle_udp(make_query(), meta).await.unwrap()).unwrap();
         assert!(resp.truncated(), "TC bit should be set");
         assert!(resp.answers().is_empty(), "answers should be dropped");
         assert!(resp.recursion_available());
@@ -476,8 +620,7 @@ mod tests {
     #[tokio::test]
     async fn servfail_response_returned_untouched_under_best_effort() {
         let resp = response_with_rcode(&make_query(), ResponseCode::ServFail);
-        let handler =
-            EntryHandler::with_best_effort(Arc::new(FixedResponseExec(resp)), true);
+        let handler = EntryHandler::with_best_effort(Arc::new(FixedResponseExec(resp)), true);
         let out = handler
             .handle(make_query(), QueryMeta::default())
             .await

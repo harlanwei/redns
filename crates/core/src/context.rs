@@ -19,6 +19,7 @@ use crate::plugin::PluginResult;
 use hickory_proto::op::{Edns, Message, Query};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -66,7 +67,6 @@ pub struct ServerMeta {
 ///
 /// All methods assume single-threaded access — the context is **not**
 /// `Sync`. Pass it through the pipeline by value or behind `&mut`.
-#[derive(Debug)]
 pub struct Context {
     id: u32,
     start_time: Instant,
@@ -87,11 +87,21 @@ pub struct Context {
     /// The DNS response (may be `None` until a plugin sets it).
     response: Option<Message>,
 
+    /// Optional pre-serialized DNS response wire bytes.
+    response_wire: Option<Vec<u8>>,
+
+    /// Hot-path storage for the selected upstream. Keeping this out of the
+    /// generic KV map avoids allocating a HashMap for the common forward path.
+    selected_upstream: Option<Arc<crate::upstream::UpstreamWrapper>>,
+
     /// A key-value store for passing arbitrary data between plugins.
-    kv: HashMap<u32, Box<dyn std::any::Any + Send + Sync>>,
+    kv: Option<HashMap<u32, Box<dyn std::any::Any + Send + Sync>>>,
 
     /// A set of boolean marks for fast flag checks.
-    marks: HashSet<u32>,
+    marks: Option<HashSet<u32>>,
+
+    /// Hot-path storage for cache-hit marking.
+    cache_hit: bool,
 
     /// Remaining chain-node execution budget for this query (see
     /// [`MAX_CHAIN_STEPS`]). Decremented as the chain walker visits nodes.
@@ -144,8 +154,11 @@ impl Context {
             client_edns,
             query_wire: None,
             response: None,
-            kv: HashMap::new(),
-            marks: HashSet::new(),
+            response_wire: None,
+            selected_upstream: None,
+            kv: None,
+            marks: None,
+            cache_hit: false,
             steps_remaining: MAX_CHAIN_STEPS,
             edns_udp_size,
         }
@@ -221,6 +234,7 @@ impl Context {
     /// Sets the response message. Pass `None` to clear any existing response.
     pub fn set_response(&mut self, resp: Option<Message>) {
         self.response = resp;
+        self.response_wire = None;
     }
 
     /// Returns a reference to the current response, if set.
@@ -230,41 +244,138 @@ impl Context {
 
     /// Returns a mutable reference to the current response, if set.
     pub fn response_mut(&mut self) -> Option<&mut Message> {
+        self.response_wire = None;
         self.response.as_mut()
+    }
+
+    /// Sets a pre-serialized response. Pass `None` to clear it.
+    pub fn set_response_wire(&mut self, wire: Option<Vec<u8>>) {
+        self.response_wire = wire;
+        self.response = None;
+    }
+
+    /// Returns the pre-serialized response wire, if set.
+    pub fn response_wire(&self) -> Option<&[u8]> {
+        self.response_wire.as_deref()
+    }
+
+    /// Takes the pre-serialized response wire, if set.
+    pub fn take_response_wire(&mut self) -> Option<Vec<u8>> {
+        self.response_wire.take()
+    }
+
+    /// Returns true when either response representation is present.
+    pub fn has_response_output(&self) -> bool {
+        self.response.is_some() || self.response_wire.is_some()
     }
 
     // ── Key-Value Store ──────────────────────────────────────────
 
     /// Stores an arbitrary value under key `k`.
     pub fn store_value<V: 'static + Send + Sync>(&mut self, k: u32, v: V) {
-        self.kv.insert(k, Box::new(v));
+        let boxed: Box<dyn std::any::Any + Send + Sync> = Box::new(v);
+        if k == KV_SELECTED_UPSTREAM {
+            match boxed.downcast::<Arc<crate::upstream::UpstreamWrapper>>() {
+                Ok(upstream) => {
+                    self.selected_upstream = Some(*upstream);
+                }
+                Err(boxed) => {
+                    self.kv.get_or_insert_with(HashMap::new).insert(k, boxed);
+                }
+            }
+        } else {
+            self.kv.get_or_insert_with(HashMap::new).insert(k, boxed);
+        }
     }
 
     /// Retrieves a reference to the value stored under key `k`.
     pub fn get_value<V: 'static>(&self, k: u32) -> Option<&V> {
-        self.kv.get(&k).and_then(|b| b.downcast_ref::<V>())
+        if k == KV_SELECTED_UPSTREAM {
+            if let Some(upstream) = self.selected_upstream.as_ref() {
+                let any = upstream as &dyn std::any::Any;
+                if let Some(value) = any.downcast_ref::<V>() {
+                    return Some(value);
+                }
+            }
+        }
+        self.kv
+            .as_ref()
+            .and_then(|kv| kv.get(&k))
+            .and_then(|b| b.downcast_ref::<V>())
     }
 
     /// Removes the value stored under key `k`.
     pub fn delete_value(&mut self, k: u32) {
-        self.kv.remove(&k);
+        if k == KV_SELECTED_UPSTREAM {
+            self.selected_upstream = None;
+        }
+        if let Some(kv) = self.kv.as_mut() {
+            kv.remove(&k);
+            if kv.is_empty() {
+                self.kv = None;
+            }
+        }
     }
 
     // ── Marks ────────────────────────────────────────────────────
 
     /// Sets a boolean mark `m` on this context.
     pub fn set_mark(&mut self, m: u32) {
-        self.marks.insert(m);
+        if m == MARK_CACHE_HIT {
+            self.cache_hit = true;
+        } else {
+            self.marks.get_or_insert_with(HashSet::new).insert(m);
+        }
     }
 
     /// Returns `true` if mark `m` has been set.
     pub fn has_mark(&self, m: u32) -> bool {
-        self.marks.contains(&m)
+        if m == MARK_CACHE_HIT {
+            self.cache_hit
+        } else {
+            self.marks.as_ref().is_some_and(|marks| marks.contains(&m))
+        }
     }
 
     /// Removes mark `m`.
     pub fn delete_mark(&mut self, m: u32) {
-        self.marks.remove(&m);
+        if m == MARK_CACHE_HIT {
+            self.cache_hit = false;
+            return;
+        }
+        if let Some(marks) = self.marks.as_mut() {
+            marks.remove(&m);
+            if marks.is_empty() {
+                self.marks = None;
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("id", &self.id)
+            .field("start_time", &self.start_time)
+            .field("server_meta", &self.server_meta)
+            .field("query", &self.query)
+            .field("client_edns", &self.client_edns)
+            .field("query_wire_len", &self.query_wire.as_ref().map(|w| w.len()))
+            .field("response", &self.response)
+            .field(
+                "response_wire_len",
+                &self.response_wire.as_ref().map(Vec::len),
+            )
+            .field(
+                "selected_upstream",
+                &self.selected_upstream.as_ref().map(|u| u.name()),
+            )
+            .field("kv_len", &self.kv.as_ref().map_or(0, HashMap::len))
+            .field("marks_len", &self.marks.as_ref().map_or(0, HashSet::len))
+            .field("cache_hit", &self.cache_hit)
+            .field("steps_remaining", &self.steps_remaining)
+            .field("edns_udp_size", &self.edns_udp_size)
+            .finish()
     }
 }
 

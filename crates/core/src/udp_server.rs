@@ -35,6 +35,14 @@ const MAX_UDP_WORKERS: usize = 32;
 /// backend's `MAX_INFLIGHT_HANDLERS`.
 const MAX_INFLIGHT_HANDLERS: usize = 2048;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UdpServerOptions {
+    /// Number of receive-loop workers. Defaults to a small multiple of CPU count.
+    pub worker_count: Option<usize>,
+    /// Maximum concurrently in-flight handler tasks.
+    pub max_inflight_handlers: Option<usize>,
+}
+
 fn default_udp_workers() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -142,17 +150,52 @@ pub async fn serve_udp(
     handler: Arc<dyn DnsHandler>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_udp_with_workers(socket, handler, cancel, default_udp_workers()).await
+    serve_udp_with_options(socket, handler, cancel, UdpServerOptions::default()).await
+}
+
+pub async fn serve_udp_with_options(
+    socket: Arc<UdpSocket>,
+    handler: Arc<dyn DnsHandler>,
+    cancel: CancellationToken,
+    options: UdpServerOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let worker_count = options
+        .worker_count
+        .unwrap_or_else(default_udp_workers)
+        .clamp(1, MAX_UDP_WORKERS);
+    let max_inflight = options
+        .max_inflight_handlers
+        .unwrap_or(MAX_INFLIGHT_HANDLERS);
+    let max_inflight = max_inflight.max(1);
+    serve_udp_inner(socket, handler, cancel, worker_count, max_inflight).await
 }
 
 /// Worker-pool core of [`serve_udp`], parameterized on the pool size for tests.
+#[cfg(test)]
 async fn serve_udp_with_workers(
     socket: Arc<UdpSocket>,
     handler: Arc<dyn DnsHandler>,
     cancel: CancellationToken,
     worker_count: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_HANDLERS));
+    serve_udp_inner(
+        socket,
+        handler,
+        cancel,
+        worker_count.clamp(1, MAX_UDP_WORKERS),
+        MAX_INFLIGHT_HANDLERS,
+    )
+    .await
+}
+
+async fn serve_udp_inner(
+    socket: Arc<UdpSocket>,
+    handler: Arc<dyn DnsHandler>,
+    cancel: CancellationToken,
+    worker_count: usize,
+    max_inflight_handlers: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let inflight = Arc::new(Semaphore::new(max_inflight_handlers));
     let mut workers = JoinSet::new();
 
     for _ in 0..worker_count {
@@ -303,7 +346,10 @@ mod tests {
                 break;
             }
         }
-        assert!(served, "server stopped serving after an isolated handler panic");
+        assert!(
+            served,
+            "server stopped serving after an isolated handler panic"
+        );
 
         cancel.cancel();
         let _ = server.await;
@@ -321,7 +367,10 @@ mod tests {
         assert_eq!(meta.protocol.as_deref(), Some("udp"));
         assert!(meta.from_udp);
         assert_eq!(meta.client_addr, Some(client_ip));
-        assert_eq!(meta.query_wire.unwrap().as_slice(), expected_wire.as_slice());
+        assert_eq!(
+            meta.query_wire.unwrap().as_slice(),
+            expected_wire.as_slice()
+        );
     }
 
     /// A slow handler must not stall the receive loop. While one query is awaiting
