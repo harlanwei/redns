@@ -69,6 +69,12 @@ pub struct ServerConfig {
     /// UDP backend: "epoll" (default) or "io-uring" (Linux-only, requires io-uring feature).
     #[serde(default)]
     pub udp_backend: Option<String>,
+    /// Optional epoll UDP receive-loop worker count.
+    #[serde(default)]
+    pub udp_workers: Option<usize>,
+    /// Optional cap on concurrently in-flight UDP handler tasks.
+    #[serde(default)]
+    pub udp_max_inflight: Option<usize>,
 }
 
 fn default_protocol() -> String {
@@ -344,6 +350,28 @@ fn trim_prefix_field<'a>(s: &'a str, prefix: &str) -> (&'a str, bool) {
     }
 }
 
+/// Loads data from a file or returns inline text.
+///
+/// If `s` starts with `file:`, the rest is treated as a file path and its
+/// contents are loaded. Otherwise `s` is returned as-is.
+///
+/// This allows matchers to accept either inline data or file references:
+/// ```text
+/// qname "domain:example.com example.org"    # inline
+/// qname "file:blocklist.txt"                # from file
+/// ```
+pub fn load_file_or_inline(s: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let s = s.trim();
+    if let Some(path) = s.strip_prefix("file:") {
+        let path = path.trim();
+        std::fs::read_to_string(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to load file '{}': {}", path, e).into()
+        })
+    } else {
+        Ok(s.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,27 +429,5 @@ mod tests {
         assert!(rc.matches[1].reverse);
         assert_eq!(rc.matches[1].match_type, "has_resp");
         assert_eq!(rc.tag, "forward");
-    }
-}
-
-/// Loads data from a file or returns inline text.
-///
-/// If `s` starts with `file:`, the rest is treated as a file path and its
-/// contents are loaded. Otherwise `s` is returned as-is.
-///
-/// This allows matchers to accept either inline data or file references:
-/// ```text
-/// qname "domain:example.com example.org"    # inline
-/// qname "file:blocklist.txt"                # from file
-/// ```
-pub fn load_file_or_inline(s: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let s = s.trim();
-    if let Some(path) = s.strip_prefix("file:") {
-        let path = path.trim();
-        std::fs::read_to_string(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to load file '{}': {}", path, e).into()
-        })
-    } else {
-        Ok(s.to_string())
     }
 }

@@ -10,14 +10,14 @@
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use lru::LruCache;
+use parking_lot::Mutex;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
-use lru::LruCache;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 /// Reverse lookup configuration.

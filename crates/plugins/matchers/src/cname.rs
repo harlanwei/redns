@@ -28,8 +28,8 @@ impl CnameMatcher {
         if p.is_empty() {
             return;
         }
-        if p.starts_with('.') {
-            self.suffixes.push(p[1..].to_string());
+        if let Some(stripped) = p.strip_prefix('.') {
+            self.suffixes.push(stripped.to_string());
         } else {
             self.exact.insert(p);
         }
@@ -76,10 +76,10 @@ impl Matcher for CnameMatcher {
         for rr in resp.answers() {
             if rr.record_type() == hickory_proto::rr::RecordType::CNAME {
                 let rdata = rr.data();
-                if let hickory_proto::rr::RData::CNAME(cname) = rdata {
-                    if self.matches_name(&cname.0.to_ascii()) {
-                        return Ok(true);
-                    }
+                if let hickory_proto::rr::RData::CNAME(cname) = rdata
+                    && self.matches_name(&cname.0.to_ascii())
+                {
+                    return Ok(true);
                 }
             }
         }

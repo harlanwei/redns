@@ -114,7 +114,11 @@ fn system_nameservers() -> Vec<IpAddr> {
             }
         }
         if !seen.is_empty() {
-            debug!(path, count = seen.len(), "using WAN DNS servers for fallback");
+            debug!(
+                path,
+                count = seen.len(),
+                "using WAN DNS servers for fallback"
+            );
             return seen;
         }
     }
@@ -150,17 +154,17 @@ async fn resolve_via_udp(
         },
     )?;
 
-    sock.connect(ns_addr).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
+    sock.connect(ns_addr)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("system dns: connect to {}: {e}", ns_addr).into()
-        },
-    )?;
+        })?;
 
-    sock.send(query_wire).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
+    sock.send(query_wire)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("system dns: send to {}: {e}", ns_addr).into()
-        },
-    )?;
+        })?;
 
     let mut buf = vec![0u8; MAX_UDP_SIZE];
     let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
@@ -168,18 +172,14 @@ async fn resolve_via_udp(
         .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
             "system dns: query timed out".into()
         })?
-        .map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("system dns: recv from {}: {e}", ns_addr).into()
-            },
-        )?;
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("system dns: recv from {}: {e}", ns_addr).into()
+        })?;
 
     buf.truncate(n);
-    Message::from_vec(&buf).map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("system dns: parse response: {e}").into()
-        },
-    )
+    Message::from_vec(&buf).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("system dns: parse response: {e}").into()
+    })
 }
 
 /// Attempts to resolve a DNS query using the WAN/Internet-assigned DNS servers.

@@ -108,7 +108,10 @@ mod tests {
             client.flush().await.unwrap();
             // Force the reader to loop on a partial head before the rest arrives.
             tokio::time::sleep(Duration::from_millis(20)).await;
-            client.write_all(b"gs HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+            client
+                .write_all(b"gs HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
             drop(client);
         });
 

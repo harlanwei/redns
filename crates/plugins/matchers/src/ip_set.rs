@@ -128,12 +128,8 @@ impl IpSet {
         }
         let net = Self::parse_net(s)?;
         match net {
-            IpNet::V4(n) => self
-                .v4
-                .insert(u32::from(n.network()), n.prefix_len()),
-            IpNet::V6(n) => self
-                .v6
-                .insert(u128::from(n.network()), n.prefix_len()),
+            IpNet::V4(n) => self.v4.insert(u32::from(n.network()), n.prefix_len()),
+            IpNet::V6(n) => self.v6.insert(u128::from(n.network()), n.prefix_len()),
         }
         Ok(())
     }

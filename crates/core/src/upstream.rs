@@ -103,14 +103,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// reconnects and retries, so a longer window costs at most one stale retry.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Maximum idle connections in pool.
-const MAX_IDLE_CONNS: usize = 4;
+/// Default maximum idle connections in a stream pool.
+const DEFAULT_MAX_IDLE_CONNS: usize = 4;
 
 /// Maximum retries on stale pooled connection.
 const MAX_POOL_RETRY: usize = 2;
 
-/// Maximum idle UDP sockets in pool.
-const MAX_IDLE_UDP_SOCKETS: usize = 16;
+/// Default maximum idle UDP sockets in pool.
+const DEFAULT_MAX_IDLE_UDP_SOCKETS: usize = 16;
 
 static GLOBAL_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -128,6 +128,7 @@ pub trait Upstream: Send + Sync {
 pub struct UdpUpstream {
     addr: SocketAddr,
     timeout: Duration,
+    max_idle_sockets: usize,
     pool: Mutex<VecDeque<UdpSocket>>,
 }
 
@@ -136,12 +137,18 @@ impl UdpUpstream {
         Self {
             addr,
             timeout: DEFAULT_TIMEOUT,
+            max_idle_sockets: DEFAULT_MAX_IDLE_UDP_SOCKETS,
             pool: Mutex::new(VecDeque::new()),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_idle_sockets(mut self, max_idle_sockets: usize) -> Self {
+        self.max_idle_sockets = max_idle_sockets;
         self
     }
 
@@ -184,8 +191,11 @@ impl UdpUpstream {
     }
 
     async fn put_socket(&self, sock: UdpSocket) {
+        if self.max_idle_sockets == 0 {
+            return;
+        }
         let mut pool = self.pool.lock().await;
-        while pool.len() >= MAX_IDLE_UDP_SOCKETS {
+        while pool.len() >= self.max_idle_sockets {
             pool.pop_front();
         }
         pool.push_back(sock);
@@ -255,13 +265,15 @@ struct IdleConn<S> {
 /// byte streams alive between queries, differing only in the stream type.
 struct ConnPool<S> {
     idle_timeout: Duration,
+    max_idle: usize,
     conns: Mutex<VecDeque<IdleConn<S>>>,
 }
 
 impl<S> ConnPool<S> {
-    fn new(idle_timeout: Duration) -> Self {
+    fn new(idle_timeout: Duration, max_idle: usize) -> Self {
         Self {
             idle_timeout,
+            max_idle,
             conns: Mutex::new(VecDeque::new()),
         }
     }
@@ -280,8 +292,11 @@ impl<S> ConnPool<S> {
 
     /// Return a connection to the pool, enforcing the max idle limit.
     async fn put_idle(&self, stream: S) {
+        if self.max_idle == 0 {
+            return;
+        }
         let mut pool = self.conns.lock().await;
-        while pool.len() >= MAX_IDLE_CONNS {
+        while pool.len() >= self.max_idle {
             pool.pop_front();
         }
         pool.push_back(IdleConn {
@@ -342,12 +357,17 @@ impl PooledTcpUpstream {
         Self {
             addr,
             timeout: DEFAULT_TIMEOUT,
-            pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT),
+            pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_CONNS),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_idle_conns(mut self, max_idle: usize) -> Self {
+        self.pool.max_idle = max_idle;
         self
     }
 }
@@ -397,11 +417,12 @@ async fn tls_connect(
             format!("invalid server name: {e}").into()
         },
     )?;
-    connector.connect(sni, tcp).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
+    connector
+        .connect(sni, tcp)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("tls handshake: {e}").into()
-        },
-    )
+        })
 }
 
 // ── TLS Pooled ──────────────────────────────────────────────────
@@ -422,12 +443,17 @@ impl PooledTlsUpstream {
             server_name,
             timeout: DEFAULT_TIMEOUT,
             tls_config: build_tls_config(),
-            pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT),
+            pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_CONNS),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_idle_conns(mut self, max_idle: usize) -> Self {
+        self.pool.max_idle = max_idle;
         self
     }
 }
@@ -464,7 +490,11 @@ async fn tcp_connect(addr: SocketAddr, timeout: Duration) -> PluginResult<TcpStr
 /// Writes the query and reads the response under a single timeout. Bounding
 /// only the read would leave the write able to block indefinitely if the
 /// upstream accepts the connection but stalls its receive window.
-async fn stream_exchange<S>(stream: &mut S, query: &[u8], timeout: Duration) -> PluginResult<Vec<u8>>
+async fn stream_exchange<S>(
+    stream: &mut S,
+    query: &[u8],
+    timeout: Duration,
+) -> PluginResult<Vec<u8>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -513,7 +543,7 @@ impl DohUpstream {
     /// - `Ip`: host is already an IP, no special handling
     /// - `StaticAddr`: pin to a fixed address (from `dial_addr`)
     /// - `Bootstrap`: use a TTL-aware custom resolver
-    fn new(endpoint: String, resolution: DohResolution) -> Self {
+    fn new(endpoint: String, resolution: DohResolution, pool_max_idle: usize) -> Self {
         use reqwest::header;
         let mut headers = header::HeaderMap::new();
         // HeaderValue::from_static is infallible for valid static strings.
@@ -526,15 +556,15 @@ impl DohUpstream {
             .default_headers(headers)
             .timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(180))
-            .pool_max_idle_per_host(4);
+            .pool_max_idle_per_host(pool_max_idle);
 
         match resolution {
             DohResolution::Ip => {}
             DohResolution::StaticAddr(addr) => {
-                if let Ok(url) = reqwest::Url::parse(&endpoint) {
-                    if let Some(host) = url.host_str() {
-                        builder = builder.resolve(host, addr);
-                    }
+                if let Ok(url) = reqwest::Url::parse(&endpoint)
+                    && let Some(host) = url.host_str()
+                {
+                    builder = builder.resolve(host, addr);
                 }
             }
             DohResolution::Bootstrap(resolver) => {
@@ -743,12 +773,11 @@ impl DoqUpstream {
 
     async fn invalidate_connection(&self, stable_id: usize) {
         let mut guard = self.conn.lock().await;
-        if let Some(conn) = guard.as_ref() {
-            if conn.stable_id() == stable_id {
-                if let Some(conn) = guard.take() {
-                    conn.close(quinn::VarInt::from_u32(0), b"reconnect");
-                }
-            }
+        if let Some(conn) = guard.as_ref()
+            && conn.stable_id() == stable_id
+            && let Some(conn) = guard.take()
+        {
+            conn.close(quinn::VarInt::from_u32(0), b"reconnect");
         }
     }
 }
@@ -948,10 +977,10 @@ impl Doh3Upstream {
 
     async fn get_session(&self) -> PluginResult<Arc<Doh3Session>> {
         let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_ref() {
-            if session.is_healthy() {
-                return Ok(session.clone());
-            }
+        if let Some(session) = guard.as_ref()
+            && session.is_healthy()
+        {
+            return Ok(session.clone());
         }
         Self::clear_session_locked(&mut guard);
 
@@ -962,10 +991,10 @@ impl Doh3Upstream {
 
     async fn invalidate_session(&self, stable_id: usize) {
         let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_ref() {
-            if session.quinn_conn.stable_id() == stable_id {
-                Self::clear_session_locked(&mut guard);
-            }
+        if let Some(session) = guard.as_ref()
+            && session.quinn_conn.stable_id() == stable_id
+        {
+            Self::clear_session_locked(&mut guard);
         }
     }
 }
@@ -1273,6 +1302,8 @@ pub struct UpstreamOpts {
     pub dial_addr: Option<SocketAddr>,
     /// Bootstrap DNS server address for resolving the upstream hostname.
     pub bootstrap: Option<String>,
+    /// Maximum idle transport resources to retain per upstream.
+    pub pool_max_idle: Option<usize>,
 }
 
 impl Default for UpstreamOpts {
@@ -1281,6 +1312,7 @@ impl Default for UpstreamOpts {
             timeout: DEFAULT_TIMEOUT,
             dial_addr: None,
             bootstrap: None,
+            pool_max_idle: None,
         }
     }
 }
@@ -1293,6 +1325,7 @@ impl Default for UpstreamOpts {
 /// - `tls://host:port` — DNS-over-TLS with connection pooling + session cache
 /// - `https://host/path` — DNS-over-HTTPS (RFC 8484)
 /// - `host:port` — defaults to UDP
+///
 /// Normalize an address string by appending the default port if missing.
 /// Handles bare IPs like "202.96.128.86" → "202.96.128.86:53",
 /// IPv6 like "[::1]" → "[::1]:53", and already-ported "1.1.1.1:53" → unchanged.
@@ -1306,10 +1339,10 @@ fn normalize_addr(addr: &str, default_port: u16) -> String {
         return format!("{}:{}", ip, default_port);
     }
     // Host:port or hostname — check if last colon is followed by digits.
-    if let Some((_, port_str)) = addr.rsplit_once(':') {
-        if port_str.parse::<u16>().is_ok() {
-            return addr.to_string(); // Already has port.
-        }
+    if let Some((_, port_str)) = addr.rsplit_once(':')
+        && port_str.parse::<u16>().is_ok()
+    {
+        return addr.to_string(); // Already has port.
     }
     // Append default port.
     format!("{}:{}", addr, default_port)
@@ -1362,13 +1395,13 @@ impl reqwest::dns::Resolve for BootstrapResolver {
         }
 
         let guard = self.cache.lock();
-        if let Some((addr, expiry)) = &*guard {
-            if Instant::now() < *expiry {
-                let addrs = vec![*addr];
-                return Box::pin(async move {
-                    Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
-                });
-            }
+        if let Some((addr, expiry)) = &*guard
+            && Instant::now() < *expiry
+        {
+            let addrs = vec![*addr];
+            return Box::pin(async move {
+                Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+            });
         }
 
         let target_host = self.target_host.clone();
@@ -1627,10 +1660,17 @@ async fn bootstrap_resolve(
         }
     }
 
-    Err(format!("bootstrap DNS returned no A/AAAA records for '{}'", hostname).into())
+    Err(format!(
+        "bootstrap DNS returned no A/AAAA records for '{}'",
+        hostname
+    )
+    .into())
 }
 
 pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upstream>> {
+    let udp_pool_max_idle = opts.pool_max_idle.unwrap_or(DEFAULT_MAX_IDLE_UDP_SOCKETS);
+    let stream_pool_max_idle = opts.pool_max_idle.unwrap_or(DEFAULT_MAX_IDLE_CONNS);
+
     if let Some(rest) = addr.strip_prefix("udp://") {
         let normalized = normalize_addr(rest, 53);
         let socket_addr: SocketAddr =
@@ -1640,7 +1680,9 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
                     format!("invalid address {rest}: {e}").into()
                 })?;
         Ok(Box::new(
-            UdpUpstream::new(socket_addr).with_timeout(opts.timeout),
+            UdpUpstream::new(socket_addr)
+                .with_timeout(opts.timeout)
+                .with_max_idle_sockets(udp_pool_max_idle),
         ))
     } else if let Some(rest) = addr.strip_prefix("tcp://") {
         let normalized = normalize_addr(rest, 53);
@@ -1651,7 +1693,9 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
                     format!("invalid address {rest}: {e}").into()
                 })?;
         Ok(Box::new(
-            PooledTcpUpstream::new(socket_addr).with_timeout(opts.timeout),
+            PooledTcpUpstream::new(socket_addr)
+                .with_timeout(opts.timeout)
+                .with_max_idle_conns(stream_pool_max_idle),
         ))
     } else if let Some(rest) = addr.strip_prefix("tls://") {
         let normalized = normalize_addr(rest, 853);
@@ -1670,12 +1714,15 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
         let socket_addr = resolve_upstream_host(host, port, &opts)?;
 
         Ok(Box::new(
-            PooledTlsUpstream::new(socket_addr, host.to_string()).with_timeout(opts.timeout),
+            PooledTlsUpstream::new(socket_addr, host.to_string())
+                .with_timeout(opts.timeout)
+                .with_max_idle_conns(stream_pool_max_idle),
         ))
     } else if addr.starts_with("https://") {
         let resolution = resolve_doh_host(addr, &opts)?;
         Ok(Box::new(
-            DohUpstream::new(addr.to_string(), resolution).with_timeout(opts.timeout),
+            DohUpstream::new(addr.to_string(), resolution, stream_pool_max_idle)
+                .with_timeout(opts.timeout),
         ))
     } else if let Some(rest) = addr.strip_prefix("quic://") {
         let normalized = normalize_addr(rest, 853);
@@ -1726,7 +1773,9 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
                     format!("invalid address {addr}: {e}").into()
                 })?;
         Ok(Box::new(
-            UdpUpstream::new(socket_addr).with_timeout(opts.timeout),
+            UdpUpstream::new(socket_addr)
+                .with_timeout(opts.timeout)
+                .with_max_idle_sockets(udp_pool_max_idle),
         ))
     }
 }
@@ -1839,8 +1888,7 @@ mod tests {
         // Verify the pooled DoT upstream can be constructed with its own
         // ClientConfig (which backs session resumption within the pooled
         // connection lifecycle).
-        let u1 =
-            PooledTlsUpstream::new("1.1.1.1:853".parse().unwrap(), "one.one.one.one".into());
+        let u1 = PooledTlsUpstream::new("1.1.1.1:853".parse().unwrap(), "one.one.one.one".into());
         let u2 = PooledTlsUpstream::new("8.8.8.8:853".parse().unwrap(), "dns.google".into());
         assert!(Arc::strong_count(&u1.tls_config) == 1);
         assert!(Arc::strong_count(&u2.tls_config) == 1);
@@ -1875,8 +1923,7 @@ mod tests {
             server.send_to(&good, peer).await.unwrap();
         });
 
-        let upstream =
-            UdpUpstream::new(server_addr).with_timeout(Duration::from_secs(2));
+        let upstream = UdpUpstream::new(server_addr).with_timeout(Duration::from_secs(2));
         // Query wire: 2-byte ID followed by a minimal body.
         let query = vec![0x12, 0x34, 0x00, 0x00, 0x00, 0x00];
         let resp = upstream.exchange(&query).await.unwrap();

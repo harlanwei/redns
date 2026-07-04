@@ -1,10 +1,10 @@
 use hickory_proto::op::{Message, ResponseCode};
+use parking_lot::Mutex;
 use redns_core::{DnsHandler, PluginResult, QueryMeta, UpstreamMetrics, UpstreamWrapper};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -209,7 +209,8 @@ impl DashboardStore {
                 });
                 if let Err(e) = handle.await {
                     warn!(error = %e, "dns_logs batch writer task failed");
-                }            }
+                }
+            }
         });
 
         Ok(store)
@@ -343,7 +344,10 @@ impl DashboardStore {
             return Ok(());
         }
         // Try setting incremental on an empty database.
-        if conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;").is_ok() {
+        if conn
+            .execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
+            .is_ok()
+        {
             return Ok(());
         }
         // Tables already exist: VACUUM to apply the new auto-vacuum mode.
@@ -381,9 +385,8 @@ impl DashboardStore {
         )?;
         Self::ensure_geoip_migrations(&geoip_conn)?;
 
-        let mut select = logs_conn.prepare(
-            "SELECT ip, city, asn, isp, proxy, hosting, expires_at FROM geoip_cache",
-        )?;
+        let mut select = logs_conn
+            .prepare("SELECT ip, city, asn, isp, proxy, hosting, expires_at FROM geoip_cache")?;
         let rows = select.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -890,13 +893,11 @@ fn parse_dhcp_leases(paths: &[String]) -> HashMap<String, DhcpLeaseInfo> {
                 let ip = fields[0];
                 let hostname = fields[1];
                 // Quick sanity check: first field should look like an IP
-                if ip.contains('.') || ip.contains(':') {
-                    if !hostname.is_empty() {
-                        map.entry(ip.to_string()).or_insert(DhcpLeaseInfo {
-                            hostname: hostname.to_string(),
-                            mac: None,
-                        });
-                    }
+                if (ip.contains('.') || ip.contains(':')) && !hostname.is_empty() {
+                    map.entry(ip.to_string()).or_insert(DhcpLeaseInfo {
+                        hostname: hostname.to_string(),
+                        mac: None,
+                    });
                 }
             }
         }
@@ -938,18 +939,17 @@ fn parse_neigh_output(output: &str) -> HashMap<String, String> {
     for line in output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         // Expected: <ip> dev <iface> lladdr <mac> <state>
-        if fields.len() >= 5 {
-            if let Some(lladdr_idx) = fields.iter().position(|f| *f == "lladdr") {
-                if lladdr_idx + 1 < fields.len() {
-                    let ip = fields[0];
-                    let mac = fields[lladdr_idx + 1];
-                    // Skip link-local IPv6 addresses — not useful for client identification.
-                    if ip.starts_with("fe80:") {
-                        continue;
-                    }
-                    map.insert(ip.to_string(), mac.to_lowercase());
-                }
+        if fields.len() >= 5
+            && let Some(lladdr_idx) = fields.iter().position(|f| *f == "lladdr")
+            && lladdr_idx + 1 < fields.len()
+        {
+            let ip = fields[0];
+            let mac = fields[lladdr_idx + 1];
+            // Skip link-local IPv6 addresses — not useful for client identification.
+            if ip.starts_with("fe80:") {
+                continue;
             }
+            map.insert(ip.to_string(), mac.to_lowercase());
         }
     }
     map
@@ -1040,7 +1040,7 @@ fn merge_clients_by_hostname(
 
     let mut items: Vec<ClientStatsEntry> = hostname_groups.into_values().collect();
     items.append(&mut standalone);
-    items.sort_by(|a, b| b.query_total.cmp(&a.query_total));
+    items.sort_by_key(|item| std::cmp::Reverse(item.query_total));
     items
 }
 
@@ -1144,33 +1144,36 @@ fn summarize_dashboard_error(err: impl Into<String>) -> (String, String, Vec<Str
     )
 }
 
-async fn persist_dashboard_log(
-    store: &DashboardStore,
+type DashboardLogSummary = (String, String, Vec<String>, u32);
+
+struct DashboardLogInput {
     qname: String,
     qtype: String,
     client_ip: String,
     protocol: String,
     selected_upstreams: Arc<Mutex<Vec<String>>>,
     elapsed: Duration,
-    summary: (String, String, Vec<String>, u32),
-) {
-    let (rcode, result_summary, result_rows, answer_ttl) = summary;
-    let upstream_names = dedupe_keep_order(selected_upstreams.lock().clone());
+    summary: DashboardLogSummary,
+}
+
+async fn persist_dashboard_log(store: &DashboardStore, input: DashboardLogInput) {
+    let (rcode, result_summary, result_rows, answer_ttl) = input.summary;
+    let upstream_names = dedupe_keep_order(input.selected_upstreams.lock().clone());
 
     let entry = NewDnsLogEntry {
         ts_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64,
-        client_ip,
-        protocol,
-        qname,
-        qtype,
+        client_ip: input.client_ip,
+        protocol: input.protocol,
+        qname: input.qname,
+        qtype: input.qtype,
         rcode,
         upstream_names,
         result: result_summary,
         result_rows_json: serde_json::to_string(&result_rows).unwrap_or_else(|_| "[]".to_string()),
-        latency_ms: latency_ms_ceil(elapsed),
+        latency_ms: latency_ms_ceil(input.elapsed),
         answer_ttl,
     };
     if let Err(e) = store.record(entry).await {
@@ -1196,13 +1199,15 @@ impl DnsHandler for DashboardDnsHandler {
         };
         persist_dashboard_log(
             &self.store,
-            qname,
-            qtype,
-            client_ip,
-            protocol,
-            selected_upstreams,
-            elapsed,
-            summary,
+            DashboardLogInput {
+                qname,
+                qtype,
+                client_ip,
+                protocol,
+                selected_upstreams,
+                elapsed,
+                summary,
+            },
         )
         .await;
 
@@ -1230,13 +1235,51 @@ impl DnsHandler for DashboardDnsHandler {
         };
         persist_dashboard_log(
             &self.store,
-            qname,
-            qtype,
-            client_ip,
-            protocol,
-            selected_upstreams,
-            elapsed,
-            summary,
+            DashboardLogInput {
+                qname,
+                qtype,
+                client_ip,
+                protocol,
+                selected_upstreams,
+                elapsed,
+                summary,
+            },
+        )
+        .await;
+
+        result
+    }
+
+    async fn handle_tcp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
+        let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
+
+        let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut meta = meta;
+        meta.selected_upstreams = Some(selected_upstreams.clone());
+
+        let start = Instant::now();
+        let result = self.inner.handle_tcp(query, meta).await;
+        let elapsed = start.elapsed();
+        let summary = match result.as_ref() {
+            Ok(resp_wire) => match Message::from_vec(resp_wire) {
+                Ok(resp) => summarize_dashboard_result(&resp, &qname),
+                Err(e) => summarize_dashboard_error(format!(
+                    "failed to decode TCP response for dashboard logging: {e}"
+                )),
+            },
+            Err(e) => summarize_dashboard_error(e.to_string()),
+        };
+        persist_dashboard_log(
+            &self.store,
+            DashboardLogInput {
+                qname,
+                qtype,
+                client_ip,
+                protocol,
+                selected_upstreams,
+                elapsed,
+                summary,
+            },
         )
         .await;
 
@@ -1584,11 +1627,7 @@ enum ServedFile {
 ///
 /// On a missing-but-contained file, serves the SPA `index.html` fallback
 /// (also containment-checked). Returns `None` if nothing can be served.
-async fn serve_contained_file(
-    target: &Path,
-    base: &Path,
-    out: &mut Vec<u8>,
-) -> Option<ServedFile> {
+async fn serve_contained_file(target: &Path, base: &Path, out: &mut Vec<u8>) -> Option<ServedFile> {
     // Canonicalizing the base fails if it doesn't exist; fall back to a
     // lexically-normalized form so a missing static dir still yields a 404
     // rather than a 500.
@@ -1688,11 +1727,7 @@ fn persisted_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
 
 fn latency_ms_ceil(elapsed: Duration) -> u64 {
     let micros = elapsed.as_micros();
-    if micros == 0 {
-        0
-    } else {
-        ((micros + 999) / 1000).min(u64::MAX as u128) as u64
-    }
+    micros.div_ceil(1000).min(u64::MAX as u128) as u64
 }
 
 fn logs_query_from_params(query: &HashMap<String, String>) -> LogsQuery {
@@ -1779,10 +1814,10 @@ fn ensure_sqlite_file_exists(path: &str) -> Result<(), DynError> {
     }
 
     let path = PathBuf::from(path);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     if !path.exists() {
         std::fs::OpenOptions::new()
@@ -2033,7 +2068,7 @@ mod tests {
         assert_eq!(entry.mac.as_deref(), Some("aa:bb:cc:dd:ee:02"));
 
         // hostname "*" should be skipped
-        assert!(map.get("192.168.1.30").is_none());
+        assert!(!map.contains_key("192.168.1.30"));
 
         let _ = std::fs::remove_file(&file);
     }
@@ -2146,9 +2181,9 @@ fd00::dead dev br-lan FAILED
         // MAC should be lowercased
         assert_eq!(map.get("fd00::2:5678").unwrap(), "aa:bb:cc:dd:ee:02");
         // fe80 link-local should be excluded
-        assert!(map.get("fe80::1").is_none());
+        assert!(!map.contains_key("fe80::1"));
         // FAILED entry (no lladdr) should be excluded
-        assert!(map.get("fd00::dead").is_none());
+        assert!(!map.contains_key("fd00::dead"));
     }
 
     #[test]
@@ -2217,7 +2252,7 @@ fd00::dead dev br-lan FAILED
         assert_eq!(entry.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
 
         // fd00::2:5678 has unknown MAC, should NOT be added
-        assert!(dhcp_map.get("fd00::2:5678").is_none());
+        assert!(!dhcp_map.contains_key("fd00::2:5678"));
 
         // fd00::99:1111 was already in dhcp_map, should NOT be overwritten
         let existing = dhcp_map.get("fd00::99:1111").unwrap();
@@ -2248,8 +2283,7 @@ fd00::dead dev br-lan FAILED
     async fn serve_contained_file_serves_file_inside_static_dir() {
         let (static_dir, _outside) = make_static_dir();
         let mut out = Vec::new();
-        let served =
-            serve_contained_file(&static_dir.join("app.js"), &static_dir, &mut out).await;
+        let served = serve_contained_file(&static_dir.join("app.js"), &static_dir, &mut out).await;
         assert!(matches!(served, Some(ServedFile::File)));
         assert_eq!(&out, b"console.log('app');");
         std::fs::remove_dir_all(static_dir.parent().unwrap()).ok();
@@ -2305,7 +2339,7 @@ fd00::dead dev br-lan FAILED
         let mut out = Vec::new();
         let served =
             serve_contained_file(&static_dir.join("missing.js"), &static_dir, &mut out).await;
-        assert!(matches!(served, None));
+        assert!(served.is_none());
         assert!(out.is_empty());
         std::fs::remove_dir_all(&static_dir).ok();
     }

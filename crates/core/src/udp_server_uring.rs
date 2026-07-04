@@ -15,9 +15,11 @@
 #[cfg(target_os = "linux")]
 use crate::server::{DnsHandler, QueryMeta};
 #[cfg(target_os = "linux")]
+use crate::udp_server::UdpServerOptions;
+#[cfg(target_os = "linux")]
 use hickory_proto::op::Message;
 #[cfg(target_os = "linux")]
-use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
+use io_uring::{IoUring, cqueue, opcode, squeue, types::Fd};
 #[cfg(target_os = "linux")]
 use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
@@ -29,7 +31,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 #[cfg(target_os = "linux")]
 use tokio_util::sync::CancellationToken;
 #[cfg(target_os = "linux")]
@@ -146,16 +148,16 @@ impl BufRing {
         let entry_size = std::mem::size_of::<io_uring::types::BufRingEntry>();
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let align = entry_size.max(page_size);
-        let layout =
-            std::alloc::Layout::from_size_align(entry_size * (num_entries + 1), align)?;
+        let layout = std::alloc::Layout::from_size_align(entry_size * (num_entries + 1), align)?;
 
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let entries = std::ptr::NonNull::new(ptr.cast::<io_uring::types::BufRingEntry>())
             .ok_or("buf ring alloc failed")?;
 
         // Allocate the data buffers and populate ring entries.
-        let buffers: Vec<Box<[u8; MAX_UDP_SIZE]>> =
-            (0..num_entries).map(|_| Box::new([0u8; MAX_UDP_SIZE])).collect();
+        let buffers: Vec<Box<[u8; MAX_UDP_SIZE]>> = (0..num_entries)
+            .map(|_| Box::new([0u8; MAX_UDP_SIZE]))
+            .collect();
 
         for (i, buf) in buffers.iter().enumerate() {
             let entry = unsafe { &mut *entries.as_ptr().add(i) };
@@ -171,8 +173,12 @@ impl BufRing {
         // Register with the kernel.
         let ring_addr = entries.as_ptr() as u64;
         unsafe {
-            ring.submitter()
-                .register_buf_ring_with_flags(ring_addr, num_entries as u16, bgid, 0)?;
+            ring.submitter().register_buf_ring_with_flags(
+                ring_addr,
+                num_entries as u16,
+                bgid,
+                0,
+            )?;
         }
 
         Ok(Self {
@@ -184,9 +190,8 @@ impl BufRing {
 
     /// Recycle a buffer by advancing the ring tail.
     fn recycle(&self, _bid: u16, tail: u16) {
-        let tail_ptr = unsafe {
-            io_uring::types::BufRingEntry::tail(self.entries.as_ptr()) as *mut u16
-        };
+        let tail_ptr =
+            unsafe { io_uring::types::BufRingEntry::tail(self.entries.as_ptr()) as *mut u16 };
         // The entry at position `tail` already has addr/len/bid set from
         // initialisation – just bump the tail so the kernel can reuse it.
         unsafe { std::ptr::write_volatile(tail_ptr, tail.wrapping_add(1)) }
@@ -503,12 +508,11 @@ impl UringUdpServer {
     pub fn new(
         socket: &tokio::net::UdpSocket,
         multishot: bool,
+        max_inflight_handlers: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let socket_fd = socket.as_raw_fd();
 
-        let ring = IoUring::builder()
-            .setup_single_issuer()
-            .build(RING_DEPTH)?;
+        let ring = IoUring::builder().setup_single_issuer().build(RING_DEPTH)?;
 
         Ok(Self {
             ring,
@@ -523,7 +527,7 @@ impl UringUdpServer {
             multishot_active: false,
             buf_tail: 0,
             multishot,
-            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDLERS)),
+            inflight: Arc::new(Semaphore::new(max_inflight_handlers.max(1))),
         })
     }
 
@@ -569,9 +573,7 @@ impl UringUdpServer {
         Ok(())
     }
 
-    fn submit_multishot_recv(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn submit_multishot_recv(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let msghdr = self
             .msghdr_template
             .as_mut()
@@ -783,12 +785,7 @@ impl UringUdpServer {
                 if self.multishot {
                     // user_data == 0 → multishot recv, else → send completion
                     if user_data == 0 {
-                        self.process_multishot_cqe(
-                            result,
-                            flags,
-                            &handler,
-                            &send_tx,
-                        );
+                        self.process_multishot_cqe(result, flags, &handler, &send_tx);
                     } else if let Some(idx) = send_slab_idx(user_data) {
                         self.send_ctxs.remove(idx);
                     }
@@ -909,7 +906,11 @@ impl UringUdpServer {
                     }
                 }
                 _ => {
-                    warn!(bid = bid, result = result, "io_uring recv: invalid buffer id/len");
+                    warn!(
+                        bid = bid,
+                        result = result,
+                        "io_uring recv: invalid buffer id/len"
+                    );
                 }
             }
         }
@@ -941,6 +942,17 @@ pub async fn serve_udp_uring(
     handler: Arc<dyn DnsHandler>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_udp_uring_with_options(socket, handler, cancel, UdpServerOptions::default()).await
+}
+
+/// Start io_uring UDP server with explicit tuning options.
+#[cfg(target_os = "linux")]
+pub async fn serve_udp_uring_with_options(
+    socket: Arc<tokio::net::UdpSocket>,
+    handler: Arc<dyn DnsHandler>,
+    cancel: CancellationToken,
+    options: UdpServerOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let multishot = supports_multishot_recvmsg();
     if multishot {
         info!("kernel ≥ 6.0 detected, using multishot recvmsg");
@@ -949,8 +961,11 @@ pub async fn serve_udp_uring(
     }
 
     let (send_tx, send_rx) = mpsc::channel::<UringSend>(SEND_CHANNEL_CAPACITY);
+    let max_inflight = options
+        .max_inflight_handlers
+        .unwrap_or(MAX_INFLIGHT_HANDLERS);
 
-    let server = UringUdpServer::new(&socket, multishot)?;
+    let server = UringUdpServer::new(&socket, multishot, max_inflight)?;
     let shutdown = server.shutdown.clone();
 
     let handle = tokio::task::spawn_blocking(move || {

@@ -68,10 +68,10 @@ impl Matcher for PtrIpMatcher {
         for question in ctx.query().queries() {
             if question.query_type() == RecordType::PTR {
                 let name = question.name().to_ascii();
-                if let Some(ip) = parse_ptr_name(&name) {
-                    if self.ranges.iter().any(|r: &IpNet| r.contains(&ip)) {
-                        return Ok(true);
-                    }
+                if let Some(ip) = parse_ptr_name(&name)
+                    && self.ranges.iter().any(|r: &IpNet| r.contains(&ip))
+                {
+                    return Ok(true);
                 }
             }
         }

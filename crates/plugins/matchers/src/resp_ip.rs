@@ -114,10 +114,10 @@ impl Matcher for RespIpMatcher {
                 hickory_proto::rr::RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                 _ => None,
             };
-            if let Some(ip) = ip {
-                if self.ranges.iter().any(|r| r.contains(&ip)) {
-                    return Ok(true);
-                }
+            if let Some(ip) = ip
+                && self.ranges.iter().any(|r| r.contains(&ip))
+            {
+                return Ok(true);
             }
         }
         Ok(false)

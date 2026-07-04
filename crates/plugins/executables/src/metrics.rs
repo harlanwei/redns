@@ -103,7 +103,7 @@ impl RecursiveExecutable for MetricsCollector {
 
         // Log every 1000 queries.
         let total = self.query_total.load(Ordering::Relaxed);
-        if total % 1000 == 0 {
+        if total.is_multiple_of(1000) {
             let snap = self.snapshot();
             info!(
                 name = %snap.name,

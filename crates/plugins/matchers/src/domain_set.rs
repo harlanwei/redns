@@ -318,6 +318,12 @@ impl DomainSet {
     }
 }
 
+impl Default for DomainSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Matcher for DomainSet {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(q) = ctx.question() {

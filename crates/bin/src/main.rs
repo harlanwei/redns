@@ -53,7 +53,7 @@ enum Commands {
         /// Working directory.
         #[arg(short, long)]
         dir: Option<String>,
-        
+
         /// UDP backend: "epoll" (default) or "io-uring" (Linux-only, requires io-uring feature).
         #[arg(long, default_value = None)]
         udp_backend: Option<String>,
@@ -82,7 +82,11 @@ async fn main() {
 
     match cli.command {
         Commands::Version => println!("redns {VERSION}"),
-        Commands::Start { config, dir, udp_backend } => {
+        Commands::Start {
+            config,
+            dir,
+            udp_backend,
+        } => {
             if let Err(e) = run_server(config, dir, udp_backend).await {
                 error!(error = %e, "server failed");
                 std::process::exit(1);
@@ -475,7 +479,7 @@ async fn run_server(
 
         let rule_args: Vec<redns_core::RuleArgs> =
             redns_core::config::deserialize_yaml_str(&plugin.args).unwrap_or_default();
-        let rule_configs: Vec<_> = rule_args.iter().map(|ra| parse_rule_args(ra)).collect();
+        let rule_configs: Vec<_> = rule_args.iter().map(parse_rule_args).collect();
         match builder.build_chain(&rule_configs) {
             Ok(chain) => {
                 let tag = if plugin.tag.is_empty() {
@@ -539,7 +543,7 @@ async fn run_server(
         let plugin = &cfg.plugins[*idx];
         let rule_args: Vec<redns_core::RuleArgs> =
             redns_core::config::deserialize_yaml_str(&plugin.args).unwrap_or_default();
-        let rule_configs: Vec<_> = rule_args.iter().map(|ra| parse_rule_args(ra)).collect();
+        let rule_configs: Vec<_> = rule_args.iter().map(parse_rule_args).collect();
         match builder.build_chain(&rule_configs) {
             Ok(chain) => {
                 let tag = if plugin.tag.is_empty() {
@@ -574,6 +578,10 @@ async fn run_server(
                     entry: String,
                     #[serde(default = "default_listen")]
                     listen: String,
+                    #[serde(default)]
+                    udp_workers: Option<usize>,
+                    #[serde(default)]
+                    udp_max_inflight: Option<usize>,
                 }
                 fn default_listen() -> String {
                     "127.0.0.1:53".into()
@@ -591,6 +599,8 @@ async fn run_server(
                     addr: args.listen,
                     entry: args.entry,
                     udp_backend: cli_udp_backend.clone(),
+                    udp_workers: args.udp_workers,
+                    udp_max_inflight: args.udp_max_inflight,
                 });
             }
             _ => {}
@@ -641,6 +651,10 @@ async fn run_server(
 
         let addr = &srv.addr;
         let proto = &srv.protocol;
+        let udp_options = redns_core::udp_server::UdpServerOptions {
+            worker_count: srv.udp_workers,
+            max_inflight_handlers: srv.udp_max_inflight,
+        };
 
         if proto.contains("udp") || proto == "udp+tcp" {
             match bind_udp_socket(addr) {
@@ -649,43 +663,64 @@ async fn run_server(
                     let h = handler.clone();
                     let s = Arc::new(socket);
                     let c = cancel.clone();
-                    
+
                     // Determine which UDP backend to use
                     let use_io_uring = srv.udp_backend.as_deref() == Some("io-uring");
-                    
+
                     #[cfg(all(target_os = "linux", feature = "io-uring"))]
                     if use_io_uring {
                         // Check if io_uring is available
                         if redns_core::udp_server_uring::is_uring_available() {
                             info!(addr = %addr, "using io_uring UDP backend");
                             tokio::spawn(async move {
-                                if let Err(e) = redns_core::udp_server_uring::serve_udp_uring(s, h, c).await {
+                                if let Err(e) =
+                                    redns_core::udp_server_uring::serve_udp_uring_with_options(
+                                        s,
+                                        h,
+                                        c,
+                                        udp_options,
+                                    )
+                                    .await
+                                {
                                     error!(error = %e, "io_uring UDP server error");
                                 }
                             });
                         } else {
                             warn!(addr = %addr, "io_uring requested but not available, falling back to epoll");
                             tokio::spawn(async move {
-                                if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
+                                if let Err(e) = redns_core::udp_server::serve_udp_with_options(
+                                    s,
+                                    h,
+                                    c,
+                                    udp_options,
+                                )
+                                .await
+                                {
                                     error!(error = %e, "UDP server error");
                                 }
                             });
                         }
                     } else {
                         tokio::spawn(async move {
-                            if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
+                            if let Err(e) =
+                                redns_core::udp_server::serve_udp_with_options(s, h, c, udp_options)
+                                    .await
+                            {
                                 error!(error = %e, "UDP server error");
                             }
                         });
                     }
-                    
+
                     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                     {
                         if use_io_uring {
                             warn!(addr = %addr, "io_uring not supported (requires Linux + io-uring feature), using epoll");
                         }
                         tokio::spawn(async move {
-                            if let Err(e) = redns_core::udp_server::serve_udp(s, h, c).await {
+                            if let Err(e) =
+                                redns_core::udp_server::serve_udp_with_options(s, h, c, udp_options)
+                                    .await
+                            {
                                 error!(error = %e, "UDP server error");
                             }
                         });
@@ -813,65 +848,6 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{CacheBuildConfig, bind_tcp_listener, bind_udp_socket, parse_cache_args};
-
-    #[test]
-    fn cache_size_parses_plain_integer_arg() {
-        assert_eq!(
-            parse_cache_args("16384"),
-            CacheBuildConfig {
-                size: 16384,
-                cache_file: None,
-                dump_interval_secs: 300,
-            }
-        );
-    }
-
-    #[test]
-    fn cache_size_parses_yaml_mapping_arg() {
-        assert_eq!(
-            parse_cache_args("size: 16384"),
-            CacheBuildConfig {
-                size: 16384,
-                cache_file: None,
-                dump_interval_secs: 300,
-            }
-        );
-    }
-
-    #[test]
-    fn cache_size_defaults_when_arg_is_invalid() {
-        assert_eq!(
-            parse_cache_args("size: nope"),
-            CacheBuildConfig {
-                size: 0,
-                cache_file: None,
-                dump_interval_secs: 300,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn udp_ipv4_and_ipv6_any_can_share_a_port() {
-        let ipv4 = bind_udp_socket("0.0.0.0:0").expect("bind IPv4 UDP listener");
-        let port = ipv4.local_addr().expect("read IPv4 UDP addr").port();
-        let ipv6 = bind_udp_socket(&format!("[::]:{port}")).expect("bind IPv6 UDP listener");
-
-        assert_eq!(ipv6.local_addr().expect("read IPv6 UDP addr").port(), port);
-    }
-
-    #[tokio::test]
-    async fn tcp_ipv4_and_ipv6_any_can_share_a_port() {
-        let ipv4 = bind_tcp_listener("0.0.0.0:0").expect("bind IPv4 TCP listener");
-        let port = ipv4.local_addr().expect("read IPv4 TCP addr").port();
-        let ipv6 = bind_tcp_listener(&format!("[::]:{port}")).expect("bind IPv6 TCP listener");
-
-        assert_eq!(ipv6.local_addr().expect("read IPv6 TCP addr").port(), port);
-    }
-}
-
 /// Simple API HTTP server.
 async fn serve_api(
     listener: TcpListener,
@@ -950,4 +926,63 @@ async fn handle_api_request(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheBuildConfig, bind_tcp_listener, bind_udp_socket, parse_cache_args};
+
+    #[test]
+    fn cache_size_parses_plain_integer_arg() {
+        assert_eq!(
+            parse_cache_args("16384"),
+            CacheBuildConfig {
+                size: 16384,
+                cache_file: None,
+                dump_interval_secs: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_size_parses_yaml_mapping_arg() {
+        assert_eq!(
+            parse_cache_args("size: 16384"),
+            CacheBuildConfig {
+                size: 16384,
+                cache_file: None,
+                dump_interval_secs: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_size_defaults_when_arg_is_invalid() {
+        assert_eq!(
+            parse_cache_args("size: nope"),
+            CacheBuildConfig {
+                size: 0,
+                cache_file: None,
+                dump_interval_secs: 300,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_ipv4_and_ipv6_any_can_share_a_port() {
+        let ipv4 = bind_udp_socket("0.0.0.0:0").expect("bind IPv4 UDP listener");
+        let port = ipv4.local_addr().expect("read IPv4 UDP addr").port();
+        let ipv6 = bind_udp_socket(&format!("[::]:{port}")).expect("bind IPv6 UDP listener");
+
+        assert_eq!(ipv6.local_addr().expect("read IPv6 UDP addr").port(), port);
+    }
+
+    #[tokio::test]
+    async fn tcp_ipv4_and_ipv6_any_can_share_a_port() {
+        let ipv4 = bind_tcp_listener("0.0.0.0:0").expect("bind IPv4 TCP listener");
+        let port = ipv4.local_addr().expect("read IPv4 TCP addr").port();
+        let ipv6 = bind_tcp_listener(&format!("[::]:{port}")).expect("bind IPv6 TCP listener");
+
+        assert_eq!(ipv6.local_addr().expect("read IPv6 TCP addr").port(), port);
+    }
 }
