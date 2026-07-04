@@ -15,8 +15,6 @@
 #[cfg(target_os = "linux")]
 use crate::server::{DnsHandler, QueryMeta};
 #[cfg(target_os = "linux")]
-use crate::udp_server::UdpServerOptions;
-#[cfg(target_os = "linux")]
 use hickory_proto::op::Message;
 #[cfg(target_os = "linux")]
 use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
@@ -505,7 +503,6 @@ impl UringUdpServer {
     pub fn new(
         socket: &tokio::net::UdpSocket,
         multishot: bool,
-        max_inflight_handlers: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let socket_fd = socket.as_raw_fd();
 
@@ -526,7 +523,7 @@ impl UringUdpServer {
             multishot_active: false,
             buf_tail: 0,
             multishot,
-            inflight: Arc::new(Semaphore::new(max_inflight_handlers.max(1))),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDLERS)),
         })
     }
 
@@ -944,17 +941,6 @@ pub async fn serve_udp_uring(
     handler: Arc<dyn DnsHandler>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_udp_uring_with_options(socket, handler, cancel, UdpServerOptions::default()).await
-}
-
-/// Start io_uring UDP server with explicit tuning options.
-#[cfg(target_os = "linux")]
-pub async fn serve_udp_uring_with_options(
-    socket: Arc<tokio::net::UdpSocket>,
-    handler: Arc<dyn DnsHandler>,
-    cancel: CancellationToken,
-    options: UdpServerOptions,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let multishot = supports_multishot_recvmsg();
     if multishot {
         info!("kernel ≥ 6.0 detected, using multishot recvmsg");
@@ -963,11 +949,8 @@ pub async fn serve_udp_uring_with_options(
     }
 
     let (send_tx, send_rx) = mpsc::channel::<UringSend>(SEND_CHANNEL_CAPACITY);
-    let max_inflight = options
-        .max_inflight_handlers
-        .unwrap_or(MAX_INFLIGHT_HANDLERS);
 
-    let server = UringUdpServer::new(&socket, multishot, max_inflight)?;
+    let server = UringUdpServer::new(&socket, multishot)?;
     let shutdown = server.shutdown.clone();
 
     let handle = tokio::task::spawn_blocking(move || {

@@ -69,12 +69,6 @@ pub struct ServerConfig {
     /// UDP backend: "epoll" (default) or "io-uring" (Linux-only, requires io-uring feature).
     #[serde(default)]
     pub udp_backend: Option<String>,
-    /// Optional epoll UDP receive-loop worker count.
-    #[serde(default)]
-    pub udp_workers: Option<usize>,
-    /// Optional cap on concurrently in-flight UDP handler tasks.
-    #[serde(default)]
-    pub udp_max_inflight: Option<usize>,
 }
 
 fn default_protocol() -> String {

@@ -111,13 +111,9 @@ impl ChainWalker {
                 match &node.executor {
                     NodeExecutor::Simple(exec) => {
                         debug!(node = idx, kind = "simple", "executing node");
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                            let start = std::time::Instant::now();
-                            exec.exec(ctx).await?;
-                            debug!(node = idx, elapsed = ?start.elapsed(), "node completed");
-                        } else {
-                            exec.exec(ctx).await?;
-                        }
+                        let start = std::time::Instant::now();
+                        exec.exec(ctx).await?;
+                        debug!(node = idx, elapsed = ?start.elapsed(), "node completed");
                         self.pos += 1;
                     }
                     NodeExecutor::Recursive(re) => {

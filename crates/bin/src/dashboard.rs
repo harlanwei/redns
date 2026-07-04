@@ -1242,40 +1242,6 @@ impl DnsHandler for DashboardDnsHandler {
 
         result
     }
-
-    async fn handle_tcp(&self, query: Message, meta: QueryMeta) -> PluginResult<Vec<u8>> {
-        let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
-
-        let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
-        let mut meta = meta;
-        meta.selected_upstreams = Some(selected_upstreams.clone());
-
-        let start = Instant::now();
-        let result = self.inner.handle_tcp(query, meta).await;
-        let elapsed = start.elapsed();
-        let summary = match result.as_ref() {
-            Ok(resp_wire) => match Message::from_vec(resp_wire) {
-                Ok(resp) => summarize_dashboard_result(&resp, &qname),
-                Err(e) => summarize_dashboard_error(format!(
-                    "failed to decode TCP response for dashboard logging: {e}"
-                )),
-            },
-            Err(e) => summarize_dashboard_error(e.to_string()),
-        };
-        persist_dashboard_log(
-            &self.store,
-            qname,
-            qtype,
-            client_ip,
-            protocol,
-            selected_upstreams,
-            elapsed,
-            summary,
-        )
-        .await;
-
-        result
-    }
 }
 
 #[derive(Clone)]

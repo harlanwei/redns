@@ -102,13 +102,9 @@ impl CachedEntry {
 
 /// Build the cache key from DNS question data.
 fn cache_key(ctx: &Context) -> Option<CacheKey> {
-    ctx.question().map(|q| {
-        let mut qname = q.name().to_ascii();
-        qname.make_ascii_lowercase();
-        CacheKey {
-            qname,
-            qtype: q.query_type(),
-        }
+    ctx.question().map(|q| CacheKey {
+        qname: q.name().to_ascii().to_lowercase(),
+        qtype: q.query_type(),
     })
 }
 
@@ -373,7 +369,7 @@ fn register_cache(inner: &Arc<CacheInner>) {
 pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
     let caches: Vec<Arc<CacheInner>> = {
         let registry = cache_registry();
-        let mut guard = registry.lock();
+    let mut guard = registry.lock();
         guard.retain(|cache| cache.upgrade().is_some());
         guard.iter().filter_map(|cache| cache.upgrade()).collect()
     };
@@ -413,18 +409,18 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
 /// Result of a cache lookup: a fresh hit, a stale hit eligible for lazy
 /// refresh, or a miss that should be fetched upstream.
 enum CacheLookup {
-    Hit(Vec<u8>),
-    Stale(Vec<u8>),
+    Hit(Message),
+    Stale(Message),
     Miss,
 }
 
 impl Cache {
-    /// Look up a key and build response wire for the current query ID.
+    /// Look up a key and build a response message for the current query ID.
     ///
     /// The shard lock is held only long enough to clone the cheap `Arc`s and
-    /// read the TTL; the full wire clone and TTL patch happen after the guard
-    /// is dropped so concurrent lookups on the same shard are not serialized
-    /// behind response construction cost.
+    /// read the TTL; the full wire clone, TTL patch, and DNS parse all happen
+    /// after the guard is dropped so concurrent lookups on the same shard are
+    /// not serialized behind parse cost.
     fn lookup_and_build(&self, key: &CacheKey, query_id: u16) -> CacheLookup {
         // Captured under the lock: (wire, offsets, ttl, is_stale).
         let captured = {
@@ -453,9 +449,9 @@ impl Cache {
 
         match captured {
             Some((wire, offsets, ttl, is_stale)) => {
-                match build_response_wire(&wire, &offsets, query_id, ttl) {
-                    Some(wire) if is_stale => CacheLookup::Stale(wire),
-                    Some(wire) => CacheLookup::Hit(wire),
+                match build_response(&wire, &offsets, query_id, ttl) {
+                    Some(resp) if is_stale => CacheLookup::Stale(resp),
+                    Some(resp) => CacheLookup::Hit(resp),
                     None => CacheLookup::Miss,
                 }
             }
@@ -464,23 +460,17 @@ impl Cache {
     }
 }
 
-/// Build response wire from a cached entry's stored wire by patching the query
-/// ID and record TTLs. Operates on cloned-out data so it can run without
-/// holding the shard lock and without reparsing the DNS message.
-fn build_response_wire(
-    resp_wire: &[u8],
-    offsets: &[usize],
-    query_id: u16,
-    ttl: u32,
-) -> Option<Vec<u8>> {
+/// Build a response `Message` from a cached entry's stored wire by patching the
+/// query ID and record TTLs. Operates on cloned-out data so it can run without
+/// holding the shard lock.
+fn build_response(resp_wire: &[u8], offsets: &[usize], query_id: u16, ttl: u32) -> Option<Message> {
     let mut wire = resp_wire.to_vec();
-    if wire.len() < 2 {
-        return None;
+    if wire.len() >= 2 {
+        wire[0] = (query_id >> 8) as u8;
+        wire[1] = (query_id & 0xff) as u8;
     }
-    wire[0] = (query_id >> 8) as u8;
-    wire[1] = (query_id & 0xff) as u8;
     set_ttl_in_wire(&mut wire, offsets, ttl);
-    Some(wire)
+    Message::from_vec(&wire).ok()
 }
 
 #[async_trait]
@@ -501,15 +491,15 @@ impl RecursiveExecutable for Cache {
 
         loop {
             match self.lookup_and_build(&key, ctx.query().id()) {
-                CacheLookup::Hit(wire) => {
+                CacheLookup::Hit(resp) => {
                     self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
-                    ctx.set_response_wire(Some(wire));
+                    ctx.set_response(Some(resp));
                     ctx.set_mark(MARK_CACHE_HIT);
                     return Ok(());
                 }
-                CacheLookup::Stale(wire) => {
+                CacheLookup::Stale(resp) => {
                     self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
-                    ctx.set_response_wire(Some(wire));
+                    ctx.set_response(Some(resp));
                     ctx.set_mark(MARK_CACHE_HIT);
                     self.spawn_refresh_for_key(
                         &key,
@@ -1067,7 +1057,7 @@ mod tests {
                 let seq = Sequence::new(chain);
                 let mut ctx = Context::new(make_query());
                 seq.exec(&mut ctx).await.unwrap();
-                assert!(ctx.has_response_output());
+                assert!(ctx.response().is_some());
             }));
         }
 

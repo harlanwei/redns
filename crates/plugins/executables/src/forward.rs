@@ -7,7 +7,6 @@
 use async_trait::async_trait;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use parking_lot::RwLock;
 use redns_core::context::KV_SELECTED_UPSTREAM;
 use redns_core::plugin::PluginResult;
 use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
@@ -15,6 +14,7 @@ use redns_core::{Context, Executable};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -105,9 +105,6 @@ pub struct UpstreamConfig {
     /// Bootstrap DNS server for resolving the upstream hostname (for DoH/DoT).
     #[serde(default)]
     pub bootstrap: Option<String>,
-    /// Optional per-upstream idle pool cap.
-    #[serde(default)]
-    pub pool_max_idle: Option<usize>,
 }
 
 /// Forward plugin configuration.
@@ -122,9 +119,6 @@ pub struct ForwardConfig {
     pub concurrent: usize,
     #[serde(default)]
     pub subprocess_suffix: Option<String>,
-    /// Optional default idle pool cap for upstream transports.
-    #[serde(default)]
-    pub pool_max_idle: Option<usize>,
 }
 
 fn default_concurrent() -> usize {
@@ -163,7 +157,6 @@ impl Default for ForwardConfig {
             upstreams: vec![],
             concurrent: 1,
             subprocess_suffix: None,
-            pool_max_idle: None,
         }
     }
 }
@@ -187,14 +180,12 @@ impl ForwardConfig {
                 tag: None,
                 dial_addr: None,
                 bootstrap: None,
-                pool_max_idle: None,
             })
             .collect();
         ForwardConfig {
             upstreams,
             concurrent: MAX_CONCURRENT_QUERIES,
             subprocess_suffix: None,
-            pool_max_idle: None,
         }
     }
 }
@@ -210,10 +201,11 @@ struct SubprocessUpstream {
 
 impl SubprocessUpstream {
     fn new(suffix: &str, socket_path: &str) -> PluginResult<Self> {
-        let current_exe =
-            std::env::current_exe().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        let current_exe = std::env::current_exe().map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("subprocess: failed to get current exe path: {e}").into()
-            })?;
+            },
+        )?;
 
         let exe_str = current_exe.to_string_lossy();
         let parent_name = current_exe
@@ -239,11 +231,7 @@ impl SubprocessUpstream {
             .arg(socket_path)
             .spawn()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!(
-                    "subprocess: failed to spawn '{}': {e}",
-                    subprocess_path.display()
-                )
-                .into()
+                format!("subprocess: failed to spawn '{}': {e}", subprocess_path.display()).into()
             })?;
 
         info!(
@@ -438,7 +426,6 @@ impl Forward {
                 opts.dial_addr = Some(parse_dial_addr(da, &ucfg.addr)?);
             }
             opts.bootstrap = ucfg.bootstrap.clone();
-            opts.pool_max_idle = ucfg.pool_max_idle.or(cfg.pool_max_idle);
             let uw = Arc::new(UpstreamWrapper::new(
                 upstream::new_upstream(&ucfg.addr, opts)?,
                 upstream_name,
@@ -468,10 +455,7 @@ impl Forward {
                 "Unix".into(),
             ));
             upstreams.push(uw);
-            tag_index
-                .entry(sub_name)
-                .or_default()
-                .push(upstreams.len() - 1);
+            tag_index.entry(sub_name).or_default().push(upstreams.len() - 1);
         }
 
         let concurrent = if cfg.concurrent == 0 {
@@ -897,26 +881,11 @@ mod tests {
                 tag: None,
                 dial_addr: None,
                 bootstrap: None,
-                pool_max_idle: None,
             }],
             concurrent: 1,
             subprocess_suffix: None,
-            pool_max_idle: None,
         };
         assert!(Forward::new(cfg, "test").is_ok());
-    }
-
-    #[test]
-    fn forward_config_pool_max_idle_yaml() {
-        let yaml = r#"
-pool_max_idle: 8
-upstreams:
-  - addr: udp://8.8.8.8:53
-    pool_max_idle: 2
-"#;
-        let cfg = ForwardConfig::from_yaml_str(yaml).unwrap();
-        assert_eq!(cfg.pool_max_idle, Some(8));
-        assert_eq!(cfg.upstreams[0].pool_max_idle, Some(2));
     }
 
     #[test]
@@ -928,26 +897,22 @@ upstreams:
                     tag: Some("google".into()),
                     dial_addr: None,
                     bootstrap: None,
-                    pool_max_idle: None,
                 },
                 UpstreamConfig {
                     addr: "udp://1.1.1.1:53".into(),
                     tag: Some("cloudflare".into()),
                     dial_addr: None,
                     bootstrap: None,
-                    pool_max_idle: None,
                 },
                 UpstreamConfig {
                     addr: "udp://9.9.9.9:53".into(),
                     tag: Some("quad9".into()),
                     dial_addr: None,
                     bootstrap: None,
-                    pool_max_idle: None,
                 },
             ],
             concurrent: 1,
             subprocess_suffix: None,
-            pool_max_idle: None,
         };
         let f = Forward::new(cfg, "test").unwrap();
         assert_eq!(f.tag_index.get("google"), Some(&vec![0]));
@@ -964,19 +929,16 @@ upstreams:
                     tag: Some("google".into()),
                     dial_addr: None,
                     bootstrap: None,
-                    pool_max_idle: None,
                 },
                 UpstreamConfig {
                     addr: "udp://1.1.1.1:53".into(),
                     tag: Some("cloudflare".into()),
                     dial_addr: None,
                     bootstrap: None,
-                    pool_max_idle: None,
                 },
             ],
             concurrent: 1,
             subprocess_suffix: None,
-            pool_max_idle: None,
         };
         let f = Forward::new(cfg, "test").unwrap();
         let selected = f.select_by_tags(&["google".into()]);
@@ -1026,11 +988,9 @@ upstreams:
                 tag: None,
                 dial_addr: Some("not-an-ip".into()),
                 bootstrap: None,
-                pool_max_idle: None,
             }],
             concurrent: 1,
             subprocess_suffix: None,
-            pool_max_idle: None,
         };
         assert!(Forward::new(cfg, "test").is_err());
     }

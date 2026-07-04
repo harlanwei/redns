@@ -76,22 +76,16 @@ impl Fallback {
 
 struct BranchOutcome {
     response: Option<Message>,
-    response_wire: Option<Vec<u8>>,
     selected_upstream: Option<Arc<UpstreamWrapper>>,
 }
 
 fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
     BranchOutcome {
         response: ctx.response().cloned(),
-        response_wire: ctx.response_wire().map(ToOwned::to_owned),
         selected_upstream: ctx
             .get_value::<Arc<UpstreamWrapper>>(KV_SELECTED_UPSTREAM)
             .cloned(),
     }
-}
-
-fn wire_rcode(resp_wire: &[u8]) -> Option<u16> {
-    resp_wire.get(3).map(|flags| (flags & 0x0f) as u16)
 }
 
 /// Evaluates a branch's response and, if usable, writes it into `ctx`.
@@ -113,16 +107,6 @@ fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
             return false;
         }
         ctx.set_response(Some(resp));
-        if let Some(upstream) = outcome.selected_upstream {
-            ctx.store_value(KV_SELECTED_UPSTREAM, upstream);
-        }
-        return true;
-    }
-    if let Some(wire) = outcome.response_wire {
-        if wire_rcode(&wire) == Some(u16::from(ResponseCode::Refused)) {
-            return false;
-        }
-        ctx.set_response_wire(Some(wire));
         if let Some(upstream) = outcome.selected_upstream {
             ctx.store_value(KV_SELECTED_UPSTREAM, upstream);
         }
@@ -161,7 +145,6 @@ impl Executable for Fallback {
                     warn!(error = %e, qname = %qname_primary, "fallback: primary failed");
                     BranchOutcome {
                         response: None,
-                        response_wire: None,
                         selected_upstream: None,
                     }
                 }
@@ -178,7 +161,6 @@ impl Executable for Fallback {
                         warn!(error = %e, qname = %qname_secondary, "fallback: secondary failed");
                         BranchOutcome {
                             response: None,
-                            response_wire: None,
                             selected_upstream: None,
                         }
                     }

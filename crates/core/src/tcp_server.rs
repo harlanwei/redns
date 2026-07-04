@@ -37,7 +37,10 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Returns true if the accept error indicates file-descriptor exhaustion
 /// (`EMFILE`/`ENFILE`), where backing off helps rather than retrying hot.
 fn is_fd_exhaustion(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
 }
 
 /// Starts an async TCP DNS server on the given listener.
@@ -137,16 +140,24 @@ pub async fn serve_tcp(
                             query_wire: Some(Arc::new(msg_buf)),
                         };
 
-                        match handler.handle_tcp(query, meta).await {
-                            Ok(resp_bytes) => {
-                                let len = (resp_bytes.len() as u16).to_be_bytes();
-                                let write = async {
-                                    stream.write_all(&len).await?;
-                                    stream.write_all(&resp_bytes).await
-                                };
-                                match tokio::time::timeout(WRITE_TIMEOUT, write).await {
-                                    Ok(Ok(())) => {}
-                                    _ => return,
+                        match handler.handle(query, meta).await {
+                            Ok(resp) => {
+                                match resp.to_vec() {
+                                    Ok(resp_bytes) => {
+                                        let len = (resp_bytes.len() as u16).to_be_bytes();
+                                        let write = async {
+                                            stream.write_all(&len).await?;
+                                            stream.write_all(&resp_bytes).await
+                                        };
+                                        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+                                            Ok(Ok(())) => {}
+                                            _ => return,
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to serialize TCP response");
+                                        return;
+                                    }
                                 }
                             }
                             Err(e) => {
