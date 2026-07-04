@@ -240,6 +240,7 @@ impl DashboardStore {
             CREATE INDEX IF NOT EXISTS idx_dns_logs_ts ON dns_logs(ts_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_client ON dns_logs(client_ip);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_qname ON dns_logs(qname);
+            CREATE INDEX IF NOT EXISTS idx_dns_logs_latency ON dns_logs(latency_ms DESC);
 
             CREATE TABLE IF NOT EXISTS upstream_names (
                 id INTEGER PRIMARY KEY,
@@ -484,25 +485,7 @@ impl DashboardStore {
             )?;
             let rows = stmt.query_map(
                 params![pattern, page_size as i64, bounded_offset as i64],
-                |row| {
-                    let upstream_ids_text: String = row.get(10)?;
-                    let upstreams_json: String = row.get(9)?;
-                    Ok(DnsLogEntry {
-                        id: row.get::<_, i64>(0)? as u64,
-                        ts_unix_ms: row.get::<_, i64>(1)? as u64,
-                        client_ip: row.get(2)?,
-                        protocol: row.get(3)?,
-                        qname: row.get(4)?,
-                        qtype: row.get(5)?,
-                        rcode: row.get(6)?,
-                        result: row.get(7)?,
-                        result_rows: parse_json_string_vec(&row.get::<_, String>(8)?),
-                        upstreams: decode_upstream_names(&conn, &upstream_ids_text, &upstreams_json)
-                            .unwrap_or_default(),
-                        latency_ms: row.get::<_, i64>(11)? as u64,
-                        answer_ttl: row.get::<_, i64>(12)? as u32,
-                    })
-                },
+                |row| row_to_dns_log_entry(&conn, row),
             )?;
 
             let mut items = Vec::new();
@@ -518,6 +501,31 @@ impl DashboardStore {
                 total_pages,
                 summary,
             })
+        })
+        .await
+        .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+
+    /// Fetch the queries with the highest latencies within the current retention
+    /// window (rows are pruned to 24h, so no explicit time filter is needed).
+    /// Backed by `idx_dns_logs_latency`; tie-breaks on `id DESC` for a stable
+    /// ordering when many rows share the same latency.
+    pub async fn fetch_slow_queries(&self) -> Result<Vec<DnsLogEntry>, DynError> {
+        let path = self.logs_db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<DnsLogEntry>, DynError> {
+            let conn = Self::open_connection(&path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
+                 FROM dns_logs
+                 ORDER BY latency_ms DESC, id DESC
+                 LIMIT 100",
+            )?;
+            let rows = stmt.query_map([], |row| row_to_dns_log_entry(&conn, row))?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+            Ok(items)
         })
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
@@ -1414,6 +1422,16 @@ async fn handle_dashboard_request(
             )
             .await?;
         }
+        ("GET", "/api/logs/slow") => {
+            let body = serde_json::to_vec(&state.store.fetch_slow_queries().await?)?;
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+        }
         ("GET", "/api/clients") => {
             let body = serde_json::to_vec(&state.store.fetch_clients().await?)?;
             write_response(
@@ -1886,6 +1904,33 @@ fn resolve_upstream_ids(
         ids.push(id as u64);
     }
     Ok(ids)
+}
+
+/// Map a `dns_logs` row into a `DnsLogEntry`, decoding upstream names from the
+/// lookup table (falling back to the legacy `upstreams_json` column). Shared by
+/// the paginated log fetch and the slow-queries fetch so both use the same
+/// column order and decoding logic.
+fn row_to_dns_log_entry(
+    conn: &Connection,
+    row: &rusqlite::Row,
+) -> Result<DnsLogEntry, rusqlite::Error> {
+    let upstream_ids_text: String = row.get(10)?;
+    let upstreams_json: String = row.get(9)?;
+    Ok(DnsLogEntry {
+        id: row.get::<_, i64>(0)? as u64,
+        ts_unix_ms: row.get::<_, i64>(1)? as u64,
+        client_ip: row.get(2)?,
+        protocol: row.get(3)?,
+        qname: row.get(4)?,
+        qtype: row.get(5)?,
+        rcode: row.get(6)?,
+        result: row.get(7)?,
+        result_rows: parse_json_string_vec(&row.get::<_, String>(8)?),
+        upstreams: decode_upstream_names(conn, &upstream_ids_text, &upstreams_json)
+            .unwrap_or_default(),
+        latency_ms: row.get::<_, i64>(11)? as u64,
+        answer_ttl: row.get::<_, i64>(12)? as u32,
+    })
 }
 
 /// Decode a space-separated upstream id list back to display names. Falls back
