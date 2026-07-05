@@ -5,7 +5,6 @@
   import UpstreamsView from './lib/components/UpstreamsView.svelte';
   import CacheView from './lib/components/CacheView.svelte';
   import type { TabId } from './lib/types/dashboard';
-  import { initTheme } from './lib/utils/theme.svelte';
 
   let activeTab = $state<TabId>('logs');
 
@@ -48,32 +47,39 @@
 
   <div class="min-w-0">
     <main id="dashboard-content" class="max-w-[1480px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-7 lg:py-8">
-      <section class="mb-5 border-b border-accent/25 pb-5">
-        <div class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-          <div class="min-w-0 max-w-3xl">
-            <div class="mb-2 inline-flex rounded-md border border-accent/20 bg-accent-soft px-2 py-1 text-xs font-semibold uppercase tracking-[0.08em] text-accent-2">{pageMeta[activeTab].kicker}</div>
-            <h1 class="text-2xl font-bold tracking-tight text-ink sm:text-[1.75rem]">{pageMeta[activeTab].title}</h1>
-            <p class="mt-1.5 text-sm leading-6 text-muted">{pageMeta[activeTab].description}</p>
+      {#key activeTab}
+        <section class="animate-rise mb-6 border-b border-line pb-5">
+          <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div class="min-w-0 max-w-3xl">
+              <div class="mb-2.5 inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-accent-2">
+                <span class="h-1 w-6 rounded-full bg-accent" aria-hidden="true"></span>
+                {pageMeta[activeTab].kicker}
+              </div>
+              <h1 class="text-[1.6rem] font-bold leading-tight tracking-tight text-ink sm:text-[2rem]">{pageMeta[activeTab].title}</h1>
+              <p class="mt-2 max-w-[62ch] text-sm leading-6 text-muted">{pageMeta[activeTab].description}</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 text-xs font-semibold">
+              <span class="rounded-lg border border-line bg-surface px-3 py-1.5 text-muted shadow-soft">{pageMeta[activeTab].detail}</span>
+              <span class="inline-flex items-center gap-1.5 rounded-lg border border-success/20 bg-success-bg px-3 py-1.5 text-success-text">
+                <span class="h-1.5 w-1.5 rounded-full bg-success-2 animate-soft-pulse" aria-hidden="true"></span>
+                Ready
+              </span>
+            </div>
           </div>
-          <div class="flex flex-wrap items-center gap-2 text-xs font-semibold">
-            <span class="rounded-md border border-accent/20 bg-accent-soft px-2.5 py-1.5 text-accent-2">{pageMeta[activeTab].detail}</span>
-            <span class="inline-flex items-center gap-1.5 rounded-md border border-success/20 bg-success-bg px-2.5 py-1.5 text-success-text">
-              <span class="h-1.5 w-1.5 rounded-full bg-success-2" aria-hidden="true"></span>
-              Ready
-            </span>
-          </div>
-        </div>
-      </section>
+        </section>
 
-      {#if activeTab === 'logs'}
-        <LogsView />
-      {:else if activeTab === 'clients'}
-        <ClientsView />
-      {:else if activeTab === 'cache'}
-        <CacheView />
-      {:else if activeTab === 'upstreams'}
-        <UpstreamsView />
-      {/if}
+        <div class="animate-rise" style="animation-delay: 60ms">
+          {#if activeTab === 'logs'}
+            <LogsView />
+          {:else if activeTab === 'clients'}
+            <ClientsView />
+          {:else if activeTab === 'cache'}
+            <CacheView />
+          {:else if activeTab === 'upstreams'}
+            <UpstreamsView />
+          {/if}
+        </div>
+      {/key}
     </main>
   </div>
 </div>

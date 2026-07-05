@@ -31,6 +31,13 @@
     return total > 0 ? (hits / total) * 100 : 0;
   }
 
+  // Color the fill bar by pressure: calm below 75%, warming toward capacity.
+  function fillClass(pct: number) {
+    if (pct >= 90) return 'bg-danger-2';
+    if (pct >= 75) return 'bg-warn-2';
+    return 'bg-accent';
+  }
+
   async function fetchCache() {
     loading = true;
     error = null;
@@ -55,53 +62,55 @@
   <ErrorAlert message={error} />
 {/if}
 
-<div class="space-y-6" in:fade>
-  <section class="rounded-md border border-line bg-surface shadow-card overflow-hidden" aria-label="Cache utilization">
-    <div class="p-4 sm:p-5 border-b border-line bg-panel flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-      <div>
-        <h2 class="text-base font-semibold text-ink">Cache utilization</h2>
-        <p class="text-sm text-faint mt-0.5">Sharded cache occupancy and balance.</p>
+<div class="space-y-5" in:fade>
+  {#if caches.length > 0}
+    <section class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4" aria-label="Cache summary">
+      <div class="rounded-xl border border-line bg-surface p-4 shadow-soft">
+        <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Instances</div>
+        <div class="mt-2 font-mono text-2xl font-semibold text-ink tabular-nums">{caches.length.toLocaleString()}</div>
+        <div class="mt-1 text-xs text-faint">Cache pools</div>
       </div>
-      <button onclick={fetchCache} class="inline-flex items-center gap-1.5 text-sm text-accent-2 font-semibold transition-colors px-3 py-1.5 rounded-md border border-accent/25 bg-accent-soft hover:bg-accent-fill hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-accent">
-        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+      <div class="rounded-xl border border-line bg-surface p-4 shadow-soft">
+        <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Entries</div>
+        <div class="mt-2 font-mono text-2xl font-semibold text-ink tabular-nums">{cacheTotalEntries.toLocaleString()}</div>
+        <div class="mt-1 text-xs text-faint">of {cacheTotalCapacity.toLocaleString()} capacity</div>
+      </div>
+      <div class="rounded-xl border border-line bg-surface p-4 shadow-soft">
+        <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Occupancy</div>
+        <div class="mt-2 font-mono text-2xl font-semibold text-ink tabular-nums">{utilization(cacheTotalEntries, cacheTotalCapacity).toFixed(1)}<span class="ml-0.5 text-sm font-medium text-faint">%</span></div>
+        <div class="mt-1 text-xs text-faint">Total fill</div>
+      </div>
+      <div class="relative overflow-hidden rounded-xl bg-header p-4 text-header-text shadow-card">
+        <div class="pointer-events-none absolute -right-6 -top-8 h-24 w-24 rounded-full bg-[radial-gradient(circle,color-mix(in_srgb,var(--ui-accent)_60%,transparent),transparent_70%)]" aria-hidden="true"></div>
+        <div class="relative text-[11px] font-semibold uppercase tracking-[0.08em] text-accent-3">Hit rate</div>
+        <div class="relative mt-2 font-mono text-2xl font-semibold text-white tabular-nums">{hitRate(cacheTotalHits, cacheTotalMisses).toFixed(1)}<span class="ml-0.5 text-sm font-medium text-header-muted">%</span></div>
+        <div class="relative mt-1 text-xs text-header-muted">{cacheTotalHits.toLocaleString()} hits</div>
+      </div>
+    </section>
+  {/if}
+
+  <section class="overflow-hidden rounded-xl border border-line bg-surface shadow-card" aria-label="Cache utilization">
+    <div class="flex flex-col gap-3 border-b border-line bg-panel p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+      <div>
+        <h2 class="text-base font-bold text-ink">Cache utilization</h2>
+        <p class="mt-0.5 text-sm text-muted">Sharded occupancy and balance across pools.</p>
+      </div>
+      <button onclick={fetchCache} class="inline-flex items-center gap-1.5 rounded-lg border border-accent/25 bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-2 hover:bg-accent-fill hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-accent active:scale-[0.98]">
+        <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
         Refresh
       </button>
     </div>
 
-    {#if caches.length > 0}
-      <div class="grid border-b border-line bg-surface sm:grid-cols-4 sm:divide-x sm:divide-line">
-        <div class="p-4">
-          <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Instances</div>
-          <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{caches.length.toLocaleString()}</div>
-        </div>
-        <div class="border-t border-line p-4 sm:border-t-0">
-          <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Entries</div>
-          <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{cacheTotalEntries.toLocaleString()}</div>
-        </div>
-        <div class="border-t border-line p-4 sm:border-t-0">
-          <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Capacity</div>
-          <div class="mt-2 text-2xl font-bold text-accent-2 tabular-nums">{cacheTotalCapacity.toLocaleString()}</div>
-        </div>
-        <div class="border-t border-line p-4 sm:border-t-0">
-          <div class="text-xs font-semibold uppercase tracking-[0.06em] text-muted">Hit rate</div>
-          <div class="mt-2 text-2xl font-bold text-success-text tabular-nums">{hitRate(cacheTotalHits, cacheTotalMisses).toFixed(1)}%</div>
-        </div>
-      </div>
-    {/if}
-
     {#if loading && caches.length === 0}
-      <div class="p-4 sm:p-6 space-y-6">
+      <div class="space-y-6 p-4 sm:p-6">
         {#each Array(1) as _}
-          <div class="border border-line rounded-md overflow-hidden">
-            <div class="px-4 sm:px-6 py-4 border-b border-line/60 flex justify-between">
-              <div class="skeleton h-5 w-28 rounded"></div>
-              <div class="skeleton h-8 w-20 rounded"></div>
+          <div class="overflow-hidden rounded-xl border border-line">
+            <div class="flex justify-between border-b border-line/60 px-4 py-4 sm:px-6">
+              <div class="skeleton h-9 w-40 rounded"></div>
+              <div class="skeleton h-9 w-20 rounded"></div>
             </div>
-            <div class="p-4 sm:p-6 grid grid-cols-3 gap-3">
-              {#each Array(6) as _}<div class="skeleton h-20 rounded-md"></div>{/each}
-            </div>
-            <div class="p-4 sm:p-6">
-              <div class="skeleton h-2 rounded-full w-full"></div>
+            <div class="grid grid-cols-3 gap-3 p-4 sm:p-6">
+              {#each Array(6) as _}<div class="skeleton h-20 rounded-lg"></div>{/each}
             </div>
           </div>
         {/each}
@@ -109,89 +118,87 @@
     {:else if caches.length === 0}
       <div class="px-6 py-16 text-center">
         <div class="inline-flex flex-col items-center gap-3 text-faint">
-          <div class="w-14 h-14 rounded-md bg-accent-soft border border-accent/20 text-accent-2 flex items-center justify-center">
-            <svg class="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7v10a2 2 0 002 2h12a2 2 0 002-2V7a2 2 0 00-2-2H6a2 2 0 00-2 2z"/></svg>
+          <div class="flex h-14 w-14 items-center justify-center rounded-xl border border-accent/20 bg-accent-soft text-accent-2">
+            <svg class="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7c0-1.1 3.58-2 8-2s8 .9 8 2-3.58 2-8 2-8-.9-8-2zm0 0v10c0 1.1 3.58 2 8 2s8-.9 8-2V7"/></svg>
           </div>
           <span class="text-sm font-medium">No cache instances found</span>
         </div>
       </div>
     {:else}
-      <div class="p-4 sm:p-6 space-y-6">
+      <div class="divide-y divide-line">
         {#each caches as cache (cache.id)}
           {@const totalPct = utilization(cache.total_entries, cache.total_capacity)}
           {@const shardCount = Math.max(cache.shards.length, 1)}
-          <article class="border border-line rounded-md overflow-hidden bg-surface">
-            <div class="px-4 sm:px-6 py-4 border-b border-line flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <article class="bg-surface">
+            <div class="flex flex-col gap-3 border-b border-line px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
               <div class="flex items-center gap-3">
-                <div class="w-9 h-9 rounded-md bg-accent-fill flex items-center justify-center font-bold text-white text-sm">{cache.id}</div>
+                <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-accent-fill text-sm font-bold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.2)] tabular-nums">{cache.id}</div>
                 <div>
                   <h3 class="text-base font-bold text-ink">Cache #{cache.id}</h3>
-                  <p class="text-xs text-faint">{cache.shards.length} shards</p>
+                  <p class="text-xs text-faint tabular-nums">{cache.shards.length} shards</p>
                 </div>
               </div>
-              <div class="flex items-center gap-4 text-left sm:text-right">
-                <div>
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Utilization</div>
-                  <div class="text-2xl font-bold text-accent-2 tabular-nums leading-none">{totalPct.toFixed(1)}<span class="text-base text-faint font-bold">%</span></div>
-                </div>
+              <div class="text-left sm:text-right">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Utilization</div>
+                <div class="font-mono text-2xl font-semibold leading-none text-ink tabular-nums">{totalPct.toFixed(1)}<span class="text-base font-medium text-faint">%</span></div>
               </div>
             </div>
 
-            <div class="p-4 sm:p-6 space-y-5 bg-panel/40">
-              <div class="grid grid-cols-1 rounded-md border border-line bg-surface sm:grid-cols-3 sm:divide-x sm:divide-line">
-                <div class="p-3">
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Entries</div>
-                  <div class="text-xl font-bold text-accent-2 tabular-nums">{cache.total_entries.toLocaleString()}</div>
+            <div class="space-y-5 bg-panel/40 p-4 sm:p-6">
+              <div class="grid grid-cols-1 overflow-hidden rounded-xl border border-line bg-surface sm:grid-cols-3 sm:divide-x sm:divide-line">
+                <div class="p-3.5">
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Entries</div>
+                  <div class="mt-1 font-mono text-xl font-semibold text-ink tabular-nums">{cache.total_entries.toLocaleString()}</div>
                 </div>
-                <div class="border-t border-line p-3 sm:border-t-0">
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Capacity</div>
-                  <div class="text-xl font-bold text-accent-2 tabular-nums">{cache.total_capacity.toLocaleString()}</div>
+                <div class="border-t border-line p-3.5 sm:border-t-0">
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Capacity</div>
+                  <div class="mt-1 font-mono text-xl font-semibold text-ink tabular-nums">{cache.total_capacity.toLocaleString()}</div>
                 </div>
-                <div class="border-t border-line p-3 sm:border-t-0">
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Avg / shard</div>
-                  <div class="text-xl font-bold text-ink tabular-nums">{Math.round(cache.total_entries / shardCount).toLocaleString()}</div>
+                <div class="border-t border-line p-3.5 sm:border-t-0">
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Avg / shard</div>
+                  <div class="mt-1 font-mono text-xl font-semibold text-ink tabular-nums">{Math.round(cache.total_entries / shardCount).toLocaleString()}</div>
                 </div>
               </div>
 
-              <div class="grid grid-cols-1 rounded-md border border-line bg-surface sm:grid-cols-3 sm:divide-x sm:divide-line">
-                <div class="p-3">
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Cache hits</div>
-                  <div class="text-xl font-bold text-success-text tabular-nums">{cache.hit_total.toLocaleString()}</div>
+              <div class="grid grid-cols-1 overflow-hidden rounded-xl border border-line bg-surface sm:grid-cols-3 sm:divide-x sm:divide-line">
+                <div class="p-3.5">
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Cache hits</div>
+                  <div class="mt-1 font-mono text-xl font-semibold text-success-text tabular-nums">{cache.hit_total.toLocaleString()}</div>
                 </div>
-                <div class="border-t border-line p-3 sm:border-t-0">
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Cache misses</div>
-                  <div class="text-xl font-bold text-warn-text tabular-nums">{cache.miss_total.toLocaleString()}</div>
+                <div class="border-t border-line p-3.5 sm:border-t-0">
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Cache misses</div>
+                  <div class="mt-1 font-mono text-xl font-semibold text-warn-text tabular-nums">{cache.miss_total.toLocaleString()}</div>
                 </div>
-                <div class="border-t border-line p-3 sm:border-t-0">
-                  <div class="text-xs uppercase tracking-[0.06em] text-faint font-semibold">Hit rate</div>
-                  <div class="text-xl font-bold text-accent-2 tabular-nums">{hitRate(cache.hit_total, cache.miss_total).toFixed(1)}%</div>
+                <div class="border-t border-line p-3.5 sm:border-t-0">
+                  <div class="text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">Hit rate</div>
+                  <div class="mt-1 font-mono text-xl font-semibold text-ink tabular-nums">{hitRate(cache.hit_total, cache.miss_total).toFixed(1)}%</div>
                 </div>
               </div>
 
               <div>
-                <div class="flex justify-between text-xs text-faint font-semibold uppercase tracking-[0.06em]">
+                <div class="flex justify-between text-[11px] font-semibold uppercase tracking-[0.06em] text-faint">
                   <span>Total fill</span>
-                  <span class="text-accent-2 tabular-nums">{cache.total_entries.toLocaleString()} / {cache.total_capacity.toLocaleString()}</span>
+                  <span class="font-mono text-muted tabular-nums">{cache.total_entries.toLocaleString()} / {cache.total_capacity.toLocaleString()}</span>
                 </div>
-                <div class="mt-2 h-2.5 rounded-full bg-line/60 overflow-hidden">
-                  <div class="h-full bg-accent rounded-full transition-all duration-500" style={`width: ${Math.min(totalPct, 100)}%;`}></div>
+                <div class="mt-2 h-2.5 overflow-hidden rounded-full bg-line/60">
+                  <div class="h-full rounded-full transition-all duration-500 {fillClass(totalPct)}" style={`width: ${Math.min(totalPct, 100)}%;`}></div>
                 </div>
               </div>
 
               <div>
-                <div class="text-xs font-semibold text-muted uppercase tracking-[0.06em] mb-3">Shard utilization</div>
-                <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+                <div class="mb-3 text-[11px] font-semibold uppercase tracking-[0.06em] text-muted">Shard utilization</div>
+                <div class="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8">
                   {#each cache.shards as shard (shard.index)}
                     {@const shardPct = utilization(shard.entries, shard.capacity)}
-                    <div class="rounded-md border border-line bg-surface p-3">
-                      <div class="flex items-center justify-between text-xs font-semibold text-muted">
+                    <div class="rounded-lg border border-line bg-surface p-3">
+                      <div class="flex items-center justify-between text-[11px] font-semibold text-muted">
                         <span>{shardLabel(shard.index)}</span>
-                        <span class="text-accent-2 tabular-nums">{shardPct.toFixed(0)}%</span>
+                        <span class="font-mono tabular-nums {shardPct >= 90 ? 'text-danger-text' : shardPct >= 75 ? 'text-warn-text' : 'text-accent-2'}">{shardPct.toFixed(0)}%</span>
                       </div>
-                      <div class="mt-2 h-1.5 rounded-full bg-line/60 overflow-hidden">
-                        <div class="h-full bg-accent rounded-full transition-all duration-500" style={`width: ${Math.min(shardPct, 100)}%;`}></div>
+                      <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-line/60">
+                        <div class="h-full rounded-full transition-all duration-500 {fillClass(shardPct)}" style={`width: ${Math.min(shardPct, 100)}%;`}></div>
                       </div>
-                      <div class="mt-2 text-[11px] text-faint tabular-nums">{shard.entries.toLocaleString()} / {shard.capacity.toLocaleString()}</div>
+                      <div class="mt-2 font-mono text-[11px] text-faint tabular-nums">{shard.entries.toLocaleString()} / {shard.capacity.toLocaleString()}</div>
                     </div>
                   {/each}
                 </div>

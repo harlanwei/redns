@@ -10,6 +10,21 @@
 
   let geoipData = $state<Record<string, { city: string | null; asn: string | null; isp: string | null; proxy: boolean | null; hosting: boolean | null }>>({});
 
+  // Portal the dialog to <body> on mount. `position: fixed` resolves against
+  // the nearest ancestor with a transform/filter/backdrop-filter/etc., and the
+  // dashboard wraps the views in `animate-rise` (whose fill-mode holds a
+  // transform) — without portaling, the overlay gets caged inside that wrapper
+  // instead of covering the viewport. Restoring the node on destroy keeps
+  // Svelte's transition teardown correct.
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
+
   // Whenever the selected log changes, refresh geoip data for its client IP and
   // any A/AAAA answer values.
   $effect(() => {
@@ -38,7 +53,7 @@
 </script>
 
 {#if log}
-  <div class="fixed inset-0 z-50 overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true" transition:fade={{ duration: 150 }}>
+  <div class="fixed inset-0 z-50 overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true" transition:fade={{ duration: 150 }} use:portal>
     <div class="flex items-end justify-center min-h-screen pt-4 px-2 pb-4 text-left sm:block sm:p-0 sm:text-center">
       <div class="fixed inset-0 z-0 bg-ink/70" aria-hidden="true" onclick={onClose}></div>
       <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>

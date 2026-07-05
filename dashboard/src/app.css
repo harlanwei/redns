@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Pixel&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap");
 @import "tailwindcss";
 @config "../tailwind.config.js";
 
@@ -184,7 +184,7 @@
 
   --font-sans: "Geist", "Inter", ui-sans-serif, system-ui, -apple-system,
     "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: "Geist Pixel", ui-monospace, "JetBrains Mono", "SF Mono", Menlo,
+  --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", "SF Mono", Menlo,
     Monaco, Consolas, "Liberation Mono", monospace;
 }
 
@@ -196,15 +196,41 @@
     -moz-osx-font-smoothing: grayscale;
   }
 
-  /* Layered, theme-aware operational canvas. */
+  /* Tabular figures everywhere numbers live in monospace, so telemetry columns
+     stay perfectly aligned as digits change. */
+  code, kbd, samp, pre, .font-mono {
+    font-feature-settings: "tnum" 1, "ss01" 1;
+  }
+
+  /* Layered, theme-aware operational canvas: a soft directional wash from the
+     top plus two low-intensity accent glows anchored to the corners. Gives the
+     dense data views a sense of depth without competing with content. */
   #app::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -2;
+    pointer-events: none;
+    background:
+      radial-gradient(70rem 40rem at 100% -10%, color-mix(in srgb, var(--ui-accent) 12%, transparent), transparent 60%),
+      radial-gradient(60rem 40rem at -10% 8%, color-mix(in srgb, var(--ui-accent-3) 10%, transparent), transparent 55%),
+      linear-gradient(180deg, color-mix(in srgb, var(--ui-canvas-2) 55%, transparent), transparent 42%);
+    background-attachment: fixed;
+  }
+
+  /* Fine-grained film grain to break up flat fills. Fixed + pointer-events:none
+     per the perf guardrails; never attached to a scrolling container. */
+  #app::after {
     content: "";
     position: fixed;
     inset: 0;
     z-index: -1;
     pointer-events: none;
-    background: linear-gradient(180deg, color-mix(in srgb, var(--ui-canvas-2) 48%, transparent), transparent 38%);
-    background-attachment: fixed;
+    opacity: 0.035;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .dark #app::after {
+    opacity: 0.05;
   }
 
   /* Smooth, theme-aware color transitions — gated behind .ready so the very
@@ -267,13 +293,15 @@
     }
   }
 
-  /* ---- Legacy animation hooks: intentionally quiet for product UI. ---- */
-  @keyframes grad-drift {
-    0%, 100% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
+  /* ---- Staggered entry: content lifts and fades in on mount. Drives the
+     card/section reveals across every view. Pair with an inline
+     `animation-delay` for a cascade. ---- */
+  @keyframes rise-in {
+    from { opacity: 0; transform: translateY(0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
   }
-  .animate-drift {
-    animation: none;
+  .animate-rise {
+    animation: rise-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
   }
 
   /* ---- Soft pulse for live/active dots. ---- */
