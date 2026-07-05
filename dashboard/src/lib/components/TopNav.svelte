@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { slide } from 'svelte/transition';
   import type { TabId } from '../types/dashboard';
   import { theme, toggleTheme } from '../utils/theme.svelte';
@@ -39,6 +40,21 @@
   }>();
 
   let mobileMenuOpen = $state(false);
+  // e.g. "0.1.0 (3b043ff2)" — package version plus short commit hash. Empty
+  // until `/api/version` resolves; the UI degrades gracefully if it fails.
+  let buildVersion = $state('');
+
+  onMount(async () => {
+    try {
+      const res = await fetch('/api/version');
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data?.version === 'string') buildVersion = data.version.trim();
+      }
+    } catch {
+      // Non-critical metadata; leave buildVersion empty.
+    }
+  });
 
   function selectTab(tab: TabId) {
     onTabChange(tab);
@@ -98,6 +114,10 @@
           <dd class="text-right font-semibold text-white tabular-nums">24h</dd>
           <dt class="text-header-muted">Appearance</dt>
           <dd class="text-right font-semibold capitalize text-white">{theme.value}</dd>
+          {#if buildVersion}
+            <dt class="text-header-muted">Build</dt>
+            <dd class="text-right font-mono text-[11px] font-semibold text-white tabular-nums">{buildVersion}</dd>
+          {/if}
         </dl>
       </div>
 
@@ -132,7 +152,9 @@
         </div>
         <div class="leading-tight">
           <h1 class="text-xl font-bold tracking-tight">ReDNS</h1>
-          <p class="-mt-0.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-header-muted">Resolver console</p>
+          <p class="-mt-0.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-header-muted">
+            Resolver console{#if buildVersion}<span class="ml-1 normal-case tracking-normal text-header-muted/70">· {buildVersion}</span>{/if}
+          </p>
         </div>
       </div>
 

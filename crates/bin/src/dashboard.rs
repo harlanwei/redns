@@ -1301,6 +1301,8 @@ pub struct DashboardState {
     pub upstreams: Arc<[Arc<UpstreamWrapper>]>,
     pub store: Arc<DashboardStore>,
     pub static_dir: String,
+    /// `"0.1.0 (3b043ff21)"` — package version plus short git commit hash.
+    pub version: &'static str,
 }
 
 pub async fn serve_dashboard(
@@ -1348,6 +1350,16 @@ async fn handle_dashboard_request(
     let query = parse_query_string(target);
 
     match (method, path) {
+        ("GET", "/api/version") => {
+            let body = serde_json::json!({ "version": state.version });
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &serde_json::to_vec(&body)?,
+            )
+            .await?;
+        }
         ("GET", "/api/upstreams") => {
             let body = upstream_metrics_json(&state).await?;
             write_response(

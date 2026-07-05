@@ -26,7 +26,10 @@ use tokio::net::{TcpListener, UdpSocket};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// `"<version> (<short-commit>)"` — shown by `--version`, the `version`
+/// subcommand, and the dashboard. Assembled at compile time from the package
+/// version and the short git commit hash captured by `build.rs`.
+const FULL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_SHORT"), ")");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheBuildConfig {
@@ -36,7 +39,7 @@ struct CacheBuildConfig {
 }
 
 #[derive(Parser)]
-#[command(name = "redns", about = "A DNS forwarder", version = VERSION)]
+#[command(name = "redns", about = "A DNS forwarder", version = FULL_VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -81,7 +84,7 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Version => println!("redns {VERSION}"),
+        Commands::Version => println!("redns {FULL_VERSION}"),
         Commands::Start {
             config,
             dir,
@@ -785,6 +788,7 @@ async fn run_server(
                     upstreams: all_upstreams.clone(),
                     store: dashboard_store.clone(),
                     static_dir,
+                    version: FULL_VERSION,
                 };
                 let c = cancel.clone();
                 tokio::spawn(async move {
