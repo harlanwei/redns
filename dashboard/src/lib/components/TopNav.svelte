@@ -3,6 +3,7 @@
   import { slide } from 'svelte/transition';
   import type { TabId } from '../types/dashboard';
   import { theme, toggleTheme } from '../utils/theme.svelte';
+  import Logo from './Logo.svelte';
 
   type Tab = { id: TabId; label: string };
 
@@ -42,8 +43,14 @@
 <header class="sticky top-0 z-30 border-b border-line bg-surface/90 backdrop-blur-md">
   <div class="mx-auto flex h-14 max-w-[1400px] items-center gap-3 px-4 sm:h-16 sm:gap-6 sm:px-6 lg:px-8">
     <div class="flex min-w-0 items-center gap-2.5">
-      <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-fill text-[0.7rem] font-bold tracking-tight text-on-accent">
-        re
+      <div
+        class="logo-tile group relative flex h-8 w-8 items-center justify-center rounded-lg text-on-accent transition duration-200 hover:-translate-y-0.5 bg-[radial-gradient(130%_130%_at_28%_18%,rgba(101,112,126,0.5),transparent_60%),linear-gradient(135deg,#2a3038_0%,#12161c_55%,#05070a_100%)] dark:bg-[radial-gradient(130%_130%_at_28%_18%,rgba(255,255,255,0.95),transparent_55%),linear-gradient(135deg,#ffffff_0%,#eef1f5_55%,#d2dae3_100%)] shadow-[inset_0_1px_0_rgba(255,255,255,0.16),inset_0_-1px_0_rgba(0,0,0,0.75),0_2px_8px_-2px_rgba(8,10,14,0.55)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.22),inset_0_-1px_0_rgba(0,0,0,0.75),0_8px_20px_-8px_rgba(8,10,14,0.65)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.95),inset_0_-1px_0_rgba(139,149,163,0.55),0_2px_8px_-2px_rgba(0,0,0,0.7)] dark:hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.95),inset_0_-1px_0_rgba(139,149,163,0.55),0_8px_20px_-8px_rgba(0,0,0,0.8)]"
+      >
+        <Logo size="h-7 w-7" />
+        <span
+          class="pointer-events-none absolute inset-0 rounded-lg bg-linear-to-br from-white/15 via-white/5 to-transparent opacity-70 transition-opacity duration-300 group-hover:opacity-100"
+          aria-hidden="true"
+        ></span>
       </div>
       <div class="min-w-0 leading-tight">
         <div class="text-sm font-semibold tracking-tight text-ink">ReDNS</div>
@@ -66,11 +73,6 @@
     </nav>
 
     <div class="ml-auto flex items-center gap-1.5 sm:gap-2">
-      <span class="chip chip-success hidden sm:inline-flex">
-        <span class="h-1.5 w-1.5 rounded-full bg-success-2 animate-soft-pulse" aria-hidden="true"></span>
-        Live
-      </span>
-
       <button
         onclick={toggleTheme}
         class="btn btn-ghost !px-2.5"

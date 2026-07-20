@@ -59,7 +59,7 @@
     transition:fade={{ duration: 120 }}
     use:portal
   >
-    <div class="absolute inset-0 bg-ink/50" aria-hidden="true" onclick={onClose}></div>
+    <div class="absolute inset-0 bg-black/50 dark:bg-black/75" aria-hidden="true" onclick={onClose}></div>
 
     <div
       class="relative z-10 flex max-h-[92dvh] w-full max-w-xl flex-col overflow-hidden rounded-t-2xl border border-line bg-surface shadow-lift sm:rounded-2xl"
@@ -134,7 +134,7 @@
           {/if}
         </dl>
 
-        <div class="mt-4 overflow-hidden rounded-xl border border-line">
+        <div class="mt-4 rounded-lg border border-line">
           <table class="data-table">
             <colgroup>
               <col class="w-[4.5rem]" />

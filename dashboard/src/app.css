@@ -5,8 +5,8 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ----------------------------------------------------------------------------
- * ReDNS — clean deep-tech blue system
- * Cool neutrals, one blue accent, minimal chrome.
+ * ReDNS — ink & paper monochrome system
+ * Cool neutrals, black/white primary, status colors only where they matter.
  * -------------------------------------------------------------------------- */
 
 :root {
@@ -24,18 +24,18 @@
   --ui-muted: #5a6b82;
   --ui-faint: #7d8ea5;
 
-  --ui-accent: #0b4f8c;
-  --ui-accent-fill: #083d6d;
-  --ui-accent-2: #0b4f8c;
-  --ui-accent-3: #3d7ab5;
-  --ui-accent-soft: #e7f0f9;
+  --ui-accent: #10141a;
+  --ui-accent-fill: #0b0e13;
+  --ui-accent-2: #242b34;
+  --ui-accent-3: #4c5560;
+  --ui-accent-soft: #eceef2;
   --ui-on-accent: #ffffff;
 
-  --ui-header: #0a2744;
-  --ui-header-2: #0d3358;
-  --ui-header-3: #13406a;
-  --ui-header-text: #f4f8fc;
-  --ui-header-muted: #9db4cc;
+  --ui-header: #0b0e13;
+  --ui-header-2: #14181f;
+  --ui-header-3: #1d232c;
+  --ui-header-text: #f5f7fa;
+  --ui-header-muted: #9aa3af;
 
   --ui-success: #1f7a52;
   --ui-success-2: #2a9464;
@@ -52,10 +52,10 @@
   --ui-warn-bg: #fdf6e8;
   --ui-warn-text: #8f5f15;
 
-  --ui-info: #0b4f8c;
-  --ui-info-2: #3d7ab5;
-  --ui-info-bg: #e7f0f9;
-  --ui-info-text: #0b4f8c;
+  --ui-info: #10141a;
+  --ui-info-2: #4c5560;
+  --ui-info-bg: #eceef2;
+  --ui-info-text: #242b34;
 
   --ui-neutral-bg: #eef3f9;
   --ui-neutral-text: #5a6b82;
@@ -73,30 +73,30 @@
 .dark {
   color-scheme: dark;
 
-  --ui-canvas: #0a1018;
-  --ui-canvas-2: #0e1622;
-  --ui-surface: #111a27;
-  --ui-surface-2: #162131;
-  --ui-panel: #0e1622;
-  --ui-line: #243247;
-  --ui-line-2: #364a63;
+  --ui-canvas: #000000;
+  --ui-canvas-2: #0a0a0b;
+  --ui-surface: #101012;
+  --ui-surface-2: #151517;
+  --ui-panel: #0a0a0c;
+  --ui-line: #262629;
+  --ui-line-2: #3b3b40;
 
-  --ui-ink: #e8eef7;
-  --ui-muted: #9aabc0;
-  --ui-faint: #7588a0;
+  --ui-ink: #f1f1f3;
+  --ui-muted: #a1a1a9;
+  --ui-faint: #74747c;
 
-  --ui-accent: #4f8fd4;
-  --ui-accent-fill: #0b4f8c;
-  --ui-accent-2: #7aafdf;
-  --ui-accent-3: #a8cceb;
-  --ui-accent-soft: color-mix(in srgb, var(--ui-accent) 14%, transparent);
-  --ui-on-accent: #ffffff;
+  --ui-accent: #ebebed;
+  --ui-accent-fill: #f4f4f6;
+  --ui-accent-2: #d9d9dd;
+  --ui-accent-3: #a8a8b0;
+  --ui-accent-soft: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+  --ui-on-accent: #0a0a0c;
 
-  --ui-header: #071018;
-  --ui-header-2: #0a1522;
-  --ui-header-3: #111a27;
-  --ui-header-text: #e8eef7;
-  --ui-header-muted: #9aabc0;
+  --ui-header: #000000;
+  --ui-header-2: #0a0a0c;
+  --ui-header-3: #131315;
+  --ui-header-text: #f1f1f3;
+  --ui-header-muted: #9c9ca4;
 
   --ui-success: #3db87a;
   --ui-success-2: #5dca93;
@@ -113,13 +113,13 @@
   --ui-warn-bg: color-mix(in srgb, var(--ui-warn) 12%, transparent);
   --ui-warn-text: #e0b66c;
 
-  --ui-info: #4f8fd4;
-  --ui-info-2: #7aafdf;
-  --ui-info-bg: color-mix(in srgb, var(--ui-info) 14%, transparent);
-  --ui-info-text: #7aafdf;
+  --ui-info: #ebebed;
+  --ui-info-2: #a8a8b0;
+  --ui-info-bg: color-mix(in srgb, var(--ui-info) 12%, transparent);
+  --ui-info-text: #d9d9dd;
 
   --ui-neutral-bg: color-mix(in srgb, var(--ui-muted) 12%, transparent);
-  --ui-neutral-text: #b7c4d4;
+  --ui-neutral-text: #b4b4bb;
 
   --ui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 18px -12px rgba(0, 0, 0, 0.55);
   --ui-shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.22);
@@ -442,6 +442,12 @@
     white-space: nowrap;
     overflow: hidden;
   }
+  /* Edge cells round themselves to sit inside their container's border curve,
+     so full-bleed header bands and hover fills are never cropped away. */
+  .data-table thead th:first-child { border-top-left-radius: calc(var(--ui-radius) - 1px); }
+  .data-table thead th:last-child { border-top-right-radius: calc(var(--ui-radius) - 1px); }
+  .data-table tbody tr:last-child td:first-child { border-bottom-left-radius: calc(var(--ui-radius) - 1px); }
+  .data-table tbody tr:last-child td:last-child { border-bottom-right-radius: calc(var(--ui-radius) - 1px); }
   .data-table tbody td {
     padding: 0.7rem 0.75rem;
     border-bottom: 1px solid color-mix(in srgb, var(--ui-line) 70%, transparent);
@@ -457,8 +463,10 @@
   }
   .data-table tbody tr.row-interactive:hover,
   .data-table tbody tr:hover {
-    background: color-mix(in srgb, var(--ui-accent-soft) 55%, var(--ui-surface));
     --ui-cell-fade: color-mix(in srgb, var(--ui-accent-soft) 55%, var(--ui-surface));
+  }
+  .data-table tbody tr:hover td {
+    background: color-mix(in srgb, var(--ui-accent-soft) 55%, var(--ui-surface));
   }
 
   /* Single-line clip: full cell width so short text is not faded; long text runs under the edge gradient. */
@@ -478,6 +486,12 @@
     width: 1.75rem;
     pointer-events: none;
     background: linear-gradient(to right, transparent, var(--ui-cell-fade, var(--ui-surface)));
+  }
+  /* Header labels are fixed text, and right-aligned ones sit exactly under
+     the edge fade — clip them instead of washing them out. */
+  .data-table thead .cell-clip::after,
+  .data-table thead .cell-clip-inline::after {
+    display: none;
   }
   .cell-clip-inline {
     position: relative;

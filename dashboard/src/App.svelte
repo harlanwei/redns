@@ -1,12 +1,18 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import TopNav from './lib/components/TopNav.svelte';
   import LogsView from './lib/components/LogsView.svelte';
   import ClientsView from './lib/components/ClientsView.svelte';
   import UpstreamsView from './lib/components/UpstreamsView.svelte';
   import CacheView from './lib/components/CacheView.svelte';
   import type { TabId } from './lib/types/dashboard';
+  import { route, navigate, initRouter } from './lib/utils/router.svelte';
 
-  let activeTab = $state<TabId>('logs');
+  const activeTab = $derived(route.tab);
+
+  onMount(() => {
+    initRouter();
+  });
 
   const pageMeta: Record<TabId, { title: string; description: string }> = {
     logs: {
@@ -26,6 +32,10 @@
       description: 'Selection, errors, and latency by server.',
     },
   };
+
+  $effect(() => {
+    document.title = `${pageMeta[activeTab].title} · ReDNS`;
+  });
 </script>
 
 <div class="min-h-dvh font-sans">
@@ -36,7 +46,7 @@
     Skip to dashboard content
   </a>
 
-  <TopNav {activeTab} onTabChange={(tab) => (activeTab = tab)} />
+  <TopNav {activeTab} onTabChange={(tab) => navigate({ tab })} />
 
   <main id="dashboard-content" class="mx-auto w-full max-w-[1400px] px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
     {#key activeTab}

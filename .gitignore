@@ -1,3 +1,6 @@
 target/
 dashboard/node_modules/
 dashboard/dist/
+.agents/
+.claude/
+skills-lock.json
