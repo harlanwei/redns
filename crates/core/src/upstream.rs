@@ -66,7 +66,7 @@
 //! # Connection Pooling
 //!
 //! TCP and TLS upstreams pool idle connections with a 30-second TTL. Stale connections
-//! are automatically detected and retried (up to 2 attempts). UDP upstreams pool sockets
+//! are automatically detected and retried once. UDP upstreams pool sockets
 //! to reuse ephemeral ports, reducing setup overhead.
 //!
 //! # Metrics
@@ -106,8 +106,8 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Default maximum idle connections in a stream pool.
 const DEFAULT_MAX_IDLE_CONNS: usize = 4;
 
-/// Maximum retries on stale pooled connection.
-const MAX_POOL_RETRY: usize = 2;
+/// Maximum retries on stale pooled connection (one retry after the first attempt).
+const MAX_POOL_RETRY: usize = 1;
 
 /// Default maximum idle UDP sockets in pool.
 const DEFAULT_MAX_IDLE_UDP_SOCKETS: usize = 16;
@@ -554,7 +554,7 @@ impl DohUpstream {
 
         let mut builder = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(10))
+            .timeout(DEFAULT_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(180))
             .pool_max_idle_per_host(pool_max_idle);
 
@@ -577,7 +577,7 @@ impl DohUpstream {
         Self {
             endpoint,
             client,
-            timeout: Duration::from_secs(10),
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 
