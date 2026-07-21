@@ -79,7 +79,7 @@
         <div class="stat-value">{utilization(cacheTotalEntries, cacheTotalCapacity).toFixed(1)}<span class="ml-0.5 text-sm font-medium text-faint">%</span></div>
         <div class="stat-hint">Total fill</div>
       </div>
-      <div class="stat">
+      <div class="stat stat-success">
         <div class="stat-label">Hit rate</div>
         <div class="stat-value">{hitRate(cacheTotalHits, cacheTotalMisses).toFixed(1)}<span class="ml-0.5 text-sm font-medium text-faint">%</span></div>
         <div class="stat-hint">{cacheTotalHits.toLocaleString()} hits</div>

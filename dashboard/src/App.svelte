@@ -12,6 +12,16 @@
 
   onMount(() => {
     initRouter();
+
+    const onMove = (e: MouseEvent) => {
+      const el = (e.target as Element).closest<HTMLElement>('.stat, .data-table tbody tr');
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      el.style.setProperty('--glow-x', `${e.clientX - rect.left}px`);
+      el.style.setProperty('--glow-y', `${e.clientY - rect.top}px`);
+    };
+    document.addEventListener('mousemove', onMove, { passive: true });
+    return () => document.removeEventListener('mousemove', onMove);
   });
 
   const pageMeta: Record<TabId, { title: string; description: string }> = {

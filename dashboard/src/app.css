@@ -31,6 +31,8 @@
   --ui-accent-soft: #eceef2;
   --ui-on-accent: #ffffff;
 
+  --ui-glow: #3b82f6;
+
   --ui-header: #0b0e13;
   --ui-header-2: #14181f;
   --ui-header-3: #1d232c;
@@ -92,6 +94,8 @@
   --ui-accent-soft: color-mix(in srgb, var(--ui-accent) 12%, transparent);
   --ui-on-accent: #0a0a0c;
 
+  --ui-glow: #60a5fa;
+
   --ui-header: #000000;
   --ui-header-2: #0a0a0c;
   --ui-header-3: #131315;
@@ -146,6 +150,8 @@
   --color-accent-3: var(--ui-accent-3);
   --color-accent-soft: var(--ui-accent-soft);
   --color-on-accent: var(--ui-on-accent);
+
+  --color-glow: var(--ui-glow);
 
   --color-header: var(--ui-header);
   --color-header-2: var(--ui-header-2);
@@ -264,11 +270,39 @@
   }
 
   .stat {
+    --stat-glow: var(--ui-glow);
+    position: relative;
     border: 1px solid var(--ui-line);
     border-radius: var(--ui-radius-lg);
     background: var(--ui-surface);
     padding: 0.9rem 1rem;
     box-shadow: var(--ui-shadow-soft);
+  }
+  .stat::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    background: radial-gradient(
+      11rem circle at var(--glow-x, 50%) var(--glow-y, 50%),
+      color-mix(in srgb, var(--stat-glow) 20%, transparent),
+      transparent 65%
+    );
+  }
+  .stat:hover::before {
+    opacity: 1;
+  }
+  .stat:hover {
+    border-color: color-mix(in srgb, var(--stat-glow) 30%, var(--ui-line));
+  }
+  .stat-success {
+    --stat-glow: var(--ui-success-2);
+  }
+  .stat-danger {
+    --stat-glow: var(--ui-danger-2);
   }
 
   .stat-label {
@@ -421,10 +455,6 @@
     table-layout: fixed;
     border-collapse: separate;
     border-spacing: 0;
-    --ui-cell-fade: var(--ui-surface);
-  }
-  .data-table thead {
-    --ui-cell-fade: color-mix(in srgb, var(--ui-surface-2) 92%, var(--ui-surface));
   }
   .data-table thead th {
     position: sticky;
@@ -458,40 +488,40 @@
   .data-table tbody tr:last-child td {
     border-bottom: 0;
   }
+  .data-table tbody tr {
+    --row-glow: var(--ui-glow);
+  }
   .data-table tbody tr.row-interactive {
     cursor: pointer;
   }
   .data-table tbody tr.row-interactive:hover,
   .data-table tbody tr:hover {
-    --ui-cell-fade: color-mix(in srgb, var(--ui-accent-soft) 55%, var(--ui-surface));
-  }
-  .data-table tbody tr:hover td {
-    background: color-mix(in srgb, var(--ui-accent-soft) 55%, var(--ui-surface));
+    background-color: color-mix(in srgb, var(--ui-accent-soft) 55%, var(--ui-surface));
+    background-image: radial-gradient(
+      14rem circle at var(--glow-x, 50%) var(--glow-y, 50%),
+      color-mix(in srgb, var(--row-glow) 16%, transparent),
+      transparent 70%
+    );
   }
 
-  /* Single-line clip: full cell width so short text is not faded; long text runs under the edge gradient. */
+  /* Single-line clip: full cell width so short text is not faded. A mask (not a
+     solid overlay) fades long text out so it blends over any background, including
+     the cursor glow. */
   .cell-clip {
     position: relative;
     display: block;
     width: 100%;
     overflow: hidden;
     white-space: nowrap;
-  }
-  .cell-clip::after {
-    content: "";
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: 1.75rem;
-    pointer-events: none;
-    background: linear-gradient(to right, transparent, var(--ui-cell-fade, var(--ui-surface)));
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.75rem), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 1.75rem), transparent);
   }
   /* Header labels are fixed text, and right-aligned ones sit exactly under
      the edge fade — clip them instead of washing them out. */
-  .data-table thead .cell-clip::after,
-  .data-table thead .cell-clip-inline::after {
-    display: none;
+  .data-table thead .cell-clip,
+  .data-table thead .cell-clip-inline {
+    -webkit-mask-image: none;
+    mask-image: none;
   }
   .cell-clip-inline {
     position: relative;
@@ -502,16 +532,8 @@
     min-width: 0;
     overflow: hidden;
     white-space: nowrap;
-  }
-  .cell-clip-inline::after {
-    content: "";
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: 1.75rem;
-    pointer-events: none;
-    background: linear-gradient(to right, transparent, var(--ui-cell-fade, var(--ui-surface)));
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.75rem), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 1.75rem), transparent);
   }
   .cell-clip-inline > .cell-clip-text {
     min-width: 0;

@@ -101,7 +101,7 @@
         <div class="stat-value">{logsResponse.summary.unique_clients.toLocaleString()}</div>
         <div class="stat-hint">Unique sources</div>
       </div>
-      <div class="stat">
+      <div class="stat {logsResponse.summary.non_noerror > 0 ? 'stat-danger' : ''}">
         <div class="stat-label">Non-NoError</div>
         <div class="stat-value {logsResponse.summary.non_noerror > 0 ? 'text-warn-text' : ''}">{logsResponse.summary.non_noerror.toLocaleString()}</div>
         <div class="stat-hint">Needs review</div>

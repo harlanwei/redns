@@ -80,7 +80,7 @@
         <div class="stat-value">{upstreamQueryTotal.toLocaleString()}</div>
         <div class="stat-hint">Sent upstream</div>
       </div>
-      <div class="stat">
+      <div class="stat {upstreamErrorTotal > 0 ? 'stat-danger' : ''}">
         <div class="stat-label">Errors</div>
         <div class="stat-value {upstreamErrorTotal > 0 ? 'text-danger-text' : ''}">{upstreamErrorTotal.toLocaleString()}</div>
         <div class="stat-hint">Failed exchanges</div>
