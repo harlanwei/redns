@@ -68,16 +68,6 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    // Tracing is initialized inside run_server after config is loaded,
-    // so that `log.level` from the config file is respected.
-    // Set up a minimal stderr fallback for early errors.
-    let early_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let early_sub = tracing_subscriber::fmt()
-        .with_env_filter(early_filter)
-        .finish();
-    let _guard = tracing::subscriber::set_default(early_sub);
-
     // Install rustls provider early to avoid runtime provider auto-detection panics.
     redns_core::install_rustls_crypto_provider();
 
@@ -91,7 +81,7 @@ async fn main() {
             udp_backend,
         } => {
             if let Err(e) = run_server(config, dir, udp_backend).await {
-                error!(error = %e, "server failed");
+                eprintln!("server failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -756,6 +746,11 @@ async fn run_server(
         let guard = upstreams_collector.lock();
         guard.clone().into()
     };
+
+    // Eagerly probe upstream capabilities (e.g. RFC 7766 pipelining for DoT).
+    for uw in all_upstreams.iter() {
+        uw.probe().await;
+    }
 
     if let Some(ref api_addr) = cfg.api.http {
         match bind_tcp_listener(api_addr) {

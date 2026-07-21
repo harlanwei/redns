@@ -78,10 +78,10 @@
 use crate::plugin::PluginResult;
 use async_trait::async_trait;
 use parking_lot::Mutex as StdMutex;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -120,6 +120,9 @@ static GLOBAL_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub trait Upstream: Send + Sync {
     /// Sends a DNS query (wire format) and returns the response (wire format).
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>>;
+
+    /// Eagerly initialize the upstream (e.g. probe capabilities). Default is no-op.
+    async fn probe(&self) {}
 }
 
 // ── UDP ─────────────────────────────────────────────────────────
@@ -471,18 +474,338 @@ impl Upstream for PooledTlsUpstream {
     }
 }
 
+// ── Pipelined TLS (DoT) — RFC 7766 ─────────────────────────────
+
+/// Timeout for the RFC 7766 pipelining probe.
+const PIPELINE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum concurrent in-flight queries on a single pipelined connection.
+const PIPELINE_MAX_INFLIGHT: usize = 64;
+
+enum PipelineMode {
+    Pipelined,
+    Fallback,
+}
+
+/// A persistent TLS connection multiplexing multiple in-flight queries by DNS
+/// transaction ID, per RFC 7766 §6.2.1.1.
+struct PipelinedConn {
+    writer: Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
+    pending: StdMutex<HashMap<u16, tokio::sync::oneshot::Sender<PluginResult<Vec<u8>>>>>,
+    next_id: AtomicU16,
+    alive: AtomicBool,
+}
+
+impl PipelinedConn {
+    fn alloc_id(&self) -> u16 {
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if !self.pending.lock().contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn inflight(&self) -> usize {
+        self.pending.lock().len()
+    }
+}
+
+fn spawn_reader<R>(mut reader: R, conn: Arc<PipelinedConn>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let mut len_buf = [0u8; 2];
+            if reader.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let resp_len = u16::from_be_bytes(len_buf) as usize;
+            let mut resp_buf = vec![0u8; resp_len];
+            if reader.read_exact(&mut resp_buf).await.is_err() {
+                break;
+            }
+            if resp_buf.len() < 2 {
+                continue;
+            }
+            let id = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
+            if let Some(tx) = conn.pending.lock().remove(&id) {
+                let _ = tx.send(Ok(resp_buf));
+            }
+        }
+        conn.alive.store(false, Ordering::Release);
+        let drained: Vec<_> = conn.pending.lock().drain().collect();
+        for (_, tx) in drained {
+            let _ = tx.send(Err("pipelined connection closed".into()));
+        }
+    });
+}
+
+/// Build a minimal DNS query for "." type A class IN with the given transaction ID.
+fn build_probe_query(id: u16) -> Vec<u8> {
+    let mut q = Vec::with_capacity(17);
+    q.extend_from_slice(&id.to_be_bytes()); // ID
+    q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
+    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    q.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
+    q.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+    q.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
+    q.push(0x00); // root label
+    q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+    q
+}
+
+/// DoT upstream with RFC 7766 query pipelining.
+///
+/// On first use, probes the upstream by sending two queries back-to-back on a
+/// single connection. If both responses arrive (matched by ID), pipelining is
+/// enabled. Otherwise, falls back to the existing pooled exclusive-checkout model.
+pub struct PipelinedTlsUpstream {
+    addr: SocketAddr,
+    server_name: String,
+    timeout: Duration,
+    tls_config: Arc<ClientConfig>,
+    mode: tokio::sync::OnceCell<PipelineMode>,
+    conn: Mutex<Option<Arc<PipelinedConn>>>,
+    fallback_pool: ConnPool<TlsStream<TcpStream>>,
+}
+
+impl PipelinedTlsUpstream {
+    pub fn new(addr: SocketAddr, server_name: String) -> Self {
+        Self {
+            addr,
+            server_name,
+            timeout: DEFAULT_TIMEOUT,
+            tls_config: build_tls_config(),
+            mode: tokio::sync::OnceCell::new(),
+            conn: Mutex::new(None),
+            fallback_pool: ConnPool::new(DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_IDLE_CONNS),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_idle_conns(mut self, max_idle: usize) -> Self {
+        self.fallback_pool.max_idle = max_idle;
+        self
+    }
+
+    async fn connect_tls(&self) -> PluginResult<TlsStream<TcpStream>> {
+        tls_connect(self.addr, &self.server_name, &self.tls_config, self.timeout).await
+    }
+
+    /// Probe whether the upstream supports RFC 7766 pipelining.
+    async fn probe_rfc7766(&self) -> PipelineMode {
+        let probe = async {
+            let stream = self.connect_tls().await.map_err(|_| ())?;
+            let (mut reader, mut writer) = tokio::io::split(stream);
+
+            let q1 = build_probe_query(0x0001);
+            let q2 = build_probe_query(0x0002);
+
+            // Send both queries without waiting for the first response.
+            let len1 = (q1.len() as u16).to_be_bytes();
+            let len2 = (q2.len() as u16).to_be_bytes();
+            writer.write_all(&len1).await.map_err(|_| ())?;
+            writer.write_all(&q1).await.map_err(|_| ())?;
+            writer.write_all(&len2).await.map_err(|_| ())?;
+            writer.write_all(&q2).await.map_err(|_| ())?;
+            writer.flush().await.map_err(|_| ())?;
+
+            // Read two responses, verify both IDs appear.
+            let mut seen = [false; 2];
+            for _ in 0..2 {
+                let mut len_buf = [0u8; 2];
+                reader.read_exact(&mut len_buf).await.map_err(|_| ())?;
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                reader.read_exact(&mut resp_buf).await.map_err(|_| ())?;
+                if resp_buf.len() >= 2 {
+                    let id = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
+                    match id {
+                        0x0001 => seen[0] = true,
+                        0x0002 => seen[1] = true,
+                        _ => {}
+                    }
+                }
+            }
+
+            if seen[0] && seen[1] {
+                // Pipelining works — reuse this connection.
+                let conn = Arc::new(PipelinedConn {
+                    writer: Mutex::new(Box::new(writer)),
+                    pending: StdMutex::new(HashMap::new()),
+                    next_id: AtomicU16::new(0x0003),
+                    alive: AtomicBool::new(true),
+                });
+                spawn_reader(reader, conn.clone());
+                *self.conn.lock().await = Some(conn);
+                Ok(())
+            } else {
+                Err(())
+            }
+        };
+
+        match tokio::time::timeout(PIPELINE_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(())) => {
+                tracing::info!(server = %self.server_name, addr = %self.addr, "DoT upstream supports RFC 7766 pipelining");
+                PipelineMode::Pipelined
+            }
+            _ => {
+                tracing::info!(server = %self.server_name, addr = %self.addr, "DoT upstream does not support RFC 7766 pipelining, using pooled fallback");
+                PipelineMode::Fallback
+            }
+        }
+    }
+
+    async fn get_conn(&self) -> Option<Arc<PipelinedConn>> {
+        let guard = self.conn.lock().await;
+        if let Some(ref c) = *guard {
+            if c.alive.load(Ordering::Acquire) {
+                return Some(c.clone());
+            }
+        }
+        drop(guard);
+
+        // Reconnect.
+        let stream = self.connect_tls().await.ok()?;
+        let (reader, writer) = tokio::io::split(stream);
+        let conn = Arc::new(PipelinedConn {
+            writer: Mutex::new(Box::new(writer)),
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU16::new(0),
+            alive: AtomicBool::new(true),
+        });
+        spawn_reader(reader, conn.clone());
+        *self.conn.lock().await = Some(conn.clone());
+        Some(conn)
+    }
+
+    async fn pipelined_exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+        let conn = self
+            .get_conn()
+            .await
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "pipelined connect failed".into()
+            })?;
+
+        if conn.inflight() >= PIPELINE_MAX_INFLIGHT {
+            return Err("pipelined connection at capacity".into());
+        }
+
+        let original_id = if query.len() >= 2 {
+            u16::from_be_bytes([query[0], query[1]])
+        } else {
+            0
+        };
+
+        let pipe_id = conn.alloc_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        conn.pending.lock().insert(pipe_id, tx);
+
+        // Rewrite the transaction ID and send.
+        let mut wire = query.to_vec();
+        if wire.len() >= 2 {
+            wire[0..2].copy_from_slice(&pipe_id.to_be_bytes());
+        }
+        let len = (wire.len() as u16).to_be_bytes();
+
+        {
+            let mut w = conn.writer.lock().await;
+            if let Err(e) = w.write_all(&len).await {
+                conn.pending.lock().remove(&pipe_id);
+                return Err(format!("pipelined write: {e}").into());
+            }
+            if let Err(e) = w.write_all(&wire).await {
+                conn.pending.lock().remove(&pipe_id);
+                return Err(format!("pipelined write: {e}").into());
+            }
+            let _ = w.flush().await;
+        }
+
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(Ok(mut resp))) => {
+                // Restore the caller's original transaction ID.
+                if resp.len() >= 2 {
+                    resp[0..2].copy_from_slice(&original_id.to_be_bytes());
+                }
+                Ok(resp)
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => {
+                conn.pending.lock().remove(&pipe_id);
+                Err("pipelined connection closed".into())
+            }
+            Err(_) => {
+                conn.pending.lock().remove(&pipe_id);
+                Err("pipelined exchange timed out".into())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Upstream for PipelinedTlsUpstream {
+    async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+        let mode = self.mode.get_or_init(|| self.probe_rfc7766()).await;
+
+        match mode {
+            PipelineMode::Fallback => {
+                pooled_exchange(
+                    &self.fallback_pool,
+                    || tls_connect(self.addr, &self.server_name, &self.tls_config, self.timeout),
+                    query,
+                    self.timeout,
+                )
+                .await
+            }
+            PipelineMode::Pipelined => {
+                match self.pipelined_exchange(query).await {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => {
+                        // If the connection died, retry once with a fresh connection.
+                        let conn_alive = self
+                            .conn
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|c| c.alive.load(Ordering::Acquire))
+                            .unwrap_or(false);
+                        if !conn_alive {
+                            self.pipelined_exchange(query).await
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn probe(&self) {
+        self.mode.get_or_init(|| self.probe_rfc7766()).await;
+    }
+}
+
 // ── Shared TCP/TLS helpers ──────────────────────────────────────
 
 /// Connect to a TCP address with timeout.
 async fn tcp_connect(addr: SocketAddr, timeout: Duration) -> PluginResult<TcpStream> {
-    tokio::time::timeout(timeout, TcpStream::connect(addr))
+    let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
             "tcp connect timed out".into()
         })?
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("tcp connect: {e}").into()
-        })
+        })?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 /// Exchange a DNS query over any length-prefixed byte stream (TCP or TLS).
@@ -1246,6 +1569,10 @@ impl UpstreamWrapper {
         }
     }
 
+    pub async fn probe(&self) {
+        self.inner.probe().await;
+    }
+
     pub async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
         self.query_count.fetch_add(1, Ordering::Relaxed);
         self.inflight_count.fetch_add(1, Ordering::Relaxed);
@@ -1714,7 +2041,7 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
         let socket_addr = resolve_upstream_host(host, port, &opts)?;
 
         Ok(Box::new(
-            PooledTlsUpstream::new(socket_addr, host.to_string())
+            PipelinedTlsUpstream::new(socket_addr, host.to_string())
                 .with_timeout(opts.timeout)
                 .with_max_idle_conns(stream_pool_max_idle),
         ))
@@ -1932,5 +2259,116 @@ mod tests {
         // one (tagged 0xAA).
         assert_eq!(&resp[0..2], &query[0..2], "response ID must match query ID");
         assert_eq!(*resp.last().unwrap(), 0xBB, "must skip the stale datagram");
+    }
+
+    // ── RFC 7766 pipelining tests ─────────────────────────────────
+
+    #[test]
+    fn probe_query_wire_format() {
+        let q = build_probe_query(0xABCD);
+        assert_eq!(q.len(), 17);
+        assert_eq!(&q[0..2], &[0xAB, 0xCD]); // transaction ID
+        assert_eq!(&q[2..4], &[0x01, 0x00]); // RD=1
+        assert_eq!(&q[4..6], &[0x00, 0x01]); // QDCOUNT=1
+        assert_eq!(q[12], 0x00); // root label
+        assert_eq!(&q[13..15], &[0x00, 0x01]); // QTYPE=A
+        assert_eq!(&q[15..17], &[0x00, 0x01]); // QCLASS=IN
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_conn_demux_by_id() {
+        use tokio::io::duplex;
+
+        let (client, mut server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+
+        let conn = Arc::new(PipelinedConn {
+            writer: Mutex::new(Box::new(writer)),
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU16::new(0),
+            alive: AtomicBool::new(true),
+        });
+        spawn_reader(reader, conn.clone());
+
+        // Register two pending queries with IDs 10 and 20.
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        conn.pending.lock().insert(10, tx1);
+        conn.pending.lock().insert(20, tx2);
+
+        // Server sends response for ID 20 first (out of order), then ID 10.
+        let mut resp20 = vec![0u8; 12];
+        resp20[0..2].copy_from_slice(&20u16.to_be_bytes());
+        resp20[5] = 0xBB;
+        let len20 = (resp20.len() as u16).to_be_bytes();
+        server.write_all(&len20).await.unwrap();
+        server.write_all(&resp20).await.unwrap();
+
+        let mut resp10 = vec![0u8; 12];
+        resp10[0..2].copy_from_slice(&10u16.to_be_bytes());
+        resp10[5] = 0xAA;
+        let len10 = (resp10.len() as u16).to_be_bytes();
+        server.write_all(&len10).await.unwrap();
+        server.write_all(&resp10).await.unwrap();
+        server.flush().await.unwrap();
+
+        let r1 = rx1.await.unwrap().unwrap();
+        let r2 = rx2.await.unwrap().unwrap();
+        assert_eq!(r1[5], 0xAA);
+        assert_eq!(r2[5], 0xBB);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_conn_drains_on_close() {
+        use tokio::io::duplex;
+
+        let (client, server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+
+        let conn = Arc::new(PipelinedConn {
+            writer: Mutex::new(Box::new(writer)),
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU16::new(0),
+            alive: AtomicBool::new(true),
+        });
+        spawn_reader(reader, conn.clone());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        conn.pending.lock().insert(42, tx);
+
+        // Drop the server side to simulate connection close.
+        drop(server);
+
+        let result = rx.await.unwrap();
+        assert!(result.is_err());
+        assert!(!conn.alive.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_conn_alloc_id_skips_inflight() {
+        use tokio::io::duplex;
+
+        let (client, _server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+
+        let conn = Arc::new(PipelinedConn {
+            writer: Mutex::new(Box::new(writer)),
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU16::new(0),
+            alive: AtomicBool::new(true),
+        });
+        spawn_reader(reader, conn.clone());
+
+        // Occupy IDs 0, 1, 2.
+        let (tx0, _rx0) = tokio::sync::oneshot::channel();
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        conn.pending.lock().insert(0, tx0);
+        conn.pending.lock().insert(1, tx1);
+        conn.pending.lock().insert(2, tx2);
+
+        // next_id starts at 0, so alloc_id should skip 0, 1, 2 and return 3.
+        let id = conn.alloc_id();
+        assert_eq!(id, 3);
     }
 }
