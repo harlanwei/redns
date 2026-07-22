@@ -15,7 +15,7 @@
 //! | UDP      | `udp://`     | 53           | Socket pooling, ID filtering      |
 //! | TCP      | `tcp://`     | 53           | Connection pooling, auto-retry    |
 //! | DoT      | `tls://`     | 853          | TLS session cache, pooling        |
-//! | DoH      | `https://`   | 443          | HTTP/2, GET method (RFC 8484)     |
+//! | DoH      | `https://`   | 443          | HTTP/2, GET+POST (RFC 8484)       |
 //! | DoQ      | `quic://`    | 853          | QUIC streams (RFC 9250)           |
 //! | DoH3     | `h3://`      | 443          | HTTP/3 over QUIC                  |
 //!
@@ -117,6 +117,20 @@ const MAX_POOL_RETRY: usize = 1;
 
 /// Default maximum idle UDP sockets in pool.
 const DEFAULT_MAX_IDLE_UDP_SOCKETS: usize = 16;
+
+/// User-Agent sent on DoH/DoH3 requests.
+///
+/// By default reqwest advertises `reqwest/x.y.z`, which some providers
+/// rate-limit or deprioritize. A common browser UA blends in with ordinary
+/// traffic and avoids client-based filtering.
+const DOH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0";
+
+/// Maximum DoH GET URL length before falling back to POST (RFC 8484 §4.1).
+///
+/// GET carries the query as base64url in the URL; intermediaries and proxies
+/// commonly cap URL length around 2 KiB. A query whose GET URL would exceed
+/// this is sent via POST instead, which puts the raw wire query in the body.
+const DOH_MAX_GET_URL_LEN: usize = 2048;
 
 static GLOBAL_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -932,7 +946,15 @@ impl DohUpstream {
     /// - `Ip`: host is already an IP, no special handling
     /// - `StaticAddr`: pin to a fixed address (from `dial_addr`)
     /// - `Bootstrap`: use a TTL-aware custom resolver
-    fn new(endpoint: String, resolution: DohResolution, pool_max_idle: usize) -> Self {
+    ///
+    /// `timeout` is baked into the reqwest client (covering connect, send, and
+    /// body read) so it stays consistent with the per-exchange deadline.
+    fn new(
+        endpoint: String,
+        resolution: DohResolution,
+        pool_max_idle: usize,
+        timeout: Duration,
+    ) -> Self {
         use reqwest::header;
         let mut headers = header::HeaderMap::new();
         // HeaderValue::from_static is infallible for valid static strings.
@@ -940,10 +962,22 @@ impl DohUpstream {
             header::ACCEPT,
             header::HeaderValue::from_static("application/dns-message"),
         );
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(DOH_USER_AGENT),
+        );
 
         let mut builder = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(DEFAULT_TIMEOUT)
+            .timeout(timeout)
+            // HTTP/2 tuning for a latency-sensitive, small-message DNS workload:
+            // adaptive flow-control windows avoid stalls without hand-tuning, and
+            // keep-alive pings (also while idle) surface a dead pooled connection
+            // long before the 180s idle timeout would.
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             .pool_idle_timeout(Duration::from_secs(180))
             .pool_max_idle_per_host(pool_max_idle);
 
@@ -966,13 +1000,8 @@ impl DohUpstream {
         Self {
             endpoint,
             client,
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
         }
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
     }
 }
 
@@ -980,6 +1009,7 @@ impl DohUpstream {
 impl Upstream for DohUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
         use base64::Engine;
+        use reqwest::header;
 
         // Zero the ID for HTTP cache friendliness (RFC 8484 §4.1).
         let mut wire = query.to_vec();
@@ -991,26 +1021,64 @@ impl Upstream for DohUpstream {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&wire);
         let url = format!("{}?dns={}", self.endpoint, encoded);
 
-        let resp = tokio::time::timeout(self.timeout, self.client.get(&url).send())
-            .await
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                "doh request timed out".into()
-            })?
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("doh request: {e}").into()
-            })?;
+        // RFC 8484 §4.1: prefer GET, but fall back to POST when the base64url
+        // query would push the URL past what intermediaries reliably accept.
+        // POST carries the raw wire query in the request body instead.
+        let use_post = url.len() > DOH_MAX_GET_URL_LEN;
 
-        if !resp.status().is_success() {
-            return Err(format!("doh: bad status {}", resp.status()).into());
-        }
+        // Bound the *entire* exchange — send and body read — with one timeout so a
+        // slow-drip response body cannot outlive the deadline.
+        let bytes = tokio::time::timeout(self.timeout, async move {
+            let request = if use_post {
+                self.client
+                    .post(&self.endpoint)
+                    .header(header::CONTENT_TYPE, "application/dns-message")
+                    .body(wire)
+            } else {
+                self.client.get(&url)
+            };
 
-        let mut body = resp
-            .bytes()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("doh read body: {e}").into()
-            })?
-            .to_vec();
+            let resp =
+                request
+                    .send()
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("doh request: {e}").into()
+                    })?;
+
+            if !resp.status().is_success() {
+                return Err(format!("doh: bad status {}", resp.status()).into());
+            }
+
+            // RFC 8484 §4.2: the response MUST be application/dns-message. A
+            // captive portal or misconfigured proxy may return 200 with an HTML
+            // page; reject it here with a clear error rather than letting a
+            // confusing parse failure surface downstream.
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !content_type
+                .to_ascii_lowercase()
+                .contains("application/dns-message")
+            {
+                return Err(format!(
+                    "doh: unexpected content-type '{content_type}' (want application/dns-message)"
+                )
+                .into());
+            }
+
+            resp.bytes()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("doh read body: {e}").into()
+                })
+        })
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> { "doh request timed out".into() })??;
+
+        let mut body = bytes.to_vec();
 
         // Restore original query ID.
         if body.len() >= 2 && query.len() >= 2 {
@@ -1413,6 +1481,7 @@ impl Upstream for Doh3Upstream {
                 self.authority, self.path_prefix, encoded
             ))
             .header("accept", "application/dns-message")
+            .header("user-agent", DOH_USER_AGENT)
             .body(())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("h3 build request: {e}").into()
@@ -1461,6 +1530,22 @@ impl Upstream for Doh3Upstream {
 
             if !resp.status().is_success() {
                 return Err(format!("h3: bad status {}", resp.status()).into());
+            }
+
+            // RFC 8484 §4.2: the response MUST be application/dns-message.
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !content_type
+                .to_ascii_lowercase()
+                .contains("application/dns-message")
+            {
+                return Err(format!(
+                    "h3: unexpected content-type '{content_type}' (want application/dns-message)"
+                )
+                .into());
             }
 
             let mut body_bytes = Vec::new();
@@ -1743,6 +1828,9 @@ fn normalize_addr(addr: &str, default_port: u16) -> String {
 
 // ── Bootstrap Resolver (TTL-aware) ──────────────────────────────
 
+/// Cached bootstrap resolution: resolved addresses and their shared expiry.
+type BootstrapCache = Arc<StdMutex<Option<(Vec<SocketAddr>, Instant)>>>;
+
 /// A custom DNS resolver for reqwest that resolves a specific hostname
 /// via a bootstrap DNS server, caching the result according to DNS TTL.
 ///
@@ -1754,7 +1842,10 @@ fn normalize_addr(addr: &str, default_port: u16) -> String {
 struct BootstrapResolver {
     target_host: String,
     bootstrap: String,
-    cache: Arc<StdMutex<Option<(SocketAddr, Instant)>>>,
+    cache: BootstrapCache,
+    /// Serializes cache refreshes so a burst of concurrent misses collapses into
+    /// a single bootstrap query (single-flight) instead of one query per request.
+    refresh_lock: Arc<Mutex<()>>,
     port: u16,
 }
 
@@ -1764,6 +1855,7 @@ impl BootstrapResolver {
             target_host,
             bootstrap,
             cache: Arc::new(StdMutex::new(None)),
+            refresh_lock: Arc::new(Mutex::new(())),
             port,
         }
     }
@@ -1787,37 +1879,57 @@ impl reqwest::dns::Resolve for BootstrapResolver {
             });
         }
 
-        let guard = self.cache.lock();
-        if let Some((addr, expiry)) = &*guard
-            && Instant::now() < *expiry
+        // Fast path: serve every cached address while the entry is fresh.
         {
-            let addrs = vec![*addr];
-            return Box::pin(async move {
-                Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
-            });
+            let guard = self.cache.lock();
+            if let Some((addrs, expiry)) = &*guard
+                && Instant::now() < *expiry
+            {
+                let addrs = addrs.clone();
+                return Box::pin(async move {
+                    Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+                });
+            }
         }
 
         let target_host = self.target_host.clone();
         let bootstrap = self.bootstrap.clone();
         let port = self.port;
-        // Clone the Arc so the cache outlives this future independently of the
-        // resolver. reqwest stores the resolver behind an Arc and may poll this
-        // future after dropping its handle, so capturing a borrow would be
-        // unsound; an owned Arc is both safe and cheap.
+        // Clone the Arcs so the cache and refresh lock outlive this future
+        // independently of the resolver. reqwest stores the resolver behind an Arc
+        // and may poll this future after dropping its handle, so capturing a
+        // borrow would be unsound; owned Arcs are both safe and cheap.
         let cache = Arc::clone(&self.cache);
+        let refresh_lock = Arc::clone(&self.refresh_lock);
 
         Box::pin(async move {
-            let result = bootstrap_resolve(&target_host, &bootstrap).await?;
+            // Single-flight: only the lock holder resolves; concurrent misses
+            // wait here and then observe the cache the winner just populated.
+            let _refresh = refresh_lock.lock().await;
 
-            let (ip, ttl) = result;
-            let addr = SocketAddr::new(ip, port);
+            // Re-check under the refresh lock — another task may have refreshed
+            // while we waited.
+            {
+                let guard = cache.lock();
+                if let Some((addrs, expiry)) = &*guard
+                    && Instant::now() < *expiry
+                {
+                    let addrs = addrs.clone();
+                    return Ok(
+                        Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>
+                    );
+                }
+            }
+
+            let (ips, ttl) = bootstrap_resolve(&target_host, &bootstrap).await?;
+            let addrs: Vec<SocketAddr> =
+                ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
 
             {
                 let mut guard = cache.lock();
-                *guard = Some((addr, Instant::now() + ttl));
+                *guard = Some((addrs.clone(), Instant::now() + ttl));
             }
 
-            let addrs = vec![addr];
             Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
         })
     }
@@ -1867,9 +1979,12 @@ fn resolve_upstream_host(host: &str, port: u16, opts: &UpstreamOpts) -> PluginRe
 
     // 2. Bootstrap — resolve via specific DNS.
     if let Some(ref bootstrap) = opts.bootstrap {
-        let (ip, ttl) = tokio::task::block_in_place(|| {
+        let (ips, ttl) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(bootstrap_resolve(host, bootstrap))
         })?;
+        // Socket upstreams connect to a single address; use the first resolved IP.
+        // `bootstrap_resolve` guarantees at least one on success.
+        let ip = ips[0];
         tracing::info!(
             host = %host, resolved = %ip, ttl = ?ttl, bootstrap = %bootstrap,
             "upstream host resolved via bootstrap"
@@ -1924,11 +2039,11 @@ fn resolve_doh_host(endpoint: &str, opts: &UpstreamOpts) -> PluginResult<DohReso
     // 2. Bootstrap — TTL-aware resolver.
     if let Some(ref bootstrap) = opts.bootstrap {
         // Do an initial resolve to fail fast at startup.
-        let (ip, ttl) = tokio::task::block_in_place(|| {
+        let (ips, ttl) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(bootstrap_resolve(host, bootstrap))
         })?;
         tracing::info!(
-            host = %host, resolved = %ip, ttl = ?ttl, bootstrap = %bootstrap,
+            host = %host, resolved = ?ips, ttl = ?ttl, bootstrap = %bootstrap,
             "DoH upstream resolved via bootstrap"
         );
 
@@ -1938,8 +2053,10 @@ fn resolve_doh_host(endpoint: &str, opts: &UpstreamOpts) -> PluginResult<DohReso
             port,
         ));
         {
+            let addrs: Vec<SocketAddr> =
+                ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
             let mut cache = resolver.cache.lock();
-            *cache = Some((SocketAddr::new(ip, port), Instant::now() + ttl));
+            *cache = Some((addrs, Instant::now() + ttl));
         }
 
         return Ok(DohResolution::Bootstrap(resolver));
@@ -1989,12 +2106,14 @@ fn validate_bootstrap_is_ip_based(bootstrap: &str) -> PluginResult<()> {
 /// Resolves a hostname using a bootstrap upstream.
 ///
 /// Creates a temporary upstream from the bootstrap URL, builds a DNS A query,
-/// sends it via `exchange()`, and extracts the first A record with its TTL.
+/// sends it via `exchange()`, and extracts *all* A/AAAA records with a single
+/// clamped TTL (the minimum across records). Returning every address lets the
+/// caller fail over to another IP if the first is unreachable.
 /// Supports any protocol: UDP, TCP, TLS, DoH, DoQ, DoH3.
 async fn bootstrap_resolve(
     hostname: &str,
     bootstrap: &str,
-) -> Result<(std::net::IpAddr, Duration), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<std::net::IpAddr>, Duration), Box<dyn std::error::Error + Send + Sync>> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, RecordType};
 
@@ -2032,32 +2151,36 @@ async fn bootstrap_resolve(
             format!("invalid bootstrap DNS response: {}", e).into()
         })?;
 
+    let mut ips = Vec::new();
+    let mut min_ttl = u32::MAX;
     for answer in resp.answers() {
         match answer.data() {
             RData::A(a) => {
-                let ttl = Duration::from_secs(answer.ttl() as u64);
-                // Clamp TTL: min 60s, max 3600s.
-                let ttl = ttl
-                    .max(Duration::from_secs(60))
-                    .min(Duration::from_secs(3600));
-                return Ok((std::net::IpAddr::V4(a.0), ttl));
+                ips.push(std::net::IpAddr::V4(a.0));
+                min_ttl = min_ttl.min(answer.ttl());
             }
             RData::AAAA(aaaa) => {
-                let ttl = Duration::from_secs(answer.ttl() as u64);
-                let ttl = ttl
-                    .max(Duration::from_secs(60))
-                    .min(Duration::from_secs(3600));
-                return Ok((std::net::IpAddr::V6(aaaa.0), ttl));
+                ips.push(std::net::IpAddr::V6(aaaa.0));
+                min_ttl = min_ttl.min(answer.ttl());
             }
             _ => continue,
         }
     }
 
-    Err(format!(
-        "bootstrap DNS returned no A/AAAA records for '{}'",
-        hostname
-    )
-    .into())
+    if ips.is_empty() {
+        return Err(format!(
+            "bootstrap DNS returned no A/AAAA records for '{}'",
+            hostname
+        )
+        .into());
+    }
+
+    // Clamp TTL: min 60s, max 3600s.
+    let ttl = Duration::from_secs(min_ttl as u64)
+        .max(Duration::from_secs(60))
+        .min(Duration::from_secs(3600));
+
+    Ok((ips, ttl))
 }
 
 pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upstream>> {
@@ -2113,10 +2236,12 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
         ))
     } else if addr.starts_with("https://") {
         let resolution = resolve_doh_host(addr, &opts)?;
-        Ok(Box::new(
-            DohUpstream::new(addr.to_string(), resolution, stream_pool_max_idle)
-                .with_timeout(opts.timeout),
-        ))
+        Ok(Box::new(DohUpstream::new(
+            addr.to_string(),
+            resolution,
+            stream_pool_max_idle,
+            opts.timeout,
+        )))
     } else if let Some(rest) = addr.strip_prefix("quic://") {
         let normalized = normalize_addr(rest, 853);
         let (host, port_str) = normalized.rsplit_once(':').ok_or_else(
