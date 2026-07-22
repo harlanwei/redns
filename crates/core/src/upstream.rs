@@ -88,8 +88,14 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tracing::warn;
 
-/// Maximum DNS UDP payload.
-const MAX_UDP_SIZE: usize = 4096;
+/// Absolute maximum DNS UDP payload we will attempt to receive (EDNS upper bound).
+const MAX_UDP_SIZE: usize = 65535;
+
+/// Default UDP recv buffer when the query advertises no EDNS0 payload size.
+const DEFAULT_UDP_RECV: usize = 4096;
+
+/// Classic DNS minimum UDP payload (no EDNS).
+const MIN_UDP_RECV: usize = 512;
 
 /// Default exchange timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -203,19 +209,43 @@ impl UdpUpstream {
         }
         pool.push_back(sock);
     }
+
+    /// Remaining time until `deadline`, or an error if the budget is exhausted.
+    fn remaining_until(deadline: Instant) -> PluginResult<Duration> {
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => Ok(d),
+            _ => Err("udp exchange timed out".into()),
+        }
+    }
+
+    /// One-shot TCP exchange used when an upstream UDP answer arrives with TC=1.
+    async fn tcp_fallback(&self, query: &[u8], timeout: Duration) -> PluginResult<Vec<u8>> {
+        let mut stream = tcp_connect(self.addr, timeout).await?;
+        stream_exchange(&mut stream, query, timeout).await
+    }
+}
+
+/// DNS header TC (truncated) flag lives in byte 2, bit 1 (0x02).
+fn dns_header_tc(wire: &[u8]) -> bool {
+    wire.len() >= 3 && (wire[2] & 0x02) != 0
+}
+
+/// Choose a UDP recv buffer large enough for the EDNS0 payload the query
+/// advertises, clamped to `[MIN_UDP_RECV, MAX_UDP_SIZE]`.
+fn udp_recv_capacity(query: &[u8]) -> usize {
+    use hickory_proto::op::Message;
+
+    if let Ok(msg) = Message::from_vec(query)
+        && let Some(edns) = msg.extensions()
+    {
+        return (edns.max_payload() as usize).clamp(MIN_UDP_RECV, MAX_UDP_SIZE);
+    }
+    DEFAULT_UDP_RECV.min(MAX_UDP_SIZE)
 }
 
 #[async_trait]
 impl Upstream for UdpUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let sock = self.get_socket().await?;
-
-        sock.send(query)
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("udp send: {e}").into()
-            })?;
-
         // The DNS message ID is the first two bytes of the wire message. Sockets
         // are pooled and reused, so a late or duplicate datagram from a previous
         // query can arrive on this socket. Match the response ID against the
@@ -227,13 +257,24 @@ impl Upstream for UdpUpstream {
             None => return Err("udp exchange: query too short".into()),
         };
 
+        let sock = self.get_socket().await?;
+
+        // Bound the whole exchange (send + recv), not just the receive side.
+        // Mirrors `stream_exchange` so a stalled send cannot hang forever.
         let deadline = Instant::now() + self.timeout;
-        let mut buf = vec![0u8; MAX_UDP_SIZE];
+
+        let remaining = Self::remaining_until(deadline)?;
+        match tokio::time::timeout(remaining, sock.send(query)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(format!("udp send: {e}").into());
+            }
+            Err(_) => return Err("udp exchange timed out".into()),
+        }
+
+        let mut buf = vec![0u8; udp_recv_capacity(query)];
         loop {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) if !d.is_zero() => d,
-                _ => return Err("udp exchange timed out".into()),
-            };
+            let remaining = Self::remaining_until(deadline)?;
 
             match tokio::time::timeout(remaining, sock.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
@@ -244,7 +285,32 @@ impl Upstream for UdpUpstream {
                     }
                     let mut resp = buf;
                     resp.truncate(n);
+                    // Done with the UDP socket whether or not we fall back to TCP.
                     self.put_socket(sock).await;
+
+                    // Transparent TCP retry on truncation (common resolver
+                    // behaviour). Prefer the full TCP answer; if TCP fails,
+                    // return the truncated UDP response so the client can still
+                    // retry over TCP itself.
+                    if dns_header_tc(&resp) {
+                        match Self::remaining_until(deadline) {
+                            Ok(remaining) => {
+                                match self.tcp_fallback(query, remaining).await {
+                                    Ok(full) => return Ok(full),
+                                    Err(e) => {
+                                        warn!(
+                                            addr = %self.addr,
+                                            error = %e,
+                                            "udp TC set; TCP fallback failed, returning truncated"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Budget exhausted — return the truncated answer.
+                            }
+                        }
+                    }
                     return Ok(resp);
                 }
                 Ok(Err(e)) => return Err(format!("udp recv: {e}").into()),
@@ -2221,9 +2287,43 @@ mod tests {
         assert!(Arc::strong_count(&u2.tls_config) == 1);
     }
 
+    #[test]
+    fn udp_recv_capacity_uses_edns_payload() {
+        use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+
+        let mut msg = Message::new();
+        msg.set_id(0x1111)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query)
+            .set_recursion_desired(true);
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("example.com.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        msg.set_edns(edns);
+        let wire = msg.to_vec().unwrap();
+        assert_eq!(udp_recv_capacity(&wire), 1232);
+
+        // No EDNS → default buffer.
+        let mut bare = Message::new();
+        bare.set_id(1).set_message_type(MessageType::Query);
+        bare.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("example.com.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        assert_eq!(udp_recv_capacity(&bare.to_vec().unwrap()), DEFAULT_UDP_RECV);
+    }
+
     /// A stale datagram with a mismatched DNS message ID (e.g. a late response
     /// from a prior query on a reused, pooled socket) must be discarded rather
-    /// than returned as the answer to the current query.
+    /// than returned as the answer to a different query.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn udp_exchange_skips_mismatched_id() {
         // Fake upstream: on receiving a query, first reply with a wrong-ID
@@ -2259,6 +2359,57 @@ mod tests {
         // one (tagged 0xAA).
         assert_eq!(&resp[0..2], &query[0..2], "response ID must match query ID");
         assert_eq!(*resp.last().unwrap(), 0xBB, "must skip the stale datagram");
+    }
+
+    /// When the UDP answer has TC=1, the upstream must transparently re-query
+    /// over TCP and return the full answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_exchange_retries_over_tcp_on_tc() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = udp_server.local_addr().unwrap();
+        let tcp_listener = TcpListener::bind(server_addr).await.unwrap();
+
+        let query = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+        // UDP: reply with TC=1, same ID.
+        let udp_query = query.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], udp_query.as_slice());
+            // Header: ID + flags with QR=1, TC=1, RA=1; zero counts.
+            let mut truncated = vec![0xAB, 0xCD, 0x82, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            // Tag so we can tell UDP vs TCP answers apart.
+            truncated.push(0x11);
+            udp_server.send_to(&truncated, peer).await.unwrap();
+        });
+
+        // TCP: reply with a full (non-truncated) answer, length-prefixed.
+        let tcp_query = query.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let qlen = u16::from_be_bytes(len_buf) as usize;
+            let mut qbuf = vec![0u8; qlen];
+            stream.read_exact(&mut qbuf).await.unwrap();
+            assert_eq!(qbuf, tcp_query);
+
+            let mut full = vec![0xAB, 0xCD, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            full.push(0x22); // full-answer tag
+            let len = (full.len() as u16).to_be_bytes();
+            stream.write_all(&len).await.unwrap();
+            stream.write_all(&full).await.unwrap();
+        });
+
+        let upstream = UdpUpstream::new(server_addr).with_timeout(Duration::from_secs(2));
+        let resp = upstream.exchange(&query).await.unwrap();
+        assert_eq!(&resp[0..2], &query[0..2]);
+        assert!(!dns_header_tc(&resp), "TCP fallback must clear truncation");
+        assert_eq!(*resp.last().unwrap(), 0x22, "must return the full TCP answer");
     }
 
     // ── RFC 7766 pipelining tests ─────────────────────────────────

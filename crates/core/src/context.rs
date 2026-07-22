@@ -206,7 +206,12 @@ impl Context {
     }
 
     /// Returns a mutable reference to the query message.
+    ///
+    /// Clearing any cached wire form is intentional: plugins such as
+    /// `ecs_handler` and `redirect` rewrite the logical `Message`, and the
+    /// forwarder must re-serialize rather than replaying a stale packet.
     pub fn query_mut(&mut self) -> &mut Message {
+        self.query_wire = None;
         &mut self.query
     }
 
@@ -406,6 +411,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
 
     fn make_query() -> Message {
         let mut msg = Message::new();
@@ -454,6 +460,21 @@ mod tests {
         let q = ctx.question().expect("should have a question");
         assert_eq!(q.name().to_ascii(), "example.com.");
         assert_eq!(q.query_type(), RecordType::A);
+    }
+
+    #[test]
+    fn query_mut_clears_cached_query_wire() {
+        let mut ctx = Context::new(make_query());
+        let wire = Arc::new(ctx.query().to_vec().unwrap());
+        ctx.set_query_wire(Some(wire));
+        assert!(ctx.query_wire().is_some());
+
+        // Any logical mutation must force the forwarder to re-serialize.
+        let _ = ctx.query_mut();
+        assert!(
+            ctx.query_wire().is_none(),
+            "query_mut must invalidate cached wire so EDNS/ECS/redirect take effect"
+        );
     }
 
     #[test]

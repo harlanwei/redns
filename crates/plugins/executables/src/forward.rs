@@ -623,14 +623,18 @@ impl Forward {
     async fn resolve(
         &self,
         query: &Message,
-        initial_query_wire: Option<Arc<Vec<u8>>>,
+        // Optional pre-serialized form of `query`. Must reflect the *current*
+        // logical message (including EDNS rewrite / ECS / redirect). Stale
+        // client-capture wire is never safe here — `Context::query_mut` clears
+        // the cache so callers re-serialize after mutation.
+        cached_query_wire: Option<Arc<Vec<u8>>>,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let qname = query
             .queries()
             .first()
             .map(|q| q.name().to_ascii())
             .unwrap_or_default();
-        let query_bytes = if let Some(raw) = initial_query_wire {
+        let query_bytes = if let Some(raw) = cached_query_wire {
             raw
         } else {
             Arc::new(query.to_vec().map_err(
@@ -650,6 +654,9 @@ impl Executable for Forward {
             return Ok(());
         }
 
+        // Prefer Context's logical wire cache (set after EDNS rewrite, cleared
+        // by query_mut on any subsequent mutation). Never use the raw client
+        // packet from ingress.
         let (resp, selected_upstream) = self
             .resolve(ctx.query(), ctx.query_wire().cloned())
             .await?;

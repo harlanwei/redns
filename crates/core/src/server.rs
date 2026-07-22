@@ -194,7 +194,18 @@ impl EntryHandler {
         ctx.server_meta.client_addr = meta.client_addr;
         ctx.server_meta.url_path = meta.url_path;
         ctx.server_meta.server_name = meta.server_name;
-        ctx.set_query_wire(meta.query_wire.clone());
+        // Cache the *logical* query wire (post EDNS rewrite from Context::new),
+        // never the raw client datagram in `meta.query_wire`. Reusing client
+        // bytes would silently drop EDNS policy and any later Message mutations
+        // (ECS, redirect, …). Ingress may still populate `meta.query_wire` for
+        // other observers, but the forward path must not use it.
+        match ctx.query().to_vec() {
+            Ok(wire) => ctx.set_query_wire(Some(Arc::new(wire))),
+            Err(e) => {
+                debug!(error = %e, "failed to serialize logical query wire");
+                ctx.set_query_wire(None);
+            }
+        }
         let result = self.entry.exec(&mut ctx).await;
         let elapsed = start.elapsed();
         let selected_upstream = if result.is_ok() && ctx.has_response_output() {
