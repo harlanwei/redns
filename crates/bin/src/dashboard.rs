@@ -130,6 +130,11 @@ impl DashboardStore {
         ensure_sqlite_file_exists(&logs_db_path)?;
         let geoip_db_path = geoip_db_path(&logs_db_path);
         ensure_sqlite_file_exists(&geoip_db_path)?;
+        // Shared in-memory databases are deleted when the last connection closes.
+        // Hold one connection open for each ephemeral DB for the process lifetime
+        // so short-lived open/close cycles used by query paths do not wipe data.
+        hold_ephemeral_db_open(&logs_db_path)?;
+        hold_ephemeral_db_open(&geoip_db_path)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<NewDnsLogEntry>(10240);
         let store = Self {
             logs_db_path: Arc::new(logs_db_path.clone()),
@@ -330,8 +335,11 @@ impl DashboardStore {
         ensure_sqlite_file_exists(path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(3))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // WAL and relaxed durability only apply to on-disk databases.
+        if !is_ephemeral_sqlite_path(path) {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         Ok(conn)
     }
 
@@ -339,6 +347,11 @@ impl DashboardStore {
     /// change; for existing databases a one-time VACUUM is required to rewrite
     /// the file with the new setting.
     fn ensure_auto_vacuum(path: &str) -> Result<(), DynError> {
+        // auto_vacuum only matters for on-disk databases; skip for process-local
+        // in-memory stores used when dashboard.persist is false.
+        if is_ephemeral_sqlite_path(path) {
+            return Ok(());
+        }
         let conn = Connection::open(path)?;
         let current: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
         if current == 2 {
@@ -1083,9 +1096,46 @@ pub fn default_sqlite_path(config_file: &str) -> String {
     base_dir.join("redns.db").to_string_lossy().into_owned()
 }
 
+/// SQLite URI for a process-local shared in-memory logs database.
+///
+/// Used when `dashboard.persist` is false so query logs and statistics are
+/// available for the current session only.
+pub fn ephemeral_sqlite_path() -> &'static str {
+    "file:redns-dashboard-logs?mode=memory&cache=shared"
+}
+
+fn ephemeral_geoip_sqlite_path() -> &'static str {
+    "file:redns-dashboard-geoip?mode=memory&cache=shared"
+}
+
+/// Returns true for SQLite paths that do not map to a durable filesystem file.
+fn is_ephemeral_sqlite_path(path: &str) -> bool {
+    path == ":memory:"
+        || (path.starts_with("file:") && path.contains("mode=memory"))
+}
+
+/// Keep a shared in-memory database alive for the process lifetime.
+///
+/// SQLite destroys `mode=memory&cache=shared` databases when the last
+/// connection closes. Dashboard code opens short-lived connections per
+/// request/batch, so without a keep-alive handle the DB would reset constantly.
+fn hold_ephemeral_db_open(path: &str) -> Result<(), DynError> {
+    if !is_ephemeral_sqlite_path(path) {
+        return Ok(());
+    }
+    let conn = DashboardStore::open_connection(path)?;
+    // Intentionally leaked: lives until process exit, matching store lifetime.
+    std::mem::forget(conn);
+    Ok(())
+}
+
 /// Derive the dedicated GeoIP SQLite path from the logs database path.
 /// For `.../redns.db` this returns `.../redns.geoip.db`.
+/// Ephemeral (in-memory) logs DBs get a matching in-memory GeoIP DB.
 fn geoip_db_path(logs_db_path: &str) -> String {
+    if is_ephemeral_sqlite_path(logs_db_path) {
+        return ephemeral_geoip_sqlite_path().to_string();
+    }
     let path = Path::new(logs_db_path);
     let stem = path
         .file_stem()
@@ -1839,7 +1889,7 @@ fn hex_value(b: u8) -> Option<u8> {
 }
 
 fn ensure_sqlite_file_exists(path: &str) -> Result<(), DynError> {
-    if path == ":memory:" {
+    if is_ephemeral_sqlite_path(path) {
         return Ok(());
     }
 
@@ -2032,6 +2082,38 @@ mod tests {
         let _ = std::fs::remove_file(geoip_path);
         let _ = std::fs::remove_file(geoip_path.with_extension("db-wal"));
         let _ = std::fs::remove_file(geoip_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_store_keeps_logs_for_session() {
+        // Unique name per test so parallel tests don't share one memory DB.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = format!(
+            "file:redns-test-logs-{}-{}?mode=memory&cache=shared",
+            std::process::id(),
+            unique
+        );
+        let store = DashboardStore::new(path, vec![]).expect("create ephemeral store");
+
+        store
+            .record(sample_entry(1_000, "session.example"))
+            .await
+            .expect("insert log");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let logs = store
+            .fetch_logs(LogsQuery::default())
+            .await
+            .expect("fetch logs");
+        assert_eq!(logs.total_items, 1);
+        assert_eq!(logs.items[0].qname, "session.example");
+
+        let clients = store.fetch_clients().await.expect("fetch clients");
+        assert_eq!(clients.total_queries, 1);
+        assert_eq!(clients.total_clients, 1);
     }
 
     #[tokio::test]

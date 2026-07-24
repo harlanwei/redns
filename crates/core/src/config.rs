@@ -121,8 +121,15 @@ pub struct DashboardConfig {
     #[serde(default)]
     pub http: Option<String>,
     /// Optional SQLite path for dashboard data.
+    /// Only used when [`Self::persist`] is true.
     #[serde(default)]
     pub sqlite: Option<String>,
+    /// When true, query logs and client statistics are written to a durable
+    /// SQLite file (see [`Self::sqlite`]) and survive process restarts.
+    /// When false (default), they are kept in a process-local in-memory
+    /// database and discarded when redns exits.
+    #[serde(default)]
+    pub persist: bool,
     /// Directory to serve static frontend files from. Defaults to "./dashboard/dist".
     #[serde(default)]
     pub static_dir: Option<String>,
