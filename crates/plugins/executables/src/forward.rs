@@ -43,6 +43,72 @@ fn hedge_delay_for(uw: &UpstreamWrapper) -> Duration {
     Duration::from_millis(delay_ms.clamp(HEDGE_DELAY_MIN_MS, HEDGE_DELAY_MAX_MS))
 }
 
+/// Attempt to repair a DNS response whose trailing zero bytes were trimmed by
+/// the upstream (TrimEnd bug). Walks the wire format; if the message ends
+/// mid-rdata, returns a zero-padded copy that satisfies the declared RDLENGTH.
+fn repair_trailing_trim(wire: &[u8]) -> Option<Vec<u8>> {
+    if wire.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([wire[4], wire[5]]) as usize;
+    let ancount = u16::from_be_bytes([wire[6], wire[7]]) as usize;
+    let nscount = u16::from_be_bytes([wire[8], wire[9]]) as usize;
+    let arcount = u16::from_be_bytes([wire[10], wire[11]]) as usize;
+
+    let mut pos = 12usize;
+
+    // Skip question section.
+    for _ in 0..qdcount {
+        pos = skip_name(wire, pos)?;
+        pos = pos.checked_add(4)?; // QTYPE + QCLASS
+        if pos > wire.len() {
+            return None;
+        }
+    }
+
+    // Walk RR sections (answer + authority + additional).
+    let total_rrs = ancount + nscount + arcount;
+    for _ in 0..total_rrs {
+        pos = skip_name(wire, pos)?;
+        let fixed = pos.checked_add(10)?; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+        if fixed > wire.len() {
+            return None;
+        }
+        let rdlength = u16::from_be_bytes([wire[fixed - 2], wire[fixed - 1]]) as usize;
+        let rdata_start = fixed;
+        let rdata_end = rdata_start.checked_add(rdlength)?;
+
+        if rdata_end > wire.len() {
+            // Message ends mid-rdata — pad with zeros.
+            let mut repaired = wire.to_vec();
+            repaired.resize(rdata_end, 0);
+            return Some(repaired);
+        }
+        pos = rdata_end;
+    }
+
+    None
+}
+
+/// Skip a DNS name (possibly compressed) starting at `pos`, returning the
+/// offset just past the name in the outer message.
+fn skip_name(wire: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        if pos >= wire.len() {
+            return None;
+        }
+        let b = wire[pos];
+        if b == 0 {
+            return Some(pos + 1);
+        }
+        if b & 0xc0 == 0xc0 {
+            // Compression pointer: 2 bytes total, always terminates.
+            return Some(pos + 2);
+        }
+        pos = pos.checked_add(1 + b as usize)?;
+    }
+}
+
 fn dns_header_rcode(resp_wire: &[u8]) -> Option<u16> {
     if resp_wire.len() < 4 {
         return None;
@@ -499,12 +565,20 @@ impl Forward {
         if selected.len() == 1 {
             let start = Instant::now();
             let resp_bytes = selected[0].exchange(query_bytes.as_slice()).await?;
-            debug!(upstream = %selected[0].name(), elapsed = ?start.elapsed(), "forward: upstream responded");
-            let resp = Message::from_vec(&resp_bytes).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("invalid upstream response: {e}").into()
-                },
-            )?;
+            let resp = match Message::from_vec(&resp_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(repaired) = repair_trailing_trim(&resp_bytes) {
+                        if let Ok(r) = Message::from_vec(&repaired) {
+                            r
+                        } else {
+                            return Err(format!("invalid upstream response: {e}").into());
+                        }
+                    } else {
+                        return Err(format!("invalid upstream response: {e}").into());
+                    }
+                }
+            };
             selected[0].record_adopted();
             return Ok((resp, selected[0].clone()));
         }
@@ -602,6 +676,13 @@ impl Forward {
                             return Ok((resp, selected[sel_idx].clone()));
                         }
                         Err(e) => {
+                            if let Some(repaired) = repair_trailing_trim(&resp_bytes) {
+                                if let Ok(resp) = Message::from_vec(&repaired) {
+                                    selected[sel_idx].record_adopted();
+                                    tasks.abort_all();
+                                    return Ok((resp, selected[sel_idx].clone()));
+                                }
+                            }
                             warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, error = %e, "invalid upstream response");
                             last_err = Some(format!("invalid response: {e}").into());
                         }
@@ -829,5 +910,42 @@ upstreams:
             pool_max_idle: None,
         };
         assert!(Forward::new(cfg, "test").is_err());
+    }
+
+    #[test]
+    fn repair_trailing_trim_recovers_trimmed_aaaa() {
+        // Real wire capture: NovaXNS Gcore trimmed trailing zeros from an AAAA
+        // response for clienttoken.spotify.com. RDLENGTH=16 but only 8 bytes
+        // of rdata present (2600:1901:0001:07c5 — last 8 bytes were zeros).
+        #[rustfmt::skip]
+        let wire: Vec<u8> = vec![
+            0x1c, 0x66, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x0b, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x74, 0x6f, 0x6b, 0x65, 0x6e,
+            0x07, 0x73, 0x70, 0x6f, 0x74, 0x69, 0x66, 0x79, 0x03, 0x63, 0x6f, 0x6d,
+            0x00, 0x00, 0x1c, 0x00, 0x01,
+            0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c, 0x00, 0x10,
+            0x26, 0x00, 0x19, 0x01, 0x00, 0x01, 0x07, 0xc5,
+        ];
+
+        // Original must fail.
+        assert!(Message::from_vec(&wire).is_err());
+
+        // Repair should pad 8 zero bytes.
+        let repaired = repair_trailing_trim(&wire).expect("should detect trailing trim");
+        assert_eq!(repaired.len(), wire.len() + 8);
+        assert!(repaired[wire.len()..].iter().all(|&b| b == 0));
+
+        // Repaired message must parse.
+        let msg = Message::from_vec(&repaired).expect("repaired wire should parse");
+        assert_eq!(msg.answers().len(), 1);
+        let rdata = msg.answers()[0].data();
+        if let hickory_proto::rr::RData::AAAA(ipv6) = rdata {
+            assert_eq!(
+                ipv6.0,
+                std::net::Ipv6Addr::new(0x2600, 0x1901, 0x0001, 0x07c5, 0, 0, 0, 0)
+            );
+        } else {
+            panic!("expected AAAA rdata");
+        }
     }
 }
