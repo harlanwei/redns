@@ -26,7 +26,10 @@ use tracing::{debug, info, warn};
 const MAX_CONCURRENT_QUERIES: usize = 3;
 const WEIGHT_CACHE_TTL_SECS: u64 = 5;
 const NOISE_FACTOR: f64 = 0.125;
-const ERROR_PENALTY_MULT: f64 = 8.0;
+const ERROR_PENALTY_MULT: f64 = 20.0;
+const ERROR_PENALTY_EXP: i32 = 2;
+const LATENCY_EXP: f64 = 2.0;
+const STREAK_PENALTY_MULT: f64 = 1.5;
 const DEFAULT_LATENCY: f64 = 10.0;
 const HEDGE_DELAY_MULT: f64 = 1.5;
 const HEDGE_DELAY_MIN_MS: u64 = 15;
@@ -395,8 +398,8 @@ impl UpstreamSelector {
 
     /// Compute the selection score for a single upstream.
     ///
-    /// Higher scores are better. The score is inversely proportional to latency
-    /// and error rate, with a small random jitter to break ties.
+    /// Higher scores are better. The score applies heavy penalties for latency
+    /// (superlinear), error rate (quadratic), and consecutive failure streaks.
     fn score_one(&self, uw: &UpstreamWrapper) -> f64 {
         let latency = uw.ema_latency() as f64;
         let latency = if latency <= 0.0 {
@@ -404,11 +407,19 @@ impl UpstreamSelector {
         } else {
             latency
         };
+
+        let latency_penalty = latency.powf(LATENCY_EXP);
+
         let error_rate = uw.error_rate();
-        let penalty_factor = 1.0 + error_rate * ERROR_PENALTY_MULT;
+        let error_penalty =
+            (1.0 + error_rate * ERROR_PENALTY_MULT).powi(ERROR_PENALTY_EXP);
+
+        let streak = uw.consecutive_failures() as f64;
+        let streak_penalty = 1.0 + streak * streak * STREAK_PENALTY_MULT;
+
         let noise = (fastrand::f64() * 2.0 - 1.0) * NOISE_FACTOR;
-        let score = (1.0 / (latency * penalty_factor)) * (1.0 + noise);
-        score.max(0.001)
+        let score = (1.0 / (latency_penalty * error_penalty * streak_penalty)) * (1.0 + noise);
+        score.max(0.0001)
     }
 
     fn weighted_sample(&self, scores: &[(usize, f64)], count: usize) -> Vec<usize> {
@@ -563,7 +574,6 @@ impl Forward {
         );
 
         if selected.len() == 1 {
-            let start = Instant::now();
             let resp_bytes = selected[0].exchange(query_bytes.as_slice()).await?;
             let resp = match Message::from_vec(&resp_bytes) {
                 Ok(r) => r,

@@ -81,7 +81,7 @@ use parking_lot::Mutex as StdMutex;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -1768,6 +1768,7 @@ pub struct UpstreamWrapper {
     inflight_count: AtomicU64,
     completed_count: AtomicU64,
     error_count: AtomicU64,
+    consecutive_failures: AtomicU32,
     adopted_count: AtomicU64,
     final_selected_count: AtomicU64,
     rejected_rcode_count: AtomicU64,
@@ -1798,6 +1799,7 @@ impl UpstreamWrapper {
             inflight_count: AtomicU64::new(0),
             completed_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
+            consecutive_failures: AtomicU32::new(0),
             adopted_count: AtomicU64::new(0),
             final_selected_count: AtomicU64::new(0),
             rejected_rcode_count: AtomicU64::new(0),
@@ -1825,6 +1827,9 @@ impl UpstreamWrapper {
     }
     pub fn error_count(&self) -> u64 {
         self.error_count.load(Ordering::Relaxed)
+    }
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
     }
 
     pub fn error_rate(&self) -> f64 {
@@ -1908,9 +1913,12 @@ impl UpstreamWrapper {
         // Without this, a timing-out upstream keeps a stale, misleadingly-low
         // EMA (it only ever recorded its fast successes) and keeps getting picked.
         self.update_ema_latency(elapsed_ms);
-        if let Err(e) = &result {
+        if result.is_err() {
             self.error_count.fetch_add(1, Ordering::Relaxed);
-            warn!(upstream = %self.name, error = %e, "upstream exchange failed");
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            warn!(upstream = %self.name, error = %result.as_ref().unwrap_err(), "upstream exchange failed");
+        } else {
+            self.consecutive_failures.store(0, Ordering::Relaxed);
         }
         result
     }
