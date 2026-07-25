@@ -132,6 +132,14 @@ const DOH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20
 /// this is sent via POST instead, which puts the raw wire query in the body.
 const DOH_MAX_GET_URL_LEN: usize = 2048;
 
+/// Maximum DNS response body we will accept from a DoH/DoH3/DoQ upstream.
+///
+/// A DNS message is at most 65535 bytes (the TCP/DoQ 2-byte length prefix caps
+/// it structurally). DoH3 accumulates the HTTP/3 body chunk-by-chunk with no
+/// inherent bound, so a misbehaving or hostile upstream could stream unbounded
+/// data; cap it here to protect against memory exhaustion.
+const MAX_DNS_RESPONSE: usize = 65535;
+
 static GLOBAL_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -475,12 +483,27 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
+/// Shared root certificate store (webpki roots), built once and cloned.
+///
+/// DoT, DoQ, and DoH3 each need a rustls [`RootCertStore`]. Loading the webpki
+/// trust anchors once and cloning avoids re-iterating the full anchor set on
+/// every upstream construction.
+fn shared_root_store() -> RootCertStore {
+    use std::sync::OnceLock;
+    static ROOTS: OnceLock<RootCertStore> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let mut store = RootCertStore::empty();
+            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            store
+        })
+        .clone()
+}
+
 /// Build a shared `ClientConfig` with session caching.
 fn build_tls_config() -> Arc<ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(shared_root_store())
         .with_no_client_auth();
     // rustls enables a 256-slot session cache by default.
     Arc::new(config)
@@ -1069,6 +1092,16 @@ impl Upstream for DohUpstream {
                 .into());
             }
 
+            // Best-effort guard against an oversized body. A DNS message is at
+            // most 65535 bytes; reject anything whose advertised length exceeds
+            // that. Chunked responses carry no Content-Length so this cannot
+            // bound them, but a well-behaved DoH server always sends a length.
+            if let Some(len) = resp.content_length()
+                && len > MAX_DNS_RESPONSE as u64
+            {
+                return Err(format!("doh response too large: {len} bytes").into());
+            }
+
             resp.bytes()
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -1121,18 +1154,37 @@ fn quic_keepalive_transport() -> Arc<quinn::TransportConfig> {
     Arc::new(transport)
 }
 
-fn build_quic_endpoint(
-    target: SocketAddr,
-    client_config: quinn::ClientConfig,
-    protocol: &str,
-) -> PluginResult<quinn::Endpoint> {
+/// A lazily-created, shared QUIC client endpoint per address family.
+///
+/// A `quinn::Endpoint` corresponds to a single UDP socket and driver task but
+/// can host many connections — to different resolvers, each with its own
+/// per-connection `ClientConfig` (ALPN etc.) supplied at `connect_with` time.
+/// Sharing one endpoint per address family avoids spawning a fresh socket and
+/// event loop for every DoQ/DoH3 upstream.
+///
+/// Two endpoints are kept (one bound to `0.0.0.0:0`, one to `[::]:0`) rather
+/// than relying on a single dual-stack socket, so IPv4 and IPv6 targets each
+/// use a socket of their own family regardless of platform dual-stack quirks.
+fn shared_quic_endpoint(target: SocketAddr) -> PluginResult<quinn::Endpoint> {
+    static V4: StdMutex<Option<quinn::Endpoint>> = StdMutex::new(None);
+    static V6: StdMutex<Option<quinn::Endpoint>> = StdMutex::new(None);
+
+    let cell = if target.is_ipv4() { &V4 } else { &V6 };
+    let mut guard = cell.lock();
+    if let Some(ep) = guard.as_ref() {
+        return Ok(ep.clone());
+    }
     let bind_addr = quic_bind_addr_for_target(target);
-    let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(
+    // Do not set a default client config: each connection passes its own via
+    // `connect_with`, letting one endpoint serve both DoQ ("doq") and DoH3
+    // ("h3") connections. On error the cache is left empty so a later upstream
+    // can retry the bind instead of inheriting a cached failure.
+    let endpoint = quinn::Endpoint::client(bind_addr).map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("{protocol} endpoint bind: {e}").into()
+            format!("quic endpoint bind: {e}").into()
         },
     )?;
-    endpoint.set_default_client_config(client_config);
+    *guard = Some(endpoint.clone());
     Ok(endpoint)
 }
 
@@ -1160,21 +1212,22 @@ pub struct DoqUpstream {
     server_name: String,
     timeout: Duration,
     endpoint: quinn::Endpoint,
+    client_config: quinn::ClientConfig,
     conn: Mutex<Option<quinn::Connection>>,
 }
 
 impl DoqUpstream {
-    fn new(addr: SocketAddr, server_name: String) -> Self {
+    fn new(addr: SocketAddr, server_name: String) -> PluginResult<Self> {
         let client_config = Self::build_client_config();
-        let endpoint =
-            build_quic_endpoint(addr, client_config, "doq").expect("failed to create doq endpoint");
-        Self {
+        let endpoint = shared_quic_endpoint(addr)?;
+        Ok(Self {
             addr,
             server_name,
             timeout: DEFAULT_TIMEOUT,
             endpoint,
+            client_config,
             conn: Mutex::new(None),
-        }
+        })
     }
 
     fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -1183,10 +1236,8 @@ impl DoqUpstream {
     }
 
     fn build_client_config() -> quinn::ClientConfig {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls_config = tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .with_root_certificates(shared_root_store())
             .with_no_client_auth();
         tls_config.alpn_protocols = vec![b"doq".to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -1199,7 +1250,7 @@ impl DoqUpstream {
     async fn connect(&self) -> PluginResult<quinn::Connection> {
         let connecting = self
             .endpoint
-            .connect(self.addr, &self.server_name)
+            .connect_with(self.client_config.clone(), self.addr, &self.server_name)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("doq connect: {e}").into()
             })?;
@@ -1228,13 +1279,20 @@ impl DoqUpstream {
         Ok(conn)
     }
 
-    async fn invalidate_connection(&self, stable_id: usize) {
+    /// Drop the cached connection only if it is the one identified by `stable_id`
+    /// *and* it is actually dead (the QUIC layer recorded a close reason).
+    ///
+    /// A single failed or timed-out stream does not imply the connection is
+    /// gone — QUIC multiplexes every concurrent query onto it. Force-closing on
+    /// any per-stream error would abort all sibling in-flight queries, so a live
+    /// connection is deliberately left intact and only the failing query retries.
+    async fn discard_dead_connection(&self, stable_id: usize) {
         let mut guard = self.conn.lock().await;
         if let Some(conn) = guard.as_ref()
             && conn.stable_id() == stable_id
-            && let Some(conn) = guard.take()
+            && conn.close_reason().is_some()
         {
-            conn.close(quinn::VarInt::from_u32(0), b"reconnect");
+            *guard = None;
         }
     }
 }
@@ -1242,6 +1300,17 @@ impl DoqUpstream {
 #[async_trait]
 impl Upstream for DoqUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+        // RFC 9250 §4.2.1: when sending over QUIC the DNS Message ID MUST be set
+        // to 0 — the stream mapping (one query/response per bidirectional stream)
+        // already correlates them, and strict servers reject a non-zero ID with a
+        // stream reset. Zero it on the wire and restore the caller's original ID
+        // on the response, matching what the UDP/TCP transports preserve.
+        let mut wire = query.to_vec();
+        if wire.len() >= 2 {
+            wire[0] = 0;
+            wire[1] = 0;
+        }
+
         let mut attempt = 0;
         loop {
             let conn = self.get_connection().await?;
@@ -1254,13 +1323,13 @@ impl Upstream for DoqUpstream {
                     },
                 )?;
 
-                let len = query.len() as u16;
+                let len = wire.len() as u16;
                 send.write_all(&len.to_be_bytes()).await.map_err(
                     |e| -> Box<dyn std::error::Error + Send + Sync> {
                         format!("doq write: {e}").into()
                     },
                 )?;
-                send.write_all(query).await.map_err(
+                send.write_all(&wire).await.map_err(
                     |e| -> Box<dyn std::error::Error + Send + Sync> {
                         format!("doq write: {e}").into()
                     },
@@ -1288,9 +1357,16 @@ impl Upstream for DoqUpstream {
             };
 
             match tokio::time::timeout(self.timeout, exchange).await {
-                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Ok(mut resp)) => {
+                    // Restore the caller's original transaction ID.
+                    if resp.len() >= 2 && query.len() >= 2 {
+                        resp[0] = query[0];
+                        resp[1] = query[1];
+                    }
+                    return Ok(resp);
+                }
                 Ok(Err(e)) => {
-                    self.invalidate_connection(stable_id).await;
+                    self.discard_dead_connection(stable_id).await;
                     if attempt < MAX_POOL_RETRY {
                         attempt += 1;
                         continue;
@@ -1298,7 +1374,7 @@ impl Upstream for DoqUpstream {
                     return Err(e);
                 }
                 Err(_) => {
-                    self.invalidate_connection(stable_id).await;
+                    self.discard_dead_connection(stable_id).await;
                     if attempt < MAX_POOL_RETRY {
                         attempt += 1;
                         continue;
@@ -1321,18 +1397,25 @@ pub struct Doh3Upstream {
     server_name: String,
     authority: String,
     path_prefix: String,
+    /// Request path (with any original query string) used for POST, without the
+    /// `?dns=` GET parameter.
+    post_path: String,
     timeout: Duration,
     endpoint: quinn::Endpoint,
+    client_config: quinn::ClientConfig,
     session: Mutex<Option<Arc<Doh3Session>>>,
 }
 
 impl Doh3Upstream {
-    fn new(endpoint_url: String, addr: SocketAddr, server_name: String) -> Self {
+    fn new(endpoint_url: String, addr: SocketAddr, server_name: String) -> PluginResult<Self> {
         let client_config = Self::build_client_config();
-        let endpoint =
-            build_quic_endpoint(addr, client_config, "h3").expect("failed to create h3 endpoint");
+        let endpoint = shared_quic_endpoint(addr)?;
 
-        let url = reqwest::Url::parse(&endpoint_url).expect("invalid h3 endpoint url");
+        let url = reqwest::Url::parse(&endpoint_url).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("invalid h3 endpoint url '{endpoint_url}': {e}").into()
+            },
+        )?;
         let authority = if let Some(port) = url.port() {
             if port == 443 {
                 server_name.clone()
@@ -1356,15 +1439,23 @@ impl Doh3Upstream {
             path_prefix.push('?');
         }
 
-        Self {
+        // POST targets the bare path plus any original (non-`dns`) query string.
+        let post_path = match url.query() {
+            Some(q) if !q.is_empty() => format!("{}?{}", url.path(), q),
+            _ => url.path().to_string(),
+        };
+
+        Ok(Self {
             addr,
             server_name,
             authority,
             path_prefix,
+            post_path,
             timeout: DEFAULT_TIMEOUT,
             endpoint,
+            client_config,
             session: Mutex::new(None),
-        }
+        })
     }
 
     fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -1373,10 +1464,8 @@ impl Doh3Upstream {
     }
 
     fn build_client_config() -> quinn::ClientConfig {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls_config = tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .with_root_certificates(shared_root_store())
             .with_no_client_auth();
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
@@ -1389,7 +1478,7 @@ impl Doh3Upstream {
     async fn connect_quic(&self) -> PluginResult<quinn::Connection> {
         let connecting = self
             .endpoint
-            .connect(self.addr, &self.server_name)
+            .connect_with(self.client_config.clone(), self.addr, &self.server_name)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("h3 connect: {e}").into()
             })?;
@@ -1446,10 +1535,17 @@ impl Doh3Upstream {
         Ok(session)
     }
 
-    async fn invalidate_session(&self, stable_id: usize) {
+    /// Clear the cached session only if it is the one identified by `stable_id`
+    /// *and* it is no longer healthy (its driver finished or the QUIC connection
+    /// recorded a close reason). A single failed request — an `RST_STREAM`, a
+    /// per-request timeout — must not tear down the shared H3 connection that
+    /// sibling in-flight requests are multiplexed on; only a genuinely dead
+    /// connection is replaced.
+    async fn discard_dead_session(&self, stable_id: usize) {
         let mut guard = self.session.lock().await;
         if let Some(session) = guard.as_ref()
             && session.quinn_conn.stable_id() == stable_id
+            && !session.is_healthy()
         {
             Self::clear_session_locked(&mut guard);
         }
@@ -1469,6 +1565,22 @@ impl Upstream for Doh3Upstream {
         }
 
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&wire);
+        let get_url = format!(
+            "https://{}{}dns={}",
+            self.authority, self.path_prefix, encoded
+        );
+
+        // RFC 8484 §4.1: prefer GET, but fall back to POST when the base64url
+        // query would push the URL past what intermediaries reliably accept.
+        // POST carries the raw wire query in the request body instead (parity
+        // with the HTTP/2 DoH transport).
+        let use_post = get_url.len() > DOH_MAX_GET_URL_LEN;
+        let request_url = if use_post {
+            format!("https://{}{}", self.authority, self.post_path)
+        } else {
+            get_url
+        };
+        let body = bytes::Bytes::from(wire);
 
         let mut attempt = 0;
         loop {
@@ -1476,22 +1588,25 @@ impl Upstream for Doh3Upstream {
             let stable_id = session.quinn_conn.stable_id();
             let mut send_request = session.send_request.clone();
 
-            let req = http::Request::get(format!(
-                "https://{}{}dns={}",
-                self.authority, self.path_prefix, encoded
-            ))
-            .header("accept", "application/dns-message")
-            .header("user-agent", DOH_USER_AGENT)
-            .body(())
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("h3 build request: {e}").into()
-            })?;
+            let builder = if use_post {
+                http::Request::post(request_url.as_str())
+                    .header("content-type", "application/dns-message")
+            } else {
+                http::Request::get(request_url.as_str())
+            };
+            let req = builder
+                .header("accept", "application/dns-message")
+                .header("user-agent", DOH_USER_AGENT)
+                .body(())
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("h3 build request: {e}").into()
+                })?;
 
             let mut resp_stream =
                 match tokio::time::timeout(self.timeout, send_request.send_request(req)).await {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(e)) => {
-                        self.invalidate_session(stable_id).await;
+                        self.discard_dead_session(stable_id).await;
                         if attempt < MAX_POOL_RETRY {
                             attempt += 1;
                             continue;
@@ -1499,7 +1614,7 @@ impl Upstream for Doh3Upstream {
                         return Err(format!("h3 send request: {e}").into());
                     }
                     Err(_) => {
-                        self.invalidate_session(stable_id).await;
+                        self.discard_dead_session(stable_id).await;
                         if attempt < MAX_POOL_RETRY {
                             attempt += 1;
                             continue;
@@ -1508,10 +1623,39 @@ impl Upstream for Doh3Upstream {
                     }
                 };
 
+            // h3 does not finalize the send side implicitly: send the POST body
+            // (if any) and then `finish()` to signal request completion. Without
+            // the finish the server may wait indefinitely for more request data.
+            let send_body = async {
+                if use_post {
+                    resp_stream.send_data(body.clone()).await?;
+                }
+                resp_stream.finish().await
+            };
+            match tokio::time::timeout(self.timeout, send_body).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.discard_dead_session(stable_id).await;
+                    if attempt < MAX_POOL_RETRY {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(format!("h3 send body: {e}").into());
+                }
+                Err(_) => {
+                    self.discard_dead_session(stable_id).await;
+                    if attempt < MAX_POOL_RETRY {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err("h3 send body timed out".into());
+                }
+            }
+
             let resp = match tokio::time::timeout(self.timeout, resp_stream.recv_response()).await {
                 Ok(Ok(resp)) => resp,
                 Ok(Err(e)) => {
-                    self.invalidate_session(stable_id).await;
+                    self.discard_dead_session(stable_id).await;
                     if attempt < MAX_POOL_RETRY {
                         attempt += 1;
                         continue;
@@ -1519,7 +1663,7 @@ impl Upstream for Doh3Upstream {
                     return Err(format!("h3 recv response: {e}").into());
                 }
                 Err(_) => {
-                    self.invalidate_session(stable_id).await;
+                    self.discard_dead_session(stable_id).await;
                     if attempt < MAX_POOL_RETRY {
                         attempt += 1;
                         continue;
@@ -1552,7 +1696,19 @@ impl Upstream for Doh3Upstream {
             let mut read_failed = None;
             loop {
                 match tokio::time::timeout(self.timeout, resp_stream.recv_data()).await {
-                    Ok(Ok(Some(chunk))) => body_bytes.extend_from_slice(bytes::Buf::chunk(&chunk)),
+                    Ok(Ok(Some(mut chunk))) => {
+                        // `recv_data` yields an opaque `Buf`; copy *all* remaining
+                        // bytes (not just the first contiguous slice) so a
+                        // multi-chunk buffer is not silently truncated.
+                        let remaining = bytes::Buf::remaining(&chunk);
+                        body_bytes
+                            .extend_from_slice(&bytes::Buf::copy_to_bytes(&mut chunk, remaining));
+                        if body_bytes.len() > MAX_DNS_RESPONSE {
+                            read_failed =
+                                Some(format!("h3 response exceeds {MAX_DNS_RESPONSE} bytes").into());
+                            break;
+                        }
+                    }
                     Ok(Ok(None)) => break,
                     Ok(Err(e)) => {
                         read_failed = Some(format!("h3 recv body: {e}").into());
@@ -1566,7 +1722,7 @@ impl Upstream for Doh3Upstream {
             }
 
             if let Some(err) = read_failed {
-                self.invalidate_session(stable_id).await;
+                self.discard_dead_session(stable_id).await;
                 if attempt < MAX_POOL_RETRY {
                     attempt += 1;
                     continue;
@@ -2259,7 +2415,7 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
         let socket_addr = resolve_upstream_host(host, port, &opts)?;
 
         Ok(Box::new(
-            DoqUpstream::new(socket_addr, host.to_string()).with_timeout(opts.timeout),
+            DoqUpstream::new(socket_addr, host.to_string())?.with_timeout(opts.timeout),
         ))
     } else if let Some(rest) = addr.strip_prefix("h3://") {
         // h3://host/path → uses HTTPS URL internally but HTTP/3 transport
@@ -2279,7 +2435,8 @@ pub fn new_upstream(addr: &str, opts: UpstreamOpts) -> PluginResult<Box<dyn Upst
         let socket_addr = resolve_upstream_host(host, port, &opts)?;
 
         Ok(Box::new(
-            Doh3Upstream::new(https_url, socket_addr, host.to_string()).with_timeout(opts.timeout),
+            Doh3Upstream::new(https_url, socket_addr, host.to_string())?
+                .with_timeout(opts.timeout),
         ))
     } else {
         // Default to UDP.
