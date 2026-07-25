@@ -125,16 +125,15 @@ pub struct DashboardStore {
 }
 
 impl DashboardStore {
-    pub fn new(db_path: impl Into<String>, dhcp_leases: Vec<String>) -> Result<Self, DynError> {
+    pub fn new(
+        clear_on_start: bool,
+        db_path: impl Into<String>,
+        dhcp_leases: Vec<String>,
+    ) -> Result<Self, DynError> {
         let logs_db_path = db_path.into();
         ensure_sqlite_file_exists(&logs_db_path)?;
         let geoip_db_path = geoip_db_path(&logs_db_path);
         ensure_sqlite_file_exists(&geoip_db_path)?;
-        // Shared in-memory databases are deleted when the last connection closes.
-        // Hold one connection open for each ephemeral DB for the process lifetime
-        // so short-lived open/close cycles used by query paths do not wipe data.
-        hold_ephemeral_db_open(&logs_db_path)?;
-        hold_ephemeral_db_open(&geoip_db_path)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<NewDnsLogEntry>(10240);
         let store = Self {
             logs_db_path: Arc::new(logs_db_path.clone()),
@@ -217,6 +216,10 @@ impl DashboardStore {
                 }
             }
         });
+
+        if clear_on_start {
+            store.clear_logs_blocking()?;
+        }
 
         Ok(store)
     }
@@ -604,17 +607,25 @@ impl DashboardStore {
     pub async fn clear_logs(&self) -> Result<(), DynError> {
         let path = self.logs_db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), DynError> {
-            let conn = Self::open_connection(&path)?;
-            conn.execute("DELETE FROM dns_logs", [])?;
-            conn.execute("DELETE FROM sqlite_sequence WHERE name='dns_logs'", [])?;
-            // Also clear the lookup table: no log rows reference these ids anymore.
-            conn.execute("DELETE FROM upstream_names", [])?;
-            // Reclaim all free pages and truncate the WAL to shrink the file.
-            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
-            Ok(())
+            Self::clear_logs_sync(&path)
         })
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
+    }
+
+    /// Synchronous clear for use during store construction, before an async
+    /// runtime context is available.
+    fn clear_logs_blocking(&self) -> Result<(), DynError> {
+        Self::clear_logs_sync(&self.logs_db_path)
+    }
+
+    fn clear_logs_sync(path: &str) -> Result<(), DynError> {
+        let conn = Self::open_connection(path)?;
+        conn.execute("DELETE FROM dns_logs", [])?;
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='dns_logs'", [])?;
+        conn.execute("DELETE FROM upstream_names", [])?;
+        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     pub async fn prune_expired_logs(&self) -> Result<u64, DynError> {
@@ -1096,46 +1107,13 @@ pub fn default_sqlite_path(config_file: &str) -> String {
     base_dir.join("redns.db").to_string_lossy().into_owned()
 }
 
-/// SQLite URI for a process-local shared in-memory logs database.
-///
-/// Used when `dashboard.persist` is false so query logs and statistics are
-/// available for the current session only.
-pub fn ephemeral_sqlite_path() -> &'static str {
-    "file:redns-dashboard-logs?mode=memory&cache=shared"
-}
-
-fn ephemeral_geoip_sqlite_path() -> &'static str {
-    "file:redns-dashboard-geoip?mode=memory&cache=shared"
-}
-
-/// Returns true for SQLite paths that do not map to a durable filesystem file.
 fn is_ephemeral_sqlite_path(path: &str) -> bool {
     path == ":memory:"
-        || (path.starts_with("file:") && path.contains("mode=memory"))
-}
-
-/// Keep a shared in-memory database alive for the process lifetime.
-///
-/// SQLite destroys `mode=memory&cache=shared` databases when the last
-/// connection closes. Dashboard code opens short-lived connections per
-/// request/batch, so without a keep-alive handle the DB would reset constantly.
-fn hold_ephemeral_db_open(path: &str) -> Result<(), DynError> {
-    if !is_ephemeral_sqlite_path(path) {
-        return Ok(());
-    }
-    let conn = DashboardStore::open_connection(path)?;
-    // Intentionally leaked: lives until process exit, matching store lifetime.
-    std::mem::forget(conn);
-    Ok(())
 }
 
 /// Derive the dedicated GeoIP SQLite path from the logs database path.
 /// For `.../redns.db` this returns `.../redns.geoip.db`.
-/// Ephemeral (in-memory) logs DBs get a matching in-memory GeoIP DB.
 fn geoip_db_path(logs_db_path: &str) -> String {
-    if is_ephemeral_sqlite_path(logs_db_path) {
-        return ephemeral_geoip_sqlite_path().to_string();
-    }
     let path = Path::new(logs_db_path);
     let stem = path
         .file_stem()
@@ -2085,42 +2063,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_store_keeps_logs_for_session() {
-        // Unique name per test so parallel tests don't share one memory DB.
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = format!(
-            "file:redns-test-logs-{}-{}?mode=memory&cache=shared",
-            std::process::id(),
-            unique
-        );
-        let store = DashboardStore::new(path, vec![]).expect("create ephemeral store");
+    async fn clear_on_start_wipes_logs_and_stats() {
+        // When clear_on_start is true, the database starts empty even if a
+        // prior session left data behind.
+        let path = temp_db_path("clear-start");
+        let path_str = path.to_string_lossy().into_owned();
 
-        store
-            .record(sample_entry(1_000, "session.example"))
-            .await
-            .expect("insert log");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // First session: insert some logs.
+        {
+            let store = DashboardStore::new(false, path_str.clone(), vec![])
+                .expect("create store");
+            store
+                .record(sample_entry(1_000, "example.com"))
+                .await
+                .expect("insert log");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let logs = store
+                .fetch_logs(LogsQuery::default())
+                .await
+                .expect("fetch logs");
+            assert_eq!(logs.total_items, 1, "data should be present in first session");
+        }
 
-        let logs = store
-            .fetch_logs(LogsQuery::default())
-            .await
-            .expect("fetch logs");
-        assert_eq!(logs.total_items, 1);
-        assert_eq!(logs.items[0].qname, "session.example");
-
-        let clients = store.fetch_clients().await.expect("fetch clients");
-        assert_eq!(clients.total_queries, 1);
-        assert_eq!(clients.total_clients, 1);
+        // Second session with clear_on_start: logs should be gone.
+        {
+            let store = DashboardStore::new(true, path_str.clone(), vec![])
+                .expect("create store with clear_on_start");
+            let logs = store
+                .fetch_logs(LogsQuery::default())
+                .await
+                .expect("fetch logs");
+            assert_eq!(logs.total_items, 0, "logs should be cleared on start");
+            let clients = store.fetch_clients().await.expect("fetch clients");
+            assert_eq!(clients.total_queries, 0, "stats should be cleared on start");
+        }
     }
 
     #[tokio::test]
     async fn prune_expired_logs_removes_rows_older_than_24_hours() {
         let path = temp_db_path("retention");
         let path_str = path.to_string_lossy().into_owned();
-        let store = DashboardStore::new(path_str.clone(), vec![]).expect("create dashboard store");
+        let store =
+            DashboardStore::new(true, path_str.clone(), vec![]).expect("create dashboard store");
 
         let now_ms = 3 * DNS_LOG_RETENTION.as_millis() as u64;
         let cutoff_ms = now_ms - DNS_LOG_RETENTION.as_millis() as u64;

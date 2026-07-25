@@ -437,4 +437,27 @@ mod tests {
         assert_eq!(rc.matches[1].match_type, "has_resp");
         assert_eq!(rc.tag, "forward");
     }
+
+    #[test]
+    fn dashboard_config_persist_defaults_to_false() {
+        let cfg: Config =
+            serde_saphyr::from_str("dashboard:\n  http: \"127.0.0.1:9090\"\n").unwrap();
+        assert!(!cfg.dashboard.persist, "persist should default to false");
+    }
+
+    #[test]
+    fn dashboard_config_persist_explicitly_false() {
+        let cfg: Config =
+            serde_saphyr::from_str("dashboard:\n  http: \"127.0.0.1:9090\"\n  persist: false\n")
+                .unwrap();
+        assert!(!cfg.dashboard.persist);
+    }
+
+    #[test]
+    fn dashboard_config_persist_explicitly_true() {
+        let cfg: Config =
+            serde_saphyr::from_str("dashboard:\n  http: \"127.0.0.1:9090\"\n  persist: true\n")
+                .unwrap();
+        assert!(cfg.dashboard.persist);
+    }
 }

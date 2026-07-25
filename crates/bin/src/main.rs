@@ -606,22 +606,18 @@ async fn run_server(
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let sqlite_path = if cfg.dashboard.persist {
-        cfg.dashboard
-            .sqlite
-            .clone()
-            .unwrap_or_else(|| dashboard::default_sqlite_path(&file_used))
-    } else {
-        // Shared-cache in-memory DB: survives concurrent open/close of short-lived
-        // connections for the lifetime of this process, but not across restarts.
-        dashboard::ephemeral_sqlite_path().to_string()
-    };
+    let sqlite_path = cfg
+        .dashboard
+        .sqlite
+        .clone()
+        .unwrap_or_else(|| dashboard::default_sqlite_path(&file_used));
     info!(
         path = %sqlite_path,
         persist = cfg.dashboard.persist,
         "dashboard sqlite path selected"
     );
     let dashboard_store = Arc::new(dashboard::DashboardStore::new(
+        !cfg.dashboard.persist,
         sqlite_path,
         cfg.dashboard.dhcp_leases.clone(),
     )?);
