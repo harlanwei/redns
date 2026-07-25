@@ -1192,7 +1192,15 @@ struct DashboardLogInput {
     summary: DashboardLogSummary,
 }
 
+fn is_arpa_query(qname: &str) -> bool {
+    let lower = qname.to_ascii_lowercase();
+    lower.ends_with(".arpa.") || lower.ends_with(".arpa")
+}
+
 async fn persist_dashboard_log(store: &DashboardStore, input: DashboardLogInput) {
+    if is_arpa_query(&input.qname) {
+        return;
+    }
     let (rcode, result_summary, result_rows, answer_ttl) = input.summary;
     let upstream_names = dedupe_keep_order(input.selected_upstreams.lock().clone());
 
