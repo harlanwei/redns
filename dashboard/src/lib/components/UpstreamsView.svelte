@@ -5,6 +5,8 @@
   import { formatProtocol, sortUpstreams } from '../utils/dashboard';
   import ErrorAlert from './ErrorAlert.svelte';
 
+  let { onReady = () => {} } = $props<{ onReady?: () => void }>();
+
   let upstreams = $state<UpstreamMetrics[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -60,6 +62,7 @@
       error = getErrorMessage(err, 'Failed to fetch upstreams');
     } finally {
       loading = false;
+      onReady();
     }
   }
 

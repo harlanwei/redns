@@ -1,11 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { fade } from 'svelte/transition';
-  import type { DnsLogEntry, PaginatedLogsResponse } from '../types/dashboard';
+  import type { DnsLogEntry, LogSummary, PaginatedLogsResponse } from '../types/dashboard';
   import { formatProtocol, formatRelativeTime } from '../utils/dashboard';
   import ErrorAlert from './ErrorAlert.svelte';
   import SlowQueriesCard from './SlowQueriesCard.svelte';
   import QueryDetailModal from './QueryDetailModal.svelte';
+
+  let { onReady = () => {} } = $props<{ onReady?: () => void }>();
+
+  const emptySummary: LogSummary = {
+    total_items: 0,
+    unique_clients: 0,
+    non_noerror: 0,
+    avg_latency_ms: 0,
+  };
 
   let logsResponse = $state<PaginatedLogsResponse | null>(null);
   let searchQuery = $state('');
@@ -17,6 +25,13 @@
   let autoRefresh = $state(false);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
   let selectedLog = $state<DnsLogEntry | null>(null);
+  let logSummary = $derived(logsResponse?.summary ?? emptySummary);
+  let logsLoaded = $state(false);
+  let slowQueriesLoaded = $state(false);
+
+  function notifyReady() {
+    if (logsLoaded && slowQueriesLoaded) onReady();
+  }
 
   function getErrorMessage(err: unknown, fallback: string) {
     if (err instanceof Error && err.message) return err.message;
@@ -39,6 +54,8 @@
       error = getErrorMessage(err, 'Failed to fetch logs');
     } finally {
       loading = false;
+      logsLoaded = true;
+      notifyReady();
     }
   }
 
@@ -89,32 +106,36 @@
 {/if}
 
 <div class="space-y-4">
-  {#if logsResponse?.summary}
-    <section class="stat-row" aria-label="Query summary" transition:fade>
-      <div class="stat">
-        <div class="stat-label">Queries</div>
-        <div class="stat-value">{logsResponse.summary.total_items.toLocaleString()}</div>
-        <div class="stat-hint">Retention window</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Clients</div>
-        <div class="stat-value">{logsResponse.summary.unique_clients.toLocaleString()}</div>
-        <div class="stat-hint">Unique sources</div>
-      </div>
-      <div class="stat {logsResponse.summary.non_noerror > 0 ? 'stat-danger' : ''}">
-        <div class="stat-label">Non-NoError</div>
-        <div class="stat-value {logsResponse.summary.non_noerror > 0 ? 'text-warn-text' : ''}">{logsResponse.summary.non_noerror.toLocaleString()}</div>
-        <div class="stat-hint">Needs review</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Avg latency</div>
-        <div class="stat-value">{logsResponse.summary.avg_latency_ms}<span class="ml-0.5 text-sm font-medium text-faint">ms</span></div>
-        <div class="stat-hint">Response time</div>
-      </div>
-    </section>
-  {/if}
+  <section class="stat-row" aria-label="Query summary">
+    <div class="stat">
+      <div class="stat-label">Queries</div>
+      <div class="stat-value">{logSummary.total_items.toLocaleString()}</div>
+      <div class="stat-hint">Retention window</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Clients</div>
+      <div class="stat-value">{logSummary.unique_clients.toLocaleString()}</div>
+      <div class="stat-hint">Unique sources</div>
+    </div>
+    <div class="stat {logSummary.non_noerror > 0 ? 'stat-danger' : ''}">
+      <div class="stat-label">Non-NoError</div>
+      <div class="stat-value {logSummary.non_noerror > 0 ? 'text-warn-text' : ''}">{logSummary.non_noerror.toLocaleString()}</div>
+      <div class="stat-hint">Needs review</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Avg latency</div>
+      <div class="stat-value">{logSummary.avg_latency_ms}<span class="ml-0.5 text-sm font-medium text-faint">ms</span></div>
+      <div class="stat-hint">Response time</div>
+    </div>
+  </section>
 
-  <SlowQueriesCard onSelectLog={(log) => (selectedLog = log)} />
+  <SlowQueriesCard
+    onSelectLog={(log) => (selectedLog = log)}
+    onReady={() => {
+      slowQueriesLoaded = true;
+      notifyReady();
+    }}
+  />
 
   <section class="panel overflow-hidden" aria-label="DNS query logs">
     <div class="panel-head space-y-3 p-4">

@@ -4,6 +4,8 @@
   import type { ClientStatsResponse } from '../types/dashboard';
   import ErrorAlert from './ErrorAlert.svelte';
 
+  let { onReady = () => {} } = $props<{ onReady?: () => void }>();
+
   let clientsResponse = $state<ClientStatsResponse | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -24,6 +26,7 @@
       error = getErrorMessage(err, 'Failed to fetch clients');
     } finally {
       loading = false;
+      onReady();
     }
   }
 

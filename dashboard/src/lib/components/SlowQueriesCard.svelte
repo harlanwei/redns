@@ -5,8 +5,9 @@
   import { formatProtocol, formatRelativeTime } from '../utils/dashboard';
   import ErrorAlert from './ErrorAlert.svelte';
 
-  let { onSelectLog } = $props<{
+  let { onSelectLog, onReady = () => {} } = $props<{
     onSelectLog: (log: DnsLogEntry) => void;
+    onReady?: () => void;
   }>();
 
   let slowQueries = $state<DnsLogEntry[]>([]);
@@ -35,6 +36,7 @@
       error = getErrorMessage(err, 'Failed to fetch slow queries');
     } finally {
       loading = false;
+      onReady();
     }
   }
 

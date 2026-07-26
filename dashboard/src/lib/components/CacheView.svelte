@@ -4,6 +4,8 @@
   import type { CacheSnapshot } from '../types/dashboard';
   import ErrorAlert from './ErrorAlert.svelte';
 
+  let { onReady = () => {} } = $props<{ onReady?: () => void }>();
+
   let caches = $state<CacheSnapshot[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -49,6 +51,7 @@
       error = getErrorMessage(err, 'Failed to fetch cache metrics');
     } finally {
       loading = false;
+      onReady();
     }
   }
 
