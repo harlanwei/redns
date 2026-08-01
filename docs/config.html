@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">Configuration — ReDNS documentation</title>
+<meta name="description" content="Reference for every ReDNS configuration key: required, type, default, meaning." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="config">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="nav.config">Configuration</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Configuration</h1>
+      <p class="lead" data-i18n="page.lead">
+        ReDNS is configured with a single YAML file. The top-level schema is small; everything
+        interesting lives in the <code>plugins</code> section. Each key below documents whether
+        it is required, its type, its default, and its meaning.
+      </p>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.top.t">Top-level keys</h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>log</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.stringmap">map</td>
+              <td data-i18n="dflt.info-stdout">info / stdout</td>
+              <td data-i18n="opt.log.d">Logging settings: <code>level</code> and optional <code>file</code> (see below).</td>
+            </tr>
+            <tr>
+              <td><code>include</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.list">list of strings</td>
+              <td data-i18n="dflt.empty-list">empty list</td>
+              <td data-i18n="opt.include.d">Additional YAML files to load (up to 8 levels of nesting). Plugins from included files are merged into the same namespace.</td>
+            </tr>
+            <tr>
+              <td><code>plugins</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.maplist">list of maps</td>
+              <td data-i18n="dflt.empty-list">empty list</td>
+              <td data-i18n="opt.plugins.d">Named plugins: <code>{ tag, type, args }</code>. Tags are referenced from rules as <code>$tag</code>.</td>
+            </tr>
+            <tr>
+              <td><code>servers</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.maplist">list of maps</td>
+              <td data-i18n="dflt.empty-list">empty list</td>
+              <td data-i18n="opt.servers.d">Listener definitions (see below). Equivalent <code>udp_server</code>/<code>tcp_server</code> plugin entries are also accepted.</td>
+            </tr>
+            <tr>
+              <td><code>api</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.stringmap">map</td>
+              <td data-i18n="dflt.disabled">absent (disabled)</td>
+              <td data-i18n="opt.api.d"><code>http</code>: listen address for the JSON metrics API (<code>/metrics/upstreams</code>, <code>/metrics/cache</code>).</td>
+            </tr>
+            <tr>
+              <td><code>dashboard</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.stringmap">map</td>
+              <td data-i18n="dflt.disabled">absent (disabled)</td>
+              <td data-i18n="opt.dashboard.d">Web dashboard settings (see below and <a href="dashboard.html">Dashboard &amp; API</a>).</td>
+            </tr>
+            <tr>
+              <td><code>best_effort</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.bool">boolean</td>
+              <td><code>false</code></td>
+              <td data-i18n="opt.best_effort.d">When true and every upstream failed to produce <em>any</em> response, retry once against the WAN-assigned system DNS. DNSSEC-safe: any response an upstream did produce — including SERVFAIL — is returned as-is.</td>
+            </tr>
+            <tr>
+              <td><code>edns_udp_size</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.int">integer</td>
+              <td><code>1232</code></td>
+              <td data-i18n="opt.edns.d">EDNS0 UDP payload size advertised to upstreams. 1232 avoids fragmentation; modern networks can handle 4096+.</td>
+            </tr>
+            <tr>
+              <td><code>asn_db</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.list">string or list of strings</td>
+              <td data-i18n="dflt.asn-db">none (auto-downloads default DB)</td>
+              <td data-i18n="opt.asn.d">Paths to MaxMind-DB files backing the <code>asn</code> matcher. When omitted and the <code>asn</code> matcher is used, ReDNS auto-downloads the default <code>origin-asn.mmdb</code> database on first use.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.log.t"><code>log</code></h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>level</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td><code>info</code></td>
+              <td data-i18n="opt.log.level.d">Log level: <code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, <code>trace</code>. The <code>RUST_LOG</code> environment variable takes precedence.</td>
+            </tr>
+            <tr>
+              <td><code>file</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td data-i18n="opt.log.file.dflt">stdout</td>
+              <td data-i18n="opt.log.file.d">Write logs to this file instead of stdout. The file is truncated on startup.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.servers.t"><code>servers</code></h2>
+      <p data-i18n="s.servers.p">Each entry defines one DNS listener. You may also declare listeners as <code>udp_server</code>/<code>tcp_server</code> plugins — see their pages for the equivalent options.</p>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>protocol</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td><code>udp+tcp</code></td>
+              <td data-i18n="opt.srv.protocol.d">Which protocols to serve on the address: <code>udp</code>, <code>tcp</code>, or <code>udp+tcp</code>.</td>
+            </tr>
+            <tr>
+              <td><code>addr</code></td>
+              <td data-i18n="common.yes">Yes</td>
+              <td data-i18n="type.string">string</td>
+              <td>—</td>
+              <td data-i18n="opt.srv.addr.d">Listen address, e.g. <code>"0.0.0.0:53"</code> or <code>"[::]:53"</code>.</td>
+            </tr>
+            <tr>
+              <td><code>entry</code></td>
+              <td data-i18n="common.yes">Yes</td>
+              <td data-i18n="type.string">string</td>
+              <td>—</td>
+              <td data-i18n="opt.srv.entry.d">Tag of the sequence plugin that handles queries arriving on this listener. Required at runtime — ReDNS refuses to start without it.</td>
+            </tr>
+            <tr>
+              <td><code>udp_backend</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td><code>epoll</code></td>
+              <td data-i18n="opt.srv.udp_backend.d"><code>epoll</code> or <code>io-uring</code> (Linux + feature). Overrides the CLI default for this listener.</td>
+            </tr>
+            <tr>
+              <td><code>udp_workers</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.int">integer</td>
+              <td data-i18n="dflt.auto-workers">auto (2× CPU cores, ≤ 32)</td>
+              <td data-i18n="opt.srv.udp_workers.d">Receive-loop worker count for the epoll UDP backend.</td>
+            </tr>
+            <tr>
+              <td><code>udp_max_inflight</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.int">integer</td>
+              <td>2048</td>
+              <td data-i18n="opt.srv.udp_max_inflight.d">Cap on concurrently in-flight UDP handler tasks.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.dashboard.t"><code>dashboard</code></h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>http</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td data-i18n="dflt.disabled">absent (disabled)</td>
+              <td data-i18n="opt.dash.http.d">Listen address for the dashboard web server, e.g. <code>"127.0.0.1:9090"</code>. Omit to disable the dashboard.</td>
+            </tr>
+            <tr>
+              <td><code>sqlite</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td data-i18n="dflt.sqlite-path">&lt;config dir&gt;/redns.db</td>
+              <td data-i18n="opt.dash.sqlite.d">SQLite file path for dashboard data. Only used when <code>persist</code> is true; otherwise an in-memory database is used.</td>
+            </tr>
+            <tr>
+              <td><code>persist</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.bool">boolean</td>
+              <td><code>false</code></td>
+              <td data-i18n="opt.dash.persist.d">When true, query logs and client statistics are written to a durable SQLite file and survive restarts.</td>
+            </tr>
+            <tr>
+              <td><code>static_dir</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td><code>./dashboard/dist</code></td>
+              <td data-i18n="opt.dash.static_dir.d">Directory containing the built dashboard frontend. Relative paths resolve against the working directory (<code>-d</code>).</td>
+            </tr>
+            <tr>
+              <td><code>dhcp_leases</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.list">list of strings</td>
+              <td data-i18n="dflt.empty-list">empty list</td>
+              <td data-i18n="opt.dash.dhcp_leases.d">Lease files for resolving client IPs to hostnames: dnsmasq format (<code>/tmp/dhcp.leases</code>) or hosts format (<code>/tmp/hosts/odhcpd</code>).</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.api.t"><code>api</code></h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>http</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td data-i18n="dflt.disabled">absent (disabled)</td>
+              <td data-i18n="opt.api.http.d">Listen address for the JSON metrics API, e.g. <code>"127.0.0.1:8080"</code>. Serves <code>/metrics/upstreams</code> and <code>/metrics/cache</code>. Omit to disable.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.example.t">Complete example</h2>
+      <pre><code><span class="tok-key">log</span>:
+  <span class="tok-key">level</span>: info
+
+<span class="tok-key">servers</span>:
+  <span class="tok-punct">-</span> <span class="tok-key">protocol</span>: udp+tcp
+    <span class="tok-key">addr</span>: <span class="tok-str">"0.0.0.0:53"</span>
+    <span class="tok-key">entry</span>: main
+
+<span class="tok-key">plugins</span>:
+  <span class="tok-comment"># Upstream group 1: Google (DoH + DoT + plain UDP)</span>
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: google
+    <span class="tok-key">type</span>: forward
+    <span class="tok-key">args</span>:
+      <span class="tok-key">upstreams</span>:
+        <span class="tok-punct">-</span> <span class="tok-key">addr</span>: <span class="tok-str">"https://dns.google/dns-query"</span>
+        <span class="tok-punct">-</span> <span class="tok-key">addr</span>: <span class="tok-str">"tls://8.8.8.8:853"</span>
+        <span class="tok-punct">-</span> <span class="tok-key">addr</span>: <span class="tok-str">"8.8.4.4"</span>
+      <span class="tok-key">concurrent</span>: 2
+
+  <span class="tok-comment"># Upstream group 2: Cloudflare (DoH + DoQ)</span>
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: cloudflare
+    <span class="tok-key">type</span>: forward
+    <span class="tok-key">args</span>:
+      <span class="tok-key">upstreams</span>:
+        <span class="tok-punct">-</span> <span class="tok-key">addr</span>: <span class="tok-str">"https://cloudflare-dns.com/dns-query"</span>
+        <span class="tok-punct">-</span> <span class="tok-key">addr</span>: <span class="tok-str">"quic://1.1.1.1:853"</span>
+
+  <span class="tok-comment"># Shared cache: 65536 entries, persisted to disk every 5 minutes</span>
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: cache
+    <span class="tok-key">type</span>: cache
+    <span class="tok-key">args</span>:
+      <span class="tok-key">size</span>: 65536
+      <span class="tok-key">cache_file</span>: /var/lib/redns/cache.bin
+      <span class="tok-key">dump_interval</span>: 300
+
+  <span class="tok-comment"># Fallback: primary Google, switch to Cloudflare after 800 ms</span>
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: resolver
+    <span class="tok-key">type</span>: fallback
+    <span class="tok-key">args</span>:
+      <span class="tok-key">primary</span>: google
+      <span class="tok-key">secondary</span>: cloudflare
+      <span class="tok-key">threshold</span>: 800
+
+  <span class="tok-comment"># Main entry sequence</span>
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: main
+    <span class="tok-key">type</span>: sequence
+    <span class="tok-key">args</span>:
+      <span class="tok-comment"># Block example.org with a black hole</span>
+      <span class="tok-punct">-</span> <span class="tok-key">matches</span>: <span class="tok-str">qname example.org</span>
+        <span class="tok-key">exec</span>: black_hole 0.0.0.0
+      <span class="tok-comment"># Serve from cache when possible</span>
+      <span class="tok-punct">-</span> <span class="tok-key">exec</span>: <span class="tok-str">"$cache"</span>
+      <span class="tok-punct">-</span> <span class="tok-key">matches</span>: has_resp
+        <span class="tok-key">exec</span>: accept
+      <span class="tok-comment"># Otherwise resolve through the fallback group</span>
+      <span class="tok-punct">-</span> <span class="tok-key">exec</span>: <span class="tok-str">"$resolver"</span>
+
+<span class="tok-key">api</span>:
+  <span class="tok-key">http</span>: <span class="tok-str">"127.0.0.1:8080"</span>
+
+<span class="tok-key">dashboard</span>:
+  <span class="tok-key">http</span>: <span class="tok-str">"127.0.0.1:9090"</span>
+  <span class="tok-key">persist</span>: true
+  <span class="tok-key">sqlite</span>: /var/lib/redns/dashboard.db</code></pre>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

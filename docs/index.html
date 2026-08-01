@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">ReDNS — User Documentation</title>
+<meta name="description" content="User documentation for ReDNS, a fast, scriptable DNS forwarder written in Rust." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="index">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <div class="page-head">
+      <h1 data-i18n="page.title">ReDNS — a fast, scriptable DNS forwarder</h1>
+      <p class="lead" data-i18n="page.lead">
+        ReDNS is a high-performance DNS forwarding server written in Rust. It listens for DNS
+        queries over UDP and TCP, and forwards them to upstream resolvers over plain or
+        encrypted transports. A plugin-based rule engine lets you filter, rewrite, cache,
+        and shape responses without writing code.
+      </p>
+      <div class="badges">
+        <span class="badge accent" data-i18n="page.badge.protocols">UDP · TCP · DoT · DoH · DoQ · DoH3</span>
+        <span class="badge" data-i18n="page.badge.rules">Rule chains</span>
+        <span class="badge" data-i18n="page.badge.cache">Persistent cache</span>
+        <span class="badge" data-i18n="page.badge.dashboard">Web dashboard</span>
+        <span class="badge" data-i18n="page.badge.license">GPL-3.0</span>
+      </div>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature-card">
+        <h4 data-i18n="page.f1.t">Protocol coverage</h4>
+        <p data-i18n="page.f1.d">Serve UDP and TCP (including io_uring on Linux) and reach upstreams via UDP, TCP, DNS-over-TLS, DNS-over-HTTPS, DNS-over-QUIC, and DNS-over-HTTP/3.</p>
+      </div>
+      <div class="feature-card">
+        <h4 data-i18n="page.f2.t">Rule engine</h4>
+        <p data-i18n="page.f2.d">Declarative YAML rules combine matchers (qname, qtype, client IP, ASN, response content…) with actions (forward, cache, redirect, block, rewrite, TTL control…).</p>
+      </div>
+      <div class="feature-card">
+        <h4 data-i18n="page.f3.t">Smart caching</h4>
+        <p data-i18n="page.f3.d">Sharded LRU cache with lazy stale-while-refresh, request coalescing, and optional on-disk persistence with periodic dumps.</p>
+      </div>
+      <div class="feature-card">
+        <h4 data-i18n="page.f4.t">Resilience</h4>
+        <p data-i18n="page.f4.d">Load-balanced upstream groups, latency-aware selection, fallback with threshold, and best-effort system DNS as a last resort.</p>
+      </div>
+      <div class="feature-card">
+        <h4 data-i18n="page.f5.t">Web dashboard</h4>
+        <p data-i18n="page.f5.d">Real-time query log, client statistics, cache viewer, upstream health, slow-query detection, and GeoIP enrichment — with optional SQLite persistence.</p>
+      </div>
+      <div class="feature-card">
+        <h4 data-i18n="page.f6.t">Privacy &amp; DNSSEC aware</h4>
+        <p data-i18n="page.f6.d">EDNS Client Subnet support, DNSSEC-safe fallback semantics (SERVFAIL is never silently re-resolved), and encrypted upstream transports.</p>
+      </div>
+    </div>
+
+    <h2 data-i18n="s.explore.t">Explore the documentation</h2>
+    <div class="link-grid">
+      <a class="link-card" href="quickstart.html">
+        <span class="lc-name" data-i18n="lc.quickstart.t">Quick start</span>
+        <span class="lc-desc" data-i18n="lc.quickstart.d">Build ReDNS, write a minimal config, run and test it. Full command-line reference.</span>
+      </a>
+      <a class="link-card" href="config.html">
+        <span class="lc-name" data-i18n="lc.config.t">Configuration</span>
+        <span class="lc-desc" data-i18n="lc.config.d">Every top-level YAML key and the servers section, with types, defaults, and meanings.</span>
+      </a>
+      <a class="link-card" href="rules.html">
+        <span class="lc-name" data-i18n="lc.rules.t">Rules</span>
+        <span class="lc-desc" data-i18n="lc.rules.d">How sequence rules work: matches, exec, negation, and $tag references.</span>
+      </a>
+      <a class="link-card" href="plugins.html">
+        <span class="lc-name" data-i18n="lc.plugins.t">Plugins</span>
+        <span class="lc-desc" data-i18n="lc.plugins.d">Detailed reference for all 16 matchers and 21 executables, one page per plugin.</span>
+      </a>
+      <a class="link-card" href="upstreams.html">
+        <span class="lc-name" data-i18n="lc.upstreams.t">Upstreams</span>
+        <span class="lc-desc" data-i18n="lc.upstreams.d">Supported transport protocols (UDP, TCP, DoT, DoH, DoQ, DoH3) and addressing.</span>
+      </a>
+      <a class="link-card" href="dashboard.html">
+        <span class="lc-name" data-i18n="lc.dashboard.t">Dashboard &amp; API</span>
+        <span class="lc-desc" data-i18n="lc.dashboard.d">The web dashboard, data persistence, and every HTTP API endpoint.</span>
+      </a>
+      <a class="link-card" href="ops.html">
+        <span class="lc-name" data-i18n="lc.ops.t">Operations</span>
+        <span class="lc-desc" data-i18n="lc.ops.d">Logging, graceful shutdown, systemd, io_uring, ASN database, security notes.</span>
+      </a>
+      <a class="link-card" href="faq.html">
+        <span class="lc-name" data-i18n="lc.faq.t">FAQ &amp; License</span>
+        <span class="lc-desc" data-i18n="lc.faq.d">Frequently asked questions and the GNU GPL-3.0 license notice.</span>
+      </a>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">Quick start — ReDNS documentation</title>
+<meta name="description" content="Build, configure, and run ReDNS for the first time." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="quickstart">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="nav.quickstart">Quick start</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Quick start</h1>
+      <p class="lead" data-i18n="page.lead">
+        Get a ReDNS instance forwarding queries within five minutes.
+      </p>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.build.t">Build</h2>
+      <p data-i18n="s.build.p">
+        ReDNS is written in Rust (edition 2024) and builds with a recent stable toolchain:
+      </p>
+      <pre><code><span class="tok-punct">$</span> cargo build --release
+<span class="tok-comment"># binary: target/release/redns</span></code></pre>
+      <p data-i18n="s.build.optional">
+        To enable the optional Linux io_uring UDP backend, build with the
+        <code>io-uring</code> feature. The dashboard frontend is optional too — see
+        <a href="dashboard.html">Dashboard &amp; API</a>.
+      </p>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.config.t">Minimal configuration</h2>
+      <p data-i18n="s.config.p">
+        Create <code>config.yaml</code> in the directory where you will run ReDNS:
+      </p>
+      <pre><code><span class="tok-key">servers</span>:
+  <span class="tok-punct">-</span> <span class="tok-key">protocol</span>: udp+tcp
+    <span class="tok-key">addr</span>: <span class="tok-str">"0.0.0.0:53"</span>
+    <span class="tok-key">entry</span>: main
+
+<span class="tok-key">plugins</span>:
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: forward
+    <span class="tok-key">type</span>: forward
+    <span class="tok-key">args</span>: <span class="tok-str">"1.1.1.1 8.8.8.8"</span>
+
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: main
+    <span class="tok-key">type</span>: sequence
+    <span class="tok-key">args</span>:
+      <span class="tok-punct">-</span> <span class="tok-key">exec</span>: <span class="tok-str">"$forward"</span></code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.run.t">Run and test</h2>
+      <pre><code><span class="tok-punct">$</span> redns start
+<span class="tok-comment"># or with an explicit config file:</span>
+<span class="tok-punct">$</span> redns start -c /etc/redns/config.yaml</code></pre>
+      <pre><code><span class="tok-punct">$</span> dig @127.0.0.1 example.com
+
+<span class="tok-comment">;; ANSWER SECTION:</span>
+example.com.<span class="tok-punct">    </span>21599<span class="tok-punct">   </span>IN<span class="tok-punct">  </span>A<span class="tok-punct">      </span>93.184.215.14</code></pre>
+      <div class="callout warn">
+        <p data-i18n="s.run.port53">
+          Port 53 is a privileged port. Run ReDNS as root, or grant the capability
+          <code>cap_net_bind_service</code> to the binary (see
+          <a href="ops.html">Operations</a>).
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.cli.t">Command line</h2>
+      <pre><code>redns start [-c &lt;config&gt;] [-d &lt;dir&gt;] [--udp-backend &lt;epoll|io-uring&gt;]
+redns version</code></pre>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.option">Option</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>start</code></td>
+              <td data-i18n="cli.start.d">Start the ReDNS server (default subcommand).</td>
+            </tr>
+            <tr>
+              <td><code>-c, --config &lt;file&gt;</code></td>
+              <td data-i18n="cli.config.d">Path to the YAML config file. When omitted, ReDNS looks for <code>config.yaml</code> then <code>config.yml</code> in the current directory.</td>
+            </tr>
+            <tr>
+              <td><code>-d, --dir &lt;dir&gt;</code></td>
+              <td data-i18n="cli.dir.d">Change the working directory before loading the config. Relative paths in the config (and the default dashboard <code>static_dir</code>) resolve from here.</td>
+            </tr>
+            <tr>
+              <td><code>--udp-backend</code></td>
+              <td data-i18n="cli.udp.d">UDP server backend: <code>epoll</code> (default, works everywhere) or <code>io-uring</code> (Linux only, requires the <code>io-uring</code> build feature). Falls back to epoll automatically when io_uring is unavailable.</td>
+            </tr>
+            <tr>
+              <td><code>version</code></td>
+              <td data-i18n="cli.version.d">Print the version and git commit, then exit.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 data-i18n="s.env.t">Environment variables</h3>
+      <ul>
+        <li><code>RUST_LOG</code> — <span data-i18n="env.rustlog">overrides the configured log level (e.g. <code>RUST_LOG=debug redns start</code>).</span></li>
+        <li><code>XDG_CACHE_HOME</code> — <span data-i18n="env.xdg">used to locate the auto-downloaded ASN database (<code>$XDG_CACHE_HOME/redns/</code>, default <code>~/.cache/redns/</code>).</span></li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

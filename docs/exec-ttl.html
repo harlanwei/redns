@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">ttl — ReDNS documentation</title>
+<meta name="description" content="ttl executable: fix or clamp the TTL of response records." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="exec-ttl">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <a href="plugins.html" data-i18n="crumb.plugins">Plugins</a><span class="sep">/</span>
+      <span data-i18n="crumb.executables">Executables</span><span class="sep">/</span>
+      <span class="current">ttl</span>
+    </nav>
+
+    <div class="page-head">
+      <h1><code>ttl</code></h1>
+      <p class="lead" data-i18n="page.lead">
+        Fixes every TTL in the response to a single value, or clamps them into a range —
+        a simple lever on cache duration and client-side caching.
+      </p>
+      <div class="badges">
+        <span class="badge accent" data-i18n="badge.executable">executable</span>
+        <span class="badge" data-i18n="badge.in-exec">used in: exec</span>
+      </div>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.usage.t">Usage</h2>
+      <pre><code><span class="tok-punct">-</span> <span class="tok-key">exec</span>: ttl 300       <span class="tok-comment"># fix every TTL to 300 seconds</span>
+<span class="tok-punct">-</span> <span class="tok-key">exec</span>: ttl 300-600   <span class="tok-comment"># clamp TTLs into [300, 600]</span></code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.params.t">Parameters</h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>value</code></td>
+              <td data-i18n="common.yes">Yes</td>
+              <td data-i18n="type.string">string: <code>N</code> or <code>N-M</code></td>
+              <td>—</td>
+              <td data-i18n="p.value.d">A single integer fixes all TTLs to that value (seconds). <code>min-max</code> clamps: TTLs below <code>min</code> are raised, above <code>max</code> are lowered, in-between values are kept.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.details.t">Details</h2>
+      <ul>
+        <li data-i18n="s.details.li1">Applies to answer, authority, and additional records; the OPT pseudo-record's TTL field (which carries EDNS flags) is left untouched.</li>
+        <li data-i18n="s.details.li2">Place the rule after the action that produced the response (e.g. after <code>forward</code>).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.related.t">See also</h2>
+      <ul>
+        <li><a href="exec-cache.html"><code>cache</code></a> — how TTLs drive the cache.</li>
+        <li><a href="exec-shuffle.html"><code>shuffle</code></a> — another response post-processor.</li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/executables.js"></script>
+</body>
+</html>

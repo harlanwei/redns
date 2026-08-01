@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">Operations — ReDNS documentation</title>
+<meta name="description" content="Running ReDNS in production: logging, graceful shutdown, systemd, io_uring, ASN database, security." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="ops">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="nav.ops">Operations</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Operations</h1>
+      <p class="lead" data-i18n="page.lead">
+        Day-to-day operational topics: logging, shutdown, service management, performance
+        backends, and security.
+      </p>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.logging.t">Logging</h2>
+      <p data-i18n="s.logging.p">
+        Set the level with <code>log.level</code> (<code>error</code>, <code>warn</code>,
+        <code>info</code>, <code>debug</code>, <code>trace</code>) or the <code>RUST_LOG</code>
+        environment variable, which takes precedence. Use <code>log.file</code> to write to a
+        file instead of stdout. The <a href="exec-debug-print.html"><code>debug_print</code></a>
+        plugin logs full query contexts at debug level.
+      </p>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.shutdown.t">Graceful shutdown</h2>
+      <p data-i18n="s.shutdown.p">
+        Send <code>SIGINT</code> (Ctrl-C) or <code>SIGTERM</code> (<code>systemctl stop</code>,
+        <code>docker stop</code>). ReDNS stops accepting queries, dumps the cache to disk when
+        persistence is configured, and exits cleanly.
+      </p>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.systemd.t">Running under systemd</h2>
+      <pre><code><span class="tok-comment"># /etc/systemd/system/redns.service</span>
+<span class="tok-punct">[</span>Unit<span class="tok-punct">]</span>
+Description=redns DNS forwarder
+After=network-online.target
+Wants=network-online.target
+
+<span class="tok-punct">[</span>Service<span class="tok-punct">]</span>
+ExecStart=/usr/local/bin/redns start -c /etc/redns/config.yaml
+Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+<span class="tok-punct">[</span>Install<span class="tok-punct">]</span>
+WantedBy=multi-user.target</code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.uring.t">io_uring UDP backend</h2>
+      <p data-i18n="s.uring.p">
+        On Linux, ReDNS can use io_uring for the UDP receive path:
+        <code>cargo build --release --features io-uring</code>, then
+        <code>redns start --udp-backend io-uring</code> (or set
+        <code>udp_backend: io-uring</code> per server). If io_uring is unavailable on the
+        running kernel, ReDNS logs a warning and falls back to epoll automatically.
+      </p>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.asn.t">ASN database</h2>
+      <p data-i18n="s.asn.p">
+        The <a href="matcher-asn.html"><code>asn</code> matcher</a> needs a MaxMind-DB file
+        with ASN records. Point <code>asn_db</code> at your own files, or rely on the default:
+        on first use ReDNS downloads <code>origin-asn.mmdb</code> (~10 MB,
+        sapics/ip-location-db) and caches it under <code>$XDG_CACHE_HOME/redns/</code> or
+        <code>~/.cache/redns/</code>. Downloads are atomic — an interrupted download never
+        leaves a corrupt database behind.
+      </p>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.security.t">Security notes</h2>
+      <ul>
+        <li data-i18n="sec.li1">Bind the API and dashboard listeners to <code>127.0.0.1</code> unless you need remote access — they expose operational data.</li>
+        <li data-i18n="sec.li2">The DNS listener is unauthenticated by design; do not expose port 53 to untrusted networks without additional filtering.</li>
+        <li data-i18n="sec.li3">ReDNS validates upstream TLS certificates with the system webpki trust anchors.</li>
+        <li data-i18n="sec.li4">Port 53 is privileged: run as root, grant <code>cap_net_bind_service</code>, or use the systemd unit above.</li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

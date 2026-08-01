@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">client_ip — ReDNS documentation</title>
+<meta name="description" content="client_ip matcher: match the DNS client source address against CIDR ranges." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="matcher-client-ip">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <a href="plugins.html" data-i18n="crumb.plugins">Plugins</a><span class="sep">/</span>
+      <span data-i18n="crumb.matchers">Matchers</span><span class="sep">/</span>
+      <span class="current">client_ip</span>
+    </nav>
+
+    <div class="page-head">
+      <h1><code>client_ip</code></h1>
+      <p class="lead" data-i18n="page.lead">
+        Matches the address of the client that sent the query against a set of CIDR ranges.
+        Ideal for per-network routing and rate limiting.
+      </p>
+      <div class="badges">
+        <span class="badge accent" data-i18n="badge.matcher">matcher</span>
+        <span class="badge" data-i18n="badge.in-matches">used in: matches</span>
+      </div>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.usage.t">Usage</h2>
+      <pre><code><span class="tok-key">matches</span>: <span class="tok-str">client_ip 192.168.0.0/16 10.0.0.1</span></code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.params.t">Parameters</h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>cidrs</code></td>
+              <td data-i18n="common.yes">Yes</td>
+              <td data-i18n="type.cidr">CIDR / IP (space-separated)</td>
+              <td>—</td>
+              <td data-i18n="p.cidrs.d">Ranges to accept, e.g. <code>192.168.0.0/16 10.0.0.1 ::1</code>. A bare IP is treated as a /32 (IPv4) or /128 (IPv6). IPv4 and IPv6 may be mixed.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.details.t">Details</h2>
+      <ul>
+        <li data-i18n="s.details.li1">The source address is taken from the socket the query arrived on; a query relayed through another resolver appears with that resolver's address.</li>
+        <li data-i18n="s.details.li2">Lookups are O(distinct prefix lengths) — large allow/block lists stay fast.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.examples.t">Examples</h2>
+      <pre><code><span class="tok-comment"># Local clients use the internal resolver; everyone else is rejected</span>
+<span class="tok-punct">-</span> <span class="tok-key">matches</span>: <span class="tok-str">client_ip 192.168.0.0/16 10.0.0.0/8</span>
+  <span class="tok-key">exec</span>: <span class="tok-str">"$internal"</span>
+<span class="tok-punct">-</span> <span class="tok-key">exec</span>: reject 5</code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.related.t">See also</h2>
+      <ul>
+        <li><a href="matcher-resp-ip.html"><code>resp_ip</code></a> — match the <em>answer</em> addresses instead.</li>
+        <li><a href="matcher-ptr-ip.html"><code>ptr_ip</code></a> — match the IP embedded in a PTR query.</li>
+        <li><a href="matcher-ip-set.html"><code>ip_set</code></a> — reusable named IP/CIDR sets.</li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/matchers.js"></script>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">Plugins — ReDNS documentation</title>
+<meta name="description" content="Index of all ReDNS plugins: 16 matchers and 21 executables, one page per plugin." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="plugins">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="crumb.plugins">Plugins</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Plugins</h1>
+      <p class="lead" data-i18n="page.lead">
+        ReDNS ships with 16 matchers and 21 executables. Each plugin has its own page with a
+        full parameter reference — whether each parameter is required, its type, its default,
+        and what it does. Start with the <a href="rules.html">Rules</a> page if you have not
+        read it yet.
+      </p>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.matchers.t">Matchers</h2>
+      <p data-i18n="s.matchers.p">Used in <code>matches</code>. They inspect the query or the response produced so far and return true or false.</p>
+      <div class="link-grid">
+        <a class="link-card" href="matcher-qname.html"><span class="lc-name">qname</span><span class="lc-desc" data-i18n="lc.qname">Match the query name against domain patterns.</span></a>
+        <a class="link-card" href="matcher-qtype.html"><span class="lc-name">qtype</span><span class="lc-desc" data-i18n="lc.qtype">Match the query type (A, AAAA, MX…).</span></a>
+        <a class="link-card" href="matcher-qclass.html"><span class="lc-name">qclass</span><span class="lc-desc" data-i18n="lc.qclass">Match the query class (IN…).</span></a>
+        <a class="link-card" href="matcher-client-ip.html"><span class="lc-name">client_ip</span><span class="lc-desc" data-i18n="lc.client_ip">Match the client source address.</span></a>
+        <a class="link-card" href="matcher-resp-ip.html"><span class="lc-name">resp_ip</span><span class="lc-desc" data-i18n="lc.resp_ip">Match addresses in the response.</span></a>
+        <a class="link-card" href="matcher-cname.html"><span class="lc-name">cname</span><span class="lc-desc" data-i18n="lc.cname">Match CNAME targets in the response.</span></a>
+        <a class="link-card" href="matcher-rcode.html"><span class="lc-name">rcode</span><span class="lc-desc" data-i18n="lc.rcode">Match the response rcode.</span></a>
+        <a class="link-card" href="matcher-random.html"><span class="lc-name">random</span><span class="lc-desc" data-i18n="lc.random">Match with a given probability.</span></a>
+        <a class="link-card" href="matcher-env.html"><span class="lc-name">env</span><span class="lc-desc" data-i18n="lc.env">Match on an environment variable.</span></a>
+        <a class="link-card" href="matcher-ptr-ip.html"><span class="lc-name">ptr_ip</span><span class="lc-desc" data-i18n="lc.ptr_ip">Match the IP in a PTR query name.</span></a>
+        <a class="link-card" href="matcher-string-exp.html"><span class="lc-name">string_exp</span><span class="lc-desc" data-i18n="lc.string_exp">String expressions over env/metadata.</span></a>
+        <a class="link-card" href="matcher-asn.html"><span class="lc-name">asn</span><span class="lc-desc" data-i18n="lc.asn">Match the autonomous system of an answer.</span></a>
+        <a class="link-card" href="matcher-has-resp.html"><span class="lc-name">has_resp</span><span class="lc-desc" data-i18n="lc.has_resp">True when a response exists.</span></a>
+        <a class="link-card" href="matcher-has-wanted-ans.html"><span class="lc-name">has_wanted_ans</span><span class="lc-desc" data-i18n="lc.has_wanted_ans">True when the response has answers.</span></a>
+        <a class="link-card" href="matcher-domain-set.html"><span class="lc-name">domain_set</span><span class="lc-desc" data-i18n="lc.domain_set">Reusable named domain set.</span></a>
+        <a class="link-card" href="matcher-ip-set.html"><span class="lc-name">ip_set</span><span class="lc-desc" data-i18n="lc.ip_set">Reusable named IP/CIDR set.</span></a>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.exec.t">Executables</h2>
+      <p data-i18n="s.exec.p">Used in <code>exec</code>. They act on the query or the response.</p>
+      <div class="link-grid">
+        <a class="link-card" href="exec-forward.html"><span class="lc-name">forward</span><span class="lc-desc" data-i18n="lc.forward">Forward to upstream resolvers.</span></a>
+        <a class="link-card" href="exec-cache.html"><span class="lc-name">cache</span><span class="lc-desc" data-i18n="lc.cache">LRU response cache, optionally persisted.</span></a>
+        <a class="link-card" href="exec-fallback.html"><span class="lc-name">fallback</span><span class="lc-desc" data-i18n="lc.fallback">Primary/secondary with a time threshold.</span></a>
+        <a class="link-card" href="exec-ecs.html"><span class="lc-name">ecs</span><span class="lc-desc" data-i18n="lc.ecs">Attach EDNS Client Subnet to queries.</span></a>
+        <a class="link-card" href="exec-redirect.html"><span class="lc-name">redirect</span><span class="lc-desc" data-i18n="lc.redirect">Alias one domain to another.</span></a>
+        <a class="link-card" href="exec-hosts.html"><span class="lc-name">hosts</span><span class="lc-desc" data-i18n="lc.hosts">Static hosts-file style mapping.</span></a>
+        <a class="link-card" href="exec-black-hole.html"><span class="lc-name">black_hole</span><span class="lc-desc" data-i18n="lc.black_hole">Answer with fixed IPs (blocking).</span></a>
+        <a class="link-card" href="exec-ttl.html"><span class="lc-name">ttl</span><span class="lc-desc" data-i18n="lc.ttl">Fix or clamp response TTLs.</span></a>
+        <a class="link-card" href="exec-reverse-lookup.html"><span class="lc-name">reverse_lookup</span><span class="lc-desc" data-i18n="lc.reverse_lookup">Answer PTR from cached A/AAAA answers.</span></a>
+        <a class="link-card" href="exec-use-answer-of.html"><span class="lc-name">use-answer-of</span><span class="lc-desc" data-i18n="lc.use_answer_of">Answer with another name's records.</span></a>
+        <a class="link-card" href="exec-metrics-collector.html"><span class="lc-name">metrics_collector</span><span class="lc-desc" data-i18n="lc.metrics_collector">In-process query/error counters.</span></a>
+        <a class="link-card" href="exec-shuffle.html"><span class="lc-name">shuffle</span><span class="lc-desc" data-i18n="lc.shuffle">Randomize record order (round robin).</span></a>
+        <a class="link-card" href="exec-accept.html"><span class="lc-name">accept</span><span class="lc-desc" data-i18n="lc.accept">Stop the chain, keep the response.</span></a>
+        <a class="link-card" href="exec-reject.html"><span class="lc-name">reject</span><span class="lc-desc" data-i18n="lc.reject">Answer with an rcode, stop the chain.</span></a>
+        <a class="link-card" href="exec-sleep.html"><span class="lc-name">sleep</span><span class="lc-desc" data-i18n="lc.sleep">Delay the query (rate limiting).</span></a>
+        <a class="link-card" href="exec-debug-print.html"><span class="lc-name">debug_print</span><span class="lc-desc" data-i18n="lc.debug_print">Log the full query context.</span></a>
+        <a class="link-card" href="exec-drop-resp.html"><span class="lc-name">drop_resp</span><span class="lc-desc" data-i18n="lc.drop_resp">Discard the response (client times out).</span></a>
+        <a class="link-card" href="exec-arbitrary.html"><span class="lc-name">arbitrary</span><span class="lc-desc" data-i18n="lc.arbitrary">Serve records added programmatically.</span></a>
+        <a class="link-card" href="exec-udp-server.html"><span class="lc-name">udp_server</span><span class="lc-desc" data-i18n="lc.udp_server">Declare a UDP listener as a plugin.</span></a>
+        <a class="link-card" href="exec-tcp-server.html"><span class="lc-name">tcp_server</span><span class="lc-desc" data-i18n="lc.tcp_server">Declare a TCP listener as a plugin.</span></a>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.other.t">Containers</h2>
+      <div class="link-grid">
+        <a class="link-card" href="plugin-sequence.html"><span class="lc-name">sequence</span><span class="lc-desc" data-i18n="lc.sequence">The rule container that processes every query.</span></a>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

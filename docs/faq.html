@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">FAQ — ReDNS documentation</title>
+<meta name="description" content="Frequently asked questions about ReDNS, plus the license notice." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="faq">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="nav.faq">FAQ</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Frequently asked questions</h1>
+    </div>
+
+    <details>
+      <summary data-i18n="q1.q">Why “permission denied” when binding port 53?</summary>
+      <p data-i18n="q1.a">Ports below 1024 are privileged. Run as root, grant the capability (<code>setcap 'cap_net_bind_service=+ep' /usr/local/bin/redns</code>), or use the systemd unit in <a href="ops.html">Operations</a> with <code>AmbientCapabilities=CAP_NET_BIND_SERVICE</code>.</p>
+    </details>
+
+    <details>
+      <summary data-i18n="q2.q">The dashboard page loads but shows no data.</summary>
+      <p data-i18n="q2.a">The frontend must be built first: run <code>make dashboard</code> (or <code>cd dashboard &amp;&amp; pnpm install &amp;&amp; pnpm build</code>) and make sure <code>static_dir</code> points at the built <code>dashboard/dist</code> directory.</p>
+    </details>
+
+    <details>
+      <summary data-i18n="q3.q">Is DNSSEC supported?</summary>
+      <p data-i18n="q3.a">ReDNS forwards queries and responses as-is, so a validating upstream protects your clients. The <code>best_effort</code> system-DNS fallback and the <a href="exec-fallback.html"><code>fallback</code></a> plugin deliberately treat SERVFAIL as a terminal answer — re-resolving a DNSSEC-bogus answer through a non-validating resolver would silently defeat DNSSEC.</p>
+    </details>
+
+    <details>
+      <summary data-i18n="q4.q">Where is the cache file stored and what format is it?</summary>
+      <p data-i18n="q4.a">Only when you configure <code>cache_file</code> on the <a href="exec-cache.html"><code>cache</code></a> plugin. It is a ReDNS-specific binary snapshot dumped every <code>dump_interval</code> seconds and on graceful shutdown. If the file is missing or corrupt, ReDNS simply starts with an empty cache.</p>
+    </details>
+
+    <details>
+      <summary data-i18n="q5.q">Does ReDNS support EDNS Client Subnet (ECS)?</summary>
+      <p data-i18n="q5.a">Yes. Add the <a href="exec-ecs.html"><code>ecs</code></a> executable to your sequence: with no arguments it forwards the client's address (IPv4 /24, IPv6 /48), or pass a fixed IP to always send a preset subnet.</p>
+    </details>
+
+    <details>
+      <summary data-i18n="q6.q">How do I reset the dashboard logs?</summary>
+      <p data-i18n="q6.a">Use the <code>POST /api/logs/clear</code> endpoint, or the clear action in the dashboard UI.</p>
+    </details>
+
+    <details>
+      <summary data-i18n="q7.q">Does the <code>asn</code> matcher require an internet connection?</summary>
+      <p data-i18n="q7.a">Only on first use, to download the default database. After that it is served from the local cache. You can avoid the download entirely by providing your own MaxMind DB via <code>asn_db</code>.</p>
+    </details>
+
+    <section>
+      <h2 data-i18n="s.license.t">License</h2>
+      <p data-i18n="license.p">
+        ReDNS is free software: you can redistribute it and/or modify it under the terms of the
+        GNU General Public License as published by the Free Software Foundation, either
+        version 3 of the License, or (at your option) any later version. Copyright (C) 2026,
+        Harlan Wei.
+      </p>
+      <p data-i18n="license.warranty">
+        ReDNS is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+        without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+        PURPOSE. See the GNU General Public License for more details.
+      </p>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

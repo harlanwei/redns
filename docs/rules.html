@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">Rules — ReDNS documentation</title>
+<meta name="description" content="How sequence rules work in ReDNS: matches, exec, negation, and $tag references." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="rules">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="nav.rules">Rules</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Rules</h1>
+      <p class="lead" data-i18n="page.lead">
+        All query processing happens in <strong>sequence</strong> plugins: an ordered list of
+        rules evaluated for every query. This page explains the rule syntax; the
+        <a href="plugins.html">Plugins</a> section documents every matcher and executable.
+      </p>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.rules.t">A sequence rule</h2>
+      <pre><code><span class="tok-key">plugins</span>:
+  <span class="tok-punct">-</span> <span class="tok-key">tag</span>: main
+    <span class="tok-key">type</span>: sequence
+    <span class="tok-key">args</span>:
+      <span class="tok-punct">-</span> <span class="tok-key">matches</span>: <span class="tok-str">qname example.org</span>
+        <span class="tok-key">exec</span>: black_hole 0.0.0.0
+      <span class="tok-punct">-</span> <span class="tok-key">matches</span>: <span class="tok-punct">[</span><span class="tok-str">"qtype 1 28"</span>, <span class="tok-str">"!has_resp"</span><span class="tok-punct">]</span>
+        <span class="tok-key">exec</span>: <span class="tok-str">"$forward"</span></code></pre>
+
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>matches</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.list">string or list of strings</td>
+              <td data-i18n="rules.matches.dflt">always fires</td>
+              <td data-i18n="rules.matches.d">Matcher directives. When several are given, <em>all</em> must match (logical AND) for the rule to fire. Prefix any directive with <code>!</code> to negate it. A missing <code>matches</code> fires unconditionally.</td>
+            </tr>
+            <tr>
+              <td><code>exec</code></td>
+              <td data-i18n="common.yes">Yes</td>
+              <td data-i18n="type.string">string</td>
+              <td>—</td>
+              <td data-i18n="rules.exec.d">The action to run: a built-in type with arguments (<code>black_hole 0.0.0.0</code>) or a reference to a named plugin (<code>$forward</code>).</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.refs.t">Referencing named plugins</h2>
+      <p data-i18n="s.refs.p">
+        Any plugin declared with a <code>tag</code> can be referenced with a <code>$</code>
+        prefix — in <code>matches</code> (for matcher plugins like <code>domain_set</code>) and
+        in <code>exec</code> (for executable plugins like <code>forward</code> or
+        <code>sequence</code>).
+      </p>
+      <pre><code><span class="tok-punct">-</span> <span class="tok-key">tag</span>: blocklist
+  <span class="tok-key">type</span>: domain_set
+  <span class="tok-key">args</span>:
+    <span class="tok-key">files</span>: <span class="tok-punct">[</span><span class="tok-str">"/etc/redns/ads.txt"</span><span class="tok-punct">]</span>
+
+<span class="tok-punct">-</span> <span class="tok-key">tag</span>: main
+  <span class="tok-key">type</span>: sequence
+  <span class="tok-key">args</span>:
+    <span class="tok-punct">-</span> <span class="tok-key">matches</span>: <span class="tok-str">"$blocklist"</span>
+      <span class="tok-key">exec</span>: black_hole 0.0.0.0</code></pre>
+      <p data-i18n="s.refs.order">
+        ReDNS builds plugins in dependency order — non-sequence plugins first, sequences last —
+        so inter-plugin references always resolve, regardless of the order in the file.
+      </p>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.flow.t">Chain flow</h2>
+      <ul>
+        <li data-i18n="s.flow.li1">Rules run top to bottom. A rule fires only when all its matchers pass.</li>
+        <li data-i18n="s.flow.li2">Executables run in order until one <em>stops the chain</em>: <a href="exec-accept.html"><code>accept</code></a>, <a href="exec-reject.html"><code>reject</code></a>, or any action that produced a response (for example a <a href="exec-cache.html"><code>cache</code></a> hit).</li>
+        <li data-i18n="s.flow.li3">The “response” that matchers inspect is whatever earlier rules have produced so far — this lets you compose conditions like “has a response and it is a SERVFAIL”.</li>
+        <li data-i18n="s.flow.li4">When the chain ends without a response, the server returns an empty NOERROR answer.</li>
+        <li data-i18n="s.flow.li5">Recursive executables (<code>redirect</code>, <code>use-answer-of</code>, <code>fallback</code>, <code>cache</code>…) can rewrite the query and pass control back to the chain.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.gotchas.t">Common pitfalls</h2>
+      <ul>
+        <li data-i18n="s.gotchas.li1">Quotes inside matcher arguments are <em>not</em> stripped by the parser. Write <code>matches: qname example.org</code>, not <code>matches: qname "example.org"</code>. Use YAML-level quoting when the value must stay a single string: <code>matches: "qname example.org example.com"</code>.</li>
+        <li data-i18n="s.gotchas.li2">Matcher arguments are space-separated tokens. Multi-word expressions (like regexes with spaces) belong in a file loaded with <code>&amp;file</code> or the <code>files</code> option.</li>
+        <li data-i18n="s.gotchas.li3">A rule that fires does not stop the chain by itself — add <code>accept</code> after actions that set a response, or later rules may override it.</li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

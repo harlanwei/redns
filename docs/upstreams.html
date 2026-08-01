@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">Upstreams — ReDNS documentation</title>
+<meta name="description" content="Upstream transport protocols supported by ReDNS: UDP, TCP, DoT, DoH, DoQ, DoH3." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="upstreams">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <span class="current" data-i18n="nav.upstreams">Upstreams</span>
+    </nav>
+
+    <div class="page-head">
+      <h1 data-i18n="page.title">Upstreams</h1>
+      <p class="lead" data-i18n="page.lead">
+        Upstreams are configured in the <a href="exec-forward.html"><code>forward</code></a>
+        plugin. This page documents the supported transport protocols and how addresses are
+        written.
+      </p>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.proto.t">Transport protocols</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th data-i18n="tbl.up.scheme">Scheme</th>
+              <th data-i18n="tbl.up.port">Default port</th>
+              <th data-i18n="tbl.up.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>udp://host:port</code></td>
+              <td>53</td>
+              <td data-i18n="up.udp.d">Plain UDP with socket pooling and response-ID filtering. Bare <code>host:port</code> addresses default to this scheme.</td>
+            </tr>
+            <tr>
+              <td><code>tcp://host:port</code></td>
+              <td>53</td>
+              <td data-i18n="up.tcp.d">Plain TCP with connection pooling and transparent retry on stale connections.</td>
+            </tr>
+            <tr>
+              <td><code>tls://host:port</code></td>
+              <td>853</td>
+              <td data-i18n="up.tls.d">DNS-over-TLS (RFC 7858): TLS session cache, connection pooling, RFC 7766 query pipelining (probed at startup).</td>
+            </tr>
+            <tr>
+              <td><code>https://host/path</code></td>
+              <td>443</td>
+              <td data-i18n="up.https.d">DNS-over-HTTPS (RFC 8484): HTTP/2, GET and POST, browser-like User-Agent, automatic POST fallback for long queries.</td>
+            </tr>
+            <tr>
+              <td><code>quic://host:port</code></td>
+              <td>853</td>
+              <td data-i18n="up.quic.d">DNS-over-QUIC (RFC 9250): one query per QUIC stream.</td>
+            </tr>
+            <tr>
+              <td><code>h3://host/path</code></td>
+              <td>443</td>
+              <td data-i18n="up.h3.d">DNS-over-HTTP/3: DoH semantics over the QUIC transport.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <pre><code><span class="tok-key">args</span>: <span class="tok-str">"1.1.1.1 tls://8.8.8.8:853 https://dns.google/dns-query quic://1.1.1.1:853 h3://cloudflare-dns.com/dns-query"</span></code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.behavior.t">Selection &amp; health behavior</h2>
+      <ul>
+        <li data-i18n="up.beh.li1">ReDNS tracks per-upstream latency (EMA) and consecutive error streaks, and prefers healthy, low-latency upstreams.</li>
+        <li data-i18n="up.beh.li2">With <code>concurrent</code> &gt; 1, several upstreams are queried simultaneously and the best response wins.</li>
+        <li data-i18n="up.beh.li3">A UDP response with the TC (truncated) flag is transparently retried over TCP.</li>
+        <li data-i18n="up.beh.li4">Secure transports (DoT/DoQ/DoH3) validate certificates against the system webpki trust anchors.</li>
+        <li data-i18n="up.beh.li5">Upstream health and metrics are visible in the <a href="dashboard.html">dashboard</a> and via the metrics API.</li>
+      </ul>
+      <div class="callout">
+        <p data-i18n="up.callout">
+          When the system resolver is unavailable (e.g. during startup), use
+          <code>dial_addr</code> and <code>bootstrap</code> in the forward plugin to reach
+          DoH/DoT upstreams directly — see the
+          <a href="exec-forward.html"><code>forward</code> page</a>.
+        </p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/core.js"></script>
+</body>
+</html>

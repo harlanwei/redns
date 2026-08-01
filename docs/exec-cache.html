@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title data-i18n="meta.title">cache — ReDNS documentation</title>
+<meta name="description" content="cache executable: sharded LRU DNS response cache with persistence and lazy refresh." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body data-page="exec-cache">
+
+<header class="topbar">
+  <div class="brand">
+    <a class="logo" href="index.html">ReDNS</a>
+    <span class="tagline" data-i18n="top.tagline">DNS forwarder</span>
+  </div>
+  <div class="topbar-actions">
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <div class="lang-switch" role="group" aria-label="Language">
+      <button type="button" data-lang="en">English</button>
+      <button type="button" data-lang="zh-CN">简体中文</button>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <nav id="toc" aria-label="Table of contents">
+      <ol>
+        <li><a href="index.html" data-nav="index" data-i18n="nav.home">Home</a></li>
+        <li><a href="quickstart.html" data-nav="quickstart" data-i18n="nav.quickstart">Quick start</a></li>
+        <li><a href="config.html" data-nav="config" data-i18n="nav.config">Configuration</a></li>
+        <li><a href="rules.html" data-nav="rules" data-i18n="nav.rules">Rules</a></li>
+        <li><a href="plugins.html" data-nav="plugins" data-i18n="nav.plugins">Plugins</a></li>
+        <li><a href="upstreams.html" data-nav="upstreams" data-i18n="nav.upstreams">Upstreams</a></li>
+        <li><a href="dashboard.html" data-nav="dashboard" data-i18n="nav.dashboard">Dashboard</a></li>
+        <li><a href="ops.html" data-nav="ops" data-i18n="nav.ops">Operations</a></li>
+        <li><a href="faq.html" data-nav="faq" data-i18n="nav.faq">FAQ</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main class="content">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="index.html" data-i18n="crumb.home">Home</a><span class="sep">/</span>
+      <a href="plugins.html" data-i18n="crumb.plugins">Plugins</a><span class="sep">/</span>
+      <span data-i18n="crumb.executables">Executables</span><span class="sep">/</span>
+      <span class="current">cache</span>
+    </nav>
+
+    <div class="page-head">
+      <h1><code>cache</code></h1>
+      <p class="lead" data-i18n="page.lead">
+        A sharded LRU response cache with lazy stale-while-refresh, request coalescing, and
+        optional on-disk persistence. Placed before <code>forward</code>, it answers most
+        repeat queries without touching an upstream.
+      </p>
+      <div class="badges">
+        <span class="badge accent" data-i18n="badge.executable">executable</span>
+        <span class="badge" data-i18n="badge.recursive">recursive</span>
+        <span class="badge" data-i18n="badge.in-exec">used in: exec</span>
+      </div>
+    </div>
+
+    <section>
+      <h2 data-i18n="s.usage.t">Usage</h2>
+      <p data-i18n="s.usage.quick">Quick form — entry count only:</p>
+      <pre><code><span class="tok-punct">-</span> <span class="tok-key">tag</span>: cache
+  <span class="tok-key">type</span>: cache
+  <span class="tok-key">args</span>: 65536</code></pre>
+      <p data-i18n="s.usage.yaml">Full form — with disk persistence:</p>
+      <pre><code><span class="tok-punct">-</span> <span class="tok-key">tag</span>: cache
+  <span class="tok-key">type</span>: cache
+  <span class="tok-key">args</span>:
+    <span class="tok-key">size</span>: 65536
+    <span class="tok-key">cache_file</span>: /var/lib/redns/cache.bin
+    <span class="tok-key">dump_interval</span>: 300</code></pre>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.params.t">Parameters</h2>
+      <div class="table-wrap">
+        <table class="params">
+          <thead>
+            <tr>
+              <th data-i18n="tbl.h.param">Parameter</th>
+              <th data-i18n="tbl.h.req">Required</th>
+              <th data-i18n="tbl.h.type">Type</th>
+              <th data-i18n="tbl.h.default">Default</th>
+              <th data-i18n="tbl.h.desc">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>size</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.int">integer</td>
+              <td><code>0</code></td>
+              <td data-i18n="p.size.d">LRU capacity in entries. <code>0</code> disables caching (the plugin becomes a pass-through).</td>
+            </tr>
+            <tr>
+              <td><code>cache_file</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string (path)</td>
+              <td data-i18n="dflt.memory-only">absent (in-memory only)</td>
+              <td data-i18n="p.cache_file.d">When set, the cache is dumped to this file every <code>dump_interval</code> seconds and on graceful shutdown, and restored at startup. A missing or corrupt file simply starts an empty cache.</td>
+            </tr>
+            <tr>
+              <td><code>dump_interval</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.sec">integer (seconds)</td>
+              <td><code>300</code></td>
+              <td data-i18n="p.dump_interval.d">Period between automatic disk dumps when <code>cache_file</code> is set.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.details.t">Details</h2>
+      <ul>
+        <li data-i18n="s.details.li1"><strong>Sharded LRU</strong> — bounded memory and low lock contention; entries expire by TTL.</li>
+        <li data-i18n="s.details.li2"><strong>Lazy refresh</strong> — a stale entry is served immediately while a background refresh fetches a fresh copy (up to 30 s of staleness tolerated).</li>
+        <li data-i18n="s.details.li3"><strong>Coalescing</strong> — concurrent misses for the same key trigger a single upstream query.</li>
+        <li data-i18n="s.details.li4">Cache keys are lowercased qname + qtype; responses are stored with normalized TTLs and patched in place on hits.</li>
+        <li data-i18n="s.details.li5">On a hit the plugin sets the response — follow it with <code>matches: has_resp</code> + <code>accept</code> to stop the chain.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 data-i18n="s.related.t">See also</h2>
+      <ul>
+        <li><a href="exec-forward.html"><code>forward</code></a> — usually placed right after the cache.</li>
+        <li><a href="exec-ttl.html"><code>ttl</code></a> — control how long records stay cached.</li>
+        <li><a href="exec-reverse-lookup.html"><code>reverse_lookup</code></a> — a separate, specialized cache.</li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <p data-i18n="footer.p">ReDNS documentation — English · 简体中文</p>
+</footer>
+
+<script src="i18n.js"></script>
+<script src="i18n/executables.js"></script>
+</body>
+</html>
