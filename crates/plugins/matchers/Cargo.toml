@@ -8,6 +8,7 @@ license.workspace = true
 redns-core = { path = "../../core" }
 hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
 ipnet = "2"
+maxminddb = "0.24"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "0.0", default-features = false }

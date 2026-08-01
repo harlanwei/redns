@@ -2,6 +2,7 @@
 //
 // This file is part of redns.
 
+pub mod asn;
 pub mod client_ip;
 pub mod cname;
 pub mod domain_set;
@@ -9,6 +10,7 @@ pub mod env;
 pub mod has_resp;
 pub mod has_wanted_ans;
 pub mod ip_set;
+mod prefix_set;
 pub mod ptr_ip;
 pub mod qclass;
 pub mod qname;
@@ -19,6 +21,7 @@ pub mod resp_ip;
 pub mod string_exp;
 
 // Re-export matchers for convenience.
+pub use asn::{AsnDb, AsnMatcher};
 pub use client_ip::ClientIpMatcher;
 pub use cname::CnameMatcher;
 pub use domain_set::DomainSet;
