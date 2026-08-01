@@ -6,15 +6,15 @@ license.workspace = true
 
 [dependencies]
 redns-core = { path = "../../core" }
-hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 tracing = "0.1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["time", "sync", "rt", "net", "process", "io-util"] }
-lru = "0.12"
+quick_cache = "0.7"
 ahash = "0.8"
 fastrand = "2"
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = { version = "0.0", default-features = false }
+serde-saphyr = { version = "1", default-features = false, features = ["serialize", "deserialize"] }
 parking_lot = "0.12"
 
 [dev-dependencies]

@@ -27,7 +27,7 @@ pub struct HasWantedAns;
 impl Matcher for HasWantedAns {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(resp) = ctx.response() {
-            Ok(!resp.answers().is_empty())
+            Ok(!resp.answers.is_empty())
         } else {
             Ok(false)
         }
@@ -42,10 +42,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn make_ctx() -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -66,7 +63,7 @@ mod tests {
     fn empty_answer_returns_false() {
         let m = HasWantedAns;
         let mut ctx = make_ctx();
-        ctx.set_response(Some(Message::new()));
+        ctx.set_response(Some(Message::response(0, OpCode::Query)));
         assert!(!m.match_ctx(&ctx).unwrap());
     }
 
@@ -74,7 +71,7 @@ mod tests {
     fn with_answer_returns_true() {
         let m = HasWantedAns;
         let mut ctx = make_ctx();
-        let mut resp = Message::new();
+        let mut resp = Message::response(0, OpCode::Query);
         let record = Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             300,

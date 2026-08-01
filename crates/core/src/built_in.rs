@@ -21,7 +21,7 @@ use crate::context::Context;
 use crate::plugin::{Matcher, PluginResult, RecursiveExecutable};
 use crate::sequence::ChainWalker;
 use async_trait::async_trait;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 
 // ── Flow-control actions ──────────────────────────────────────────
 
@@ -60,10 +60,8 @@ impl ActionReject {
 #[async_trait]
 impl RecursiveExecutable for ActionReject {
     async fn exec_recursive(&self, ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
-        let mut resp = Message::new();
-        resp.set_id(ctx.query().id());
-        resp.set_message_type(MessageType::Response);
-        resp.set_response_code(self.rcode);
+        let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = self.rcode;
         ctx.set_response(Some(resp));
         Ok(())
     }
@@ -138,10 +136,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
 
     fn make_query() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -188,7 +183,7 @@ mod tests {
         let mut ctx = Context::new(make_query());
         seq.exec(&mut ctx).await.unwrap();
         let resp = ctx.response().expect("should have response");
-        assert_eq!(resp.response_code(), ResponseCode::Refused);
+        assert_eq!(resp.response_code, ResponseCode::Refused);
     }
 
     #[tokio::test]
@@ -201,7 +196,7 @@ mod tests {
         let mut ctx = Context::new(make_query());
         seq.exec(&mut ctx).await.unwrap();
         let resp = ctx.response().expect("should have response");
-        assert_eq!(u16::from(resp.response_code()), 3);
+        assert_eq!(u16::from(resp.response_code), 3);
     }
 
     #[test]

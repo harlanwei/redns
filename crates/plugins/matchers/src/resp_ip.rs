@@ -107,8 +107,8 @@ impl Matcher for RespIpMatcher {
             Some(r) => r,
             None => return Ok(false),
         };
-        for rr in resp.answers() {
-            let rdata = rr.data();
+        for rr in &resp.answers {
+            let rdata = &rr.data;
             let ip: Option<IpAddr> = match rdata {
                 hickory_proto::rr::RData::A(a) => Some(IpAddr::V4(a.0)),
                 hickory_proto::rr::RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
@@ -132,10 +132,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn make_ctx_with_resp(ip: Ipv4Addr) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -143,10 +140,8 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
-        resp.set_id(1)
-            .set_message_type(MessageType::Response)
-            .set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(1, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_answer(Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             300,
@@ -172,10 +167,7 @@ mod tests {
     #[test]
     fn no_response_returns_false() {
         let m = RespIpMatcher::from_str_args("0.0.0.0/0").unwrap();
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

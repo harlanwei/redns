@@ -258,7 +258,7 @@ fn udp_recv_capacity(query: &[u8]) -> usize {
     use hickory_proto::op::Message;
 
     if let Ok(msg) = Message::from_vec(query)
-        && let Some(edns) = msg.extensions()
+        && let Some(edns) = msg.edns
     {
         return (edns.max_payload() as usize).clamp(MIN_UDP_RECV, MAX_UDP_SIZE);
     }
@@ -978,6 +978,10 @@ impl DohUpstream {
         pool_max_idle: usize,
         timeout: Duration,
     ) -> Self {
+        // reqwest is built with the `rustls` feature so it shares the
+        // aws-lc-rs backend used by DoT/DoQ/DoH3; install the process default
+        // first for determinism.
+        crate::install_rustls_crypto_provider();
         use reqwest::header;
         let mut headers = header::HeaderMap::new();
         // HeaderValue::from_static is infallible for valid static strings.
@@ -2292,12 +2296,12 @@ async fn bootstrap_resolve(
             format!("invalid hostname '{}': {}", hostname, e).into()
         })?;
 
-    let mut query_msg = Message::new();
-    query_msg
-        .set_id(std::process::id() as u16)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true);
+    let mut query_msg = Message::new(
+        std::process::id() as u16,
+        MessageType::Query,
+        OpCode::Query,
+    );
+    query_msg.metadata.recursion_desired = true;
     let mut q = Query::new();
     q.set_name(name).set_query_type(RecordType::A);
     query_msg.add_query(q);
@@ -2317,15 +2321,15 @@ async fn bootstrap_resolve(
 
     let mut ips = Vec::new();
     let mut min_ttl = u32::MAX;
-    for answer in resp.answers() {
-        match answer.data() {
+    for answer in &resp.answers {
+        match answer.data {
             RData::A(a) => {
                 ips.push(std::net::IpAddr::V4(a.0));
-                min_ttl = min_ttl.min(answer.ttl());
+                min_ttl = min_ttl.min(answer.ttl);
             }
             RData::AAAA(aaaa) => {
                 ips.push(std::net::IpAddr::V6(aaaa.0));
-                min_ttl = min_ttl.min(answer.ttl());
+                min_ttl = min_ttl.min(answer.ttl);
             }
             _ => continue,
         }
@@ -2567,7 +2571,7 @@ mod tests {
     #[test]
     fn tls_config_reuse() {
         // Install crypto provider for rustls 0.23+.
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         // Verify the pooled DoT upstream can be constructed with its own
         // ClientConfig (which backs session resumption within the pooled
         // connection lifecycle).
@@ -2582,11 +2586,9 @@ mod tests {
         use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
         use hickory_proto::rr::{Name, RecordType};
 
-        let mut msg = Message::new();
-        msg.set_id(0x1111)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true);
+        let mut msg = Message::new(0x1111, MessageType::Query, OpCode::Query);
+        msg.metadata.op_code = OpCode::Query;
+        msg.metadata.recursion_desired = true;
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -2600,8 +2602,7 @@ mod tests {
         assert_eq!(udp_recv_capacity(&wire), 1232);
 
         // No EDNS → default buffer.
-        let mut bare = Message::new();
-        bare.set_id(1).set_message_type(MessageType::Query);
+        let mut bare = Message::new(1, MessageType::Query, OpCode::Query);
         bare.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

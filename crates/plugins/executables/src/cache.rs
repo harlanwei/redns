@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use hickory_proto::op::Message;
 use hickory_proto::rr::RecordType;
-use lru::LruCache;
 use parking_lot::Mutex;
+use quick_cache::sync::Cache as QuickCache;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
@@ -53,6 +53,10 @@ static CACHE_REGISTRY: OnceLock<Mutex<Vec<Weak<CacheInner>>>> = OnceLock::new();
 static CACHE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// A cached DNS response entry.
+///
+/// `Clone` is required by `quick_cache`, whose `get` returns an owned clone
+/// (cheap here: the payload is behind `Arc`s).
+#[derive(Clone)]
 struct CachedEntry {
     /// Pre-serialized DNS response wire bytes. All record TTL fields have been
     /// normalized to `original_ttl`, so on a cache hit we only need to patch the
@@ -122,15 +126,15 @@ fn host_parallelism() -> usize {
 fn min_ttl(msg: &Message) -> u32 {
     let mut min = u32::MAX;
     for rr in msg
-        .answers()
+        .answers
         .iter()
-        .chain(msg.name_servers().iter())
-        .chain(msg.additionals().iter())
+        .chain(msg.authorities.iter())
+        .chain(msg.additionals.iter())
     {
         if rr.record_type() == hickory_proto::rr::RecordType::OPT {
             continue;
         }
-        min = min.min(rr.ttl());
+        min = min.min(rr.ttl);
     }
     if min == u32::MAX { 300 } else { min }
 }
@@ -220,9 +224,10 @@ fn build_stored_wire(resp: &Message, original_ttl: u32) -> Option<(Vec<u8>, Vec<
     Some((wire, offsets))
 }
 
-/// In-memory LRU DNS cache.
+/// In-memory approximate-LRU DNS cache.
 ///
-/// Uses `lru::LruCache` for proper bounded eviction.
+/// Uses `quick_cache` (clock / hot-cold segmented eviction) for bounded
+/// capacity with better hit rates than a strict LRU on skewed workloads.
 /// Sharded to reduce lock contention across threads.
 #[derive(Clone)]
 pub struct Cache {
@@ -232,7 +237,7 @@ pub struct Cache {
 struct CacheInner {
     id: usize,
     shard_count: usize,
-    shards: Vec<Mutex<LruCache<CacheKey, CachedEntry>>>,
+    shards: Vec<Mutex<QuickCache<CacheKey, CachedEntry>>>,
     shard_hasher: ahash::RandomState,
     /// Deduplicates background lazy refreshes for the same key.
     inflight_refreshes: Mutex<HashSet<CacheKey>>,
@@ -285,9 +290,7 @@ impl Cache {
         let shard_cap = std::cmp::max(1, cap.div_ceil(shard_count));
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Mutex::new(LruCache::new(
-                NonZeroUsize::new(shard_cap).unwrap(),
-            )));
+            shards.push(Mutex::new(QuickCache::new(shard_cap)));
         }
 
         let id = CACHE_ID.fetch_add(1, Ordering::Relaxed);
@@ -353,7 +356,7 @@ impl Cache {
         Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL, None)
     }
 
-    fn get_shard(&self, key: &CacheKey) -> &Mutex<LruCache<CacheKey, CachedEntry>> {
+    fn get_shard(&self, key: &CacheKey) -> &Mutex<QuickCache<CacheKey, CachedEntry>> {
         let hash = self.inner.shard_hasher.hash_one(key);
         &self.inner.shards[(hash as usize) % self.inner.shard_count]
     }
@@ -387,7 +390,7 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
         for (index, shard) in cache.shards.iter().enumerate() {
             let store = shard.lock();
             let entries = store.len();
-            let capacity = store.cap().get();
+            let capacity = store.capacity() as usize;
             total_entries += entries;
             total_capacity += capacity;
             shards.push(CacheShardSnapshot {
@@ -429,23 +432,18 @@ impl Cache {
         // Captured under the lock: (wire, offsets, ttl, is_stale).
         let captured = {
             let shard = self.get_shard(key);
-            let mut store = shard.lock();
-            match store.get_mut(key) {
-                Some(entry) if !entry.is_expired() => Some((
-                    Arc::clone(&entry.resp_wire),
-                    Arc::clone(&entry.ttl_offsets),
-                    entry.remaining_ttl(),
-                    false,
-                )),
+            let store = shard.lock();
+            // `quick_cache::get` returns an owned clone and bumps recency,
+            // so the `Arc`s are cheap to pull out of the shard lock.
+            match store.get(key) {
+                Some(entry) if !entry.is_expired() => {
+                    let ttl = entry.remaining_ttl();
+                    Some((entry.resp_wire, entry.ttl_offsets, ttl, false))
+                }
                 Some(entry) if entry.is_within_lazy_window(self.inner.lazy_ttl) => {
                     // Stale-while-refresh: serve with a 1-second TTL while a
                     // background refresh runs.
-                    Some((
-                        Arc::clone(&entry.resp_wire),
-                        Arc::clone(&entry.ttl_offsets),
-                        1,
-                        true,
-                    ))
+                    Some((entry.resp_wire, entry.ttl_offsets, 1, true))
                 }
                 _ => None,
             }
@@ -500,7 +498,7 @@ impl RecursiveExecutable for Cache {
         };
 
         loop {
-            match self.lookup_and_build(&key, ctx.query().id()) {
+            match self.lookup_and_build(&key, ctx.query().id) {
                 CacheLookup::Hit(wire) => {
                     self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
                     ctx.set_response_wire(Some(wire));
@@ -566,7 +564,7 @@ impl Cache {
         use hickory_proto::op::ResponseCode;
 
         if let Some(resp) = ctx.response() {
-            let rcode = resp.response_code();
+            let rcode = resp.response_code;
 
             // Never cache REFUSED — it's a transient upstream signal (rate
             // limiting, policy, etc.) and should not poison the cache.
@@ -590,9 +588,9 @@ impl Cache {
             };
 
             let shard = self.get_shard(key);
-            let mut store = shard.lock();
+            let store = shard.lock();
 
-            store.push(
+            store.insert(
                 key.clone(),
                 CachedEntry {
                     resp_wire: Arc::new(wire),
@@ -648,6 +646,8 @@ impl Cache {
 
         for shard in &self.inner.shards {
             let store = shard.lock();
+            // `quick_cache::iter` yields owned clones, so `key`/`entry` can be
+            // used without holding references into the shard.
             for (key, entry) in store.iter() {
                 let remaining = entry.remaining_ttl();
                 if remaining == 0 {
@@ -815,8 +815,8 @@ impl Cache {
             set_ttl_in_wire(&mut wire, &offsets, effective_remaining);
 
             let shard = self.get_shard(&key);
-            let mut store = shard.lock();
-            store.push(
+            let store = shard.lock();
+            store.insert(
                 key,
                 CachedEntry {
                     resp_wire: Arc::new(wire),
@@ -847,10 +847,8 @@ mod tests {
     impl Executable for RespondWithTtl {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             let q = ctx.question().unwrap().clone();
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
             resp.add_query(q.clone());
             resp.add_answer(Record::from_rdata(
                 q.name().clone(),
@@ -875,10 +873,8 @@ mod tests {
             tokio::time::sleep(self.delay).await;
 
             let q = ctx.question().unwrap().clone();
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
             resp.add_query(q.clone());
             resp.add_answer(Record::from_rdata(
                 q.name().clone(),
@@ -891,10 +887,7 @@ mod tests {
     }
 
     fn make_query() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("test.example.com.").unwrap())
@@ -922,11 +915,11 @@ mod tests {
         let mut ctx = Context::new(make_query());
         seq.exec(&mut ctx).await.unwrap();
         assert!(ctx.response().is_some());
-        assert_eq!(ctx.response().unwrap().answers().len(), 1);
+        assert_eq!(ctx.response().unwrap().answers.len(), 1);
     }
 
     fn empty_entry(ttl: u32) -> CachedEntry {
-        let resp = Message::new();
+        let resp = Message::response(0, OpCode::Query);
         let (wire, offsets) = build_stored_wire(&resp, ttl).unwrap();
         CachedEntry {
             resp_wire: Arc::new(wire),
@@ -937,19 +930,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lru_eviction_respects_capacity() {
+    async fn eviction_bounds_capacity() {
         let cache = Cache::new(2, Duration::from_secs(30), None);
 
-        // Simulate 5 different cache entries via the store directly.
+        // Simulate 4 different cache entries via the store directly.
         {
             let shard_key = CacheKey {
                 qname: "key".to_string(),
                 qtype: RecordType::A,
             };
             let shard = cache.get_shard(&shard_key);
-            let mut store = shard.lock();
-            for i in 0..5 {
-                store.put(
+            let store = shard.lock();
+            for i in 0..4 {
+                store.insert(
                     CacheKey {
                         qname: format!("key{i}"),
                         qtype: RecordType::A,
@@ -957,25 +950,10 @@ mod tests {
                     empty_entry(300),
                 );
             }
-            // Sharding is disabled for small caches, so capacity stays exact.
+            // Sharding is disabled for small caches, so capacity stays exact:
+            // 4 inserts into a 2-entry cache leave only 2 resident.
             assert_eq!(store.len(), 2);
-            // key0 should have been evicted (LRU).
-            assert!(
-                store
-                    .get(&CacheKey {
-                        qname: "key0".to_string(),
-                        qtype: RecordType::A,
-                    })
-                    .is_none()
-            );
-            assert!(
-                store
-                    .get(&CacheKey {
-                        qname: "key1".to_string(),
-                        qtype: RecordType::A,
-                    })
-                    .is_none()
-            );
+            // The most recently inserted entry is always resident.
             assert!(
                 store
                     .get(&CacheKey {
@@ -984,13 +962,24 @@ mod tests {
                     })
                     .is_some()
             );
+            // key0 was admitted into the hot segment on first insert and is
+            // never scanned for eviction by later inserts, so it survives
+            // while the cold entries (key1, key2) fall out one by one.
             assert!(
                 store
                     .get(&CacheKey {
-                        qname: "key4".to_string(),
+                        qname: "key0".to_string(),
                         qtype: RecordType::A,
                     })
                     .is_some()
+            );
+            assert!(
+                store
+                    .get(&CacheKey {
+                        qname: "key1".to_string(),
+                        qtype: RecordType::A,
+                    })
+                    .is_none()
             );
         }
     }

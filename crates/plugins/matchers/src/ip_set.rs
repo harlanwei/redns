@@ -133,8 +133,8 @@ impl IpSet {
 impl Matcher for IpSet {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(resp) = ctx.response() {
-            for rr in resp.answers() {
-                let rdata = rr.data();
+            for rr in &resp.answers {
+                let rdata = &rr.data;
                 let ip: Option<IpAddr> = match rdata {
                     hickory_proto::rr::RData::A(a) => Some(IpAddr::V4(a.0)),
                     hickory_proto::rr::RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),

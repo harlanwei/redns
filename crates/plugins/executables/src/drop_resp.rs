@@ -27,10 +27,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
 
     fn make_ctx() -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -43,7 +40,7 @@ mod tests {
     #[tokio::test]
     async fn drop_resp_clears_response() {
         let mut ctx = make_ctx();
-        ctx.set_response(Some(Message::new()));
+        ctx.set_response(Some(Message::response(0, OpCode::Query)));
         assert!(ctx.response().is_some());
 
         DropResp.exec(&mut ctx).await.unwrap();

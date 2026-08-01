@@ -24,10 +24,10 @@ pub mod udp_server_uring;
 ///
 /// This avoids runtime panics when multiple providers are compiled in.
 pub fn install_rustls_crypto_provider() {
-    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+    use tokio_rustls::rustls::crypto::{CryptoProvider, aws_lc_rs};
 
     if CryptoProvider::get_default().is_none() {
-        let _ = ring::default_provider().install_default();
+        let _ = aws_lc_rs::default_provider().install_default();
     }
 }
 

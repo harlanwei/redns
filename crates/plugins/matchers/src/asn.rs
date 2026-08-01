@@ -105,8 +105,8 @@ impl AsnDb {
         let reader = maxminddb::Reader::from_source(bytes)
             .map_err(|e| format!("invalid MaxMind DB data: {e}"))?;
         info!(
-            database_type = %reader.metadata.database_type,
-            ip_version = reader.metadata.ip_version,
+            database_type = %reader.metadata().database_type,
+            ip_version = reader.metadata().ip_version,
             "ASN database loaded from MaxMind DB"
         );
         self.mmdb.push(reader);
@@ -117,8 +117,11 @@ impl AsnDb {
     /// according to any of the loaded MaxMind DB files.
     pub fn contains(&self, asn: u32, addr: IpAddr) -> bool {
         self.mmdb.iter().any(|reader| {
-            match reader.lookup::<geoip2::Asn>(addr) {
-                Ok(record) => record.autonomous_system_number == Some(asn),
+            match reader.lookup(addr) {
+                Ok(result) => match result.decode::<geoip2::Asn>() {
+                    Ok(Some(record)) => record.autonomous_system_number == Some(asn),
+                    _ => false,
+                },
                 Err(_) => false,
             }
         })
@@ -172,8 +175,8 @@ impl Matcher for AsnMatcher {
             Some(r) => r,
             None => return Ok(false),
         };
-        for rr in resp.answers() {
-            let ip: Option<IpAddr> = match rr.data() {
+        for rr in &resp.answers {
+            let ip: Option<IpAddr> = match rr.data {
                 hickory_proto::rr::RData::A(a) => Some(IpAddr::V4(a.0)),
                 hickory_proto::rr::RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                 _ => None,
@@ -205,10 +208,7 @@ mod tests {
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     fn make_ctx_with_resp(ips: &[IpAddr]) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -216,10 +216,8 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
-        resp.set_id(1)
-            .set_message_type(MessageType::Response)
-            .set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(1, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         for ip in ips {
             let rdata = match ip {
                 IpAddr::V4(v4) => RData::A((*v4).into()),
@@ -395,10 +393,7 @@ mod tests {
     #[test]
     fn matcher_no_response_is_false() {
         let m = AsnMatcher::from_str_args("13335", Arc::new(AsnDb::new())).unwrap();
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

@@ -22,7 +22,7 @@ use crate::plugin::{Executable, PluginResult};
 use crate::system_dns::system_fallback_resolve;
 use crate::upstream::UpstreamWrapper;
 use async_trait::async_trait;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use parking_lot::Mutex;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -86,7 +86,7 @@ impl ResponsePayload {
     fn set_recursion_available(&mut self) {
         match self {
             Self::Message(resp) => {
-                resp.set_recursion_available(true);
+                resp.metadata.recursion_available = true;
             }
             Self::Wire(wire) => set_recursion_available_in_wire(wire),
         }
@@ -94,7 +94,7 @@ impl ResponsePayload {
 
     fn response_code(&self) -> Option<ResponseCode> {
         match self {
-            Self::Message(resp) => Some(resp.response_code()),
+            Self::Message(resp) => Some(resp.response_code),
             Self::Wire(wire) => dns_header_rcode(wire),
         }
     }
@@ -174,16 +174,16 @@ impl EntryHandler {
         meta: QueryMeta,
     ) -> PluginResult<ResponsePayload> {
         // Basic query validation.
-        if query.message_type() == MessageType::Response || query.queries().len() != 1 {
+        if query.message_type == MessageType::Response || query.queries.len() != 1 {
             return Ok(ResponsePayload::Message(servfail_response(&query)));
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let question = &query.queries()[0];
+            let question = &query.queries[0];
             debug!(
                 qname = %question.name(),
                 qtype = ?question.query_type(),
-                id = query.id(),
+                id = query.id,
                 "handling query"
             );
         }
@@ -330,7 +330,7 @@ const MIN_UDP_RESPONSE_SIZE: usize = 512;
 /// Returns the maximum UDP payload the client advertised for this query.
 fn udp_max_payload(query: &Message) -> usize {
     query
-        .extensions()
+        .edns
         .as_ref()
         .map(|e| e.max_payload() as usize)
         .filter(|&p| p >= MIN_UDP_RESPONSE_SIZE)
@@ -344,7 +344,7 @@ fn serialize_udp_response(resp: Message, max_payload: usize) -> PluginResult<Vec
         Ok(wire) if wire.len() <= max_payload => Ok(wire),
         Ok(_) => {
             let mut truncated = resp.truncate();
-            truncated.set_recursion_available(true);
+            truncated.metadata.recursion_available = true;
             truncated
                 .to_vec()
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -373,10 +373,8 @@ fn qname_for_log(ctx: &Context) -> String {
 }
 
 fn empty_response(query: &Message) -> Message {
-    let mut resp = Message::new();
-    resp.set_id(query.id());
-    resp.set_message_type(MessageType::Response);
-    if let Some(q) = query.queries().first() {
+    let mut resp = Message::response(query.id, OpCode::Query);
+    if let Some(q) = query.queries.first() {
         resp.add_query(q.clone());
     }
     resp
@@ -384,13 +382,13 @@ fn empty_response(query: &Message) -> Message {
 
 fn noerror_response(query: &Message) -> Message {
     let mut resp = empty_response(query);
-    resp.set_response_code(ResponseCode::NoError);
+    resp.metadata.response_code = ResponseCode::NoError;
     resp
 }
 
 fn servfail_response(query: &Message) -> Message {
     let mut resp = empty_response(query);
-    resp.set_response_code(ResponseCode::ServFail);
+    resp.metadata.response_code = ResponseCode::ServFail;
     resp
 }
 
@@ -401,10 +399,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
 
     fn make_query() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(42)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(42, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -419,10 +414,7 @@ mod tests {
     /// best-effort fallback that reaches the WAN DNS provably produces NXDOMAIN
     /// rather than SERVFAIL.
     fn make_query_invalid() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(42)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(42, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("nonexistent.invalid.").unwrap())
@@ -452,10 +444,8 @@ mod tests {
     #[async_trait]
     impl Executable for SetResponseExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
             ctx.set_response(Some(resp));
             Ok(())
         }
@@ -465,11 +455,9 @@ mod tests {
     #[async_trait]
     impl Executable for RawWireExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
-            if let Some(q) = ctx.query().queries().first() {
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(q) = ctx.query().queries.first() {
                 resp.add_query(q.clone());
             }
             ctx.set_response_wire(Some(resp.to_vec().unwrap()));
@@ -484,8 +472,8 @@ mod tests {
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert!(resp.recursion_available());
+        assert_eq!(resp.response_code, ResponseCode::NoError);
+        assert!(resp.recursion_available);
     }
 
     #[tokio::test]
@@ -495,8 +483,8 @@ mod tests {
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
-        assert!(resp.recursion_available());
+        assert_eq!(resp.response_code, ResponseCode::ServFail);
+        assert!(resp.recursion_available);
     }
 
     #[tokio::test]
@@ -506,8 +494,8 @@ mod tests {
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert!(resp.recursion_available());
+        assert_eq!(resp.response_code, ResponseCode::NoError);
+        assert!(resp.recursion_available);
     }
 
     #[tokio::test]
@@ -518,15 +506,15 @@ mod tests {
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert_eq!(msg_resp.response_code(), ResponseCode::NoError);
-        assert!(msg_resp.recursion_available());
+        assert_eq!(msg_resp.response_code, ResponseCode::NoError);
+        assert!(msg_resp.recursion_available);
 
         let tcp_wire = handler
             .handle_tcp(make_query(), QueryMeta::default())
             .await
             .unwrap();
         let tcp_resp = Message::from_vec(&tcp_wire).unwrap();
-        assert!(tcp_resp.recursion_available());
+        assert!(tcp_resp.recursion_available);
 
         let udp_wire = handler
             .handle_udp(
@@ -539,7 +527,7 @@ mod tests {
             .await
             .unwrap();
         let udp_resp = Message::from_vec(&udp_wire).unwrap();
-        assert!(udp_resp.recursion_available());
+        assert!(udp_resp.recursion_available);
     }
 
     /// Executable that stuffs the response with enough answer records to blow
@@ -549,11 +537,9 @@ mod tests {
     impl Executable for BigResponseExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             use hickory_proto::rr::{Name, RData, Record, rdata::TXT};
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
-            if let Some(q) = ctx.query().queries().first() {
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(q) = ctx.query().queries.first() {
                 resp.add_query(q.clone());
             }
             let name = Name::from_ascii("example.com.").unwrap();
@@ -578,9 +564,9 @@ mod tests {
         };
         let resp =
             Message::from_vec(&handler.handle_udp(make_query(), meta).await.unwrap()).unwrap();
-        assert!(resp.truncated(), "TC bit should be set");
-        assert!(resp.answers().is_empty(), "answers should be dropped");
-        assert!(resp.recursion_available());
+        assert!(resp.truncation, "TC bit should be set");
+        assert!(resp.answers.is_empty(), "answers should be dropped");
+        assert!(resp.recursion_available);
     }
 
     #[tokio::test]
@@ -591,8 +577,8 @@ mod tests {
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert!(!resp.truncated(), "TCP response must not be truncated");
-        assert_eq!(resp.answers().len(), 40);
+        assert!(!resp.truncation, "TCP response must not be truncated");
+        assert_eq!(resp.answers.len(), 40);
     }
 
     // ── best_effort policy: never rescue a SERVFAIL response ──────
@@ -609,7 +595,7 @@ mod tests {
     impl Executable for FixedResponseExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             let mut resp = self.0.clone();
-            resp.set_id(ctx.query().id());
+            resp.metadata.id = ctx.query().id;
             ctx.set_response(Some(resp));
             Ok(())
         }
@@ -617,7 +603,7 @@ mod tests {
 
     fn response_with_rcode(query: &Message, rcode: ResponseCode) -> Message {
         let mut resp = empty_response(query);
-        resp.set_response_code(rcode);
+        resp.metadata.response_code = rcode;
         resp
     }
 
@@ -636,7 +622,7 @@ mod tests {
             .handle(make_query(), QueryMeta::default())
             .await
             .unwrap();
-        assert_eq!(out.response_code(), ResponseCode::ServFail);
+        assert_eq!(out.response_code, ResponseCode::ServFail);
     }
 
     /// A chain `Err` (no upstream produced any response) is the one case
@@ -654,7 +640,7 @@ mod tests {
             .handle(make_query_invalid(), QueryMeta::default())
             .await
             .unwrap();
-        let rcode = out.response_code();
+        let rcode = out.response_code;
         assert!(
             rcode == ResponseCode::NXDomain || rcode == ResponseCode::ServFail,
             "chain Err must trigger best-effort fallback (expected NXDOMAIN from \

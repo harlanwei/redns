@@ -35,13 +35,13 @@ impl Executable for Shuffle {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
         if let Some(resp) = ctx.response_mut() {
             if self.answer {
-                shuffle_slice(resp.answers_mut());
+                shuffle_slice(&mut resp.answers);
             }
             if self.ns {
-                shuffle_slice(resp.name_servers_mut());
+                shuffle_slice(&mut resp.authorities);
             }
             if self.extra {
-                shuffle_slice(resp.additionals_mut());
+                shuffle_slice(&mut resp.additionals);
             }
         }
         Ok(())
@@ -74,10 +74,7 @@ mod tests {
     #[tokio::test]
     async fn shuffle_preserves_count() {
         let s = Shuffle::default();
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -85,7 +82,7 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
+        let mut resp = Message::response(0, OpCode::Query);
         for i in 0..5 {
             resp.add_answer(Record::from_rdata(
                 Name::from_ascii("example.com.").unwrap(),
@@ -95,7 +92,7 @@ mod tests {
         }
         ctx.set_response(Some(resp));
         s.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers().len(), 5);
+        assert_eq!(ctx.response().unwrap().answers.len(), 5);
     }
 
     #[tokio::test]
@@ -105,10 +102,7 @@ mod tests {
             ns: false,
             extra: true,
         };
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -116,7 +110,7 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
+        let mut resp = Message::response(0, OpCode::Query);
         for i in 0..5 {
             resp.add_additional(Record::from_rdata(
                 Name::from_ascii("example.com.").unwrap(),
@@ -126,6 +120,6 @@ mod tests {
         }
         ctx.set_response(Some(resp));
         s.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().additionals().len(), 5);
+        assert_eq!(ctx.response().unwrap().additionals.len(), 5);
     }
 }

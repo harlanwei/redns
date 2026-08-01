@@ -65,7 +65,7 @@ fn parse_ptr_name(name: &str) -> Option<IpAddr> {
 impl Matcher for PtrIpMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         use hickory_proto::rr::RecordType;
-        for question in ctx.query().queries() {
+        for question in &ctx.query().queries {
             if question.query_type() == RecordType::PTR {
                 let name = question.name().to_ascii();
                 if let Some(ip) = parse_ptr_name(&name)
@@ -86,10 +86,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
 
     fn make_ptr_ctx(ptr_name: &str) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii(ptr_name).unwrap())
@@ -116,10 +113,7 @@ mod tests {
     #[test]
     fn non_ptr_query_returns_false() {
         let m = PtrIpMatcher::from_str_args("0.0.0.0/0").unwrap();
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

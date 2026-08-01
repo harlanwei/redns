@@ -5,7 +5,7 @@
 //! Responds with fixed IPs for A/AAAA queries.
 
 use async_trait::async_trait;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Executable};
@@ -64,10 +64,8 @@ impl Executable for BlackHole {
             _ => return Ok(()),
         };
 
-        let mut resp = Message::new();
-        resp.set_id(ctx.query().id());
-        resp.set_message_type(MessageType::Response);
-        resp.set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_query(question);
         for rr in records {
             resp.add_answer(rr);
@@ -83,10 +81,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
 
     fn make_ctx(rtype: RecordType) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -102,7 +97,7 @@ mod tests {
         let mut ctx = make_ctx(RecordType::A);
         bh.exec(&mut ctx).await.unwrap();
         let resp = ctx.response().unwrap();
-        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers.len(), 1);
     }
 
     #[tokio::test]
@@ -110,7 +105,7 @@ mod tests {
         let bh = BlackHole::new(vec![], vec!["::1".parse().unwrap()]);
         let mut ctx = make_ctx(RecordType::AAAA);
         bh.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers().len(), 1);
+        assert_eq!(ctx.response().unwrap().answers.len(), 1);
     }
 
     #[tokio::test]

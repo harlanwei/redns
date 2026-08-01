@@ -268,10 +268,8 @@ mod tests {
             if n < self.panic_until {
                 panic!("simulated handler panic #{n}");
             }
-            let mut resp = Message::new();
-            resp.set_id(query.id());
-            resp.set_message_type(MessageType::Response);
-            if let Some(q) = query.queries().first() {
+            let mut resp = Message::response(query.id, OpCode::Query);
+            if let Some(q) = query.queries.first() {
                 resp.add_query(q.clone());
             }
             Ok(resp)
@@ -279,10 +277,7 @@ mod tests {
     }
 
     fn make_query() -> Vec<u8> {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -363,7 +358,7 @@ mod tests {
 
         let (parsed, meta) = build_udp_query(expected_wire.clone(), client_ip).unwrap();
 
-        assert_eq!(parsed.id(), 1);
+        assert_eq!(parsed.id, 1);
         assert_eq!(meta.protocol.as_deref(), Some("udp"));
         assert!(meta.from_udp);
         assert_eq!(meta.client_addr, Some(client_ip));
@@ -398,10 +393,8 @@ mod tests {
                 self.release.notified().await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
 
-                let mut resp = Message::new();
-                resp.set_id(query.id());
-                resp.set_message_type(MessageType::Response);
-                if let Some(q) = query.queries().first() {
+                let mut resp = Message::response(query.id, OpCode::Query);
+                if let Some(q) = query.queries.first() {
                     resp.add_query(q.clone());
                 }
                 Ok(resp)

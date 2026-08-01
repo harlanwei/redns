@@ -54,17 +54,17 @@ impl Executable for Ttl {
                 }
                 t
             };
-            for rr in resp.answers_mut() {
-                let old = rr.ttl();
-                rr.set_ttl(apply(old));
+            for rr in &mut resp.answers {
+                let old = rr.ttl;
+                rr.ttl = apply(old);
             }
-            for rr in resp.name_servers_mut() {
-                let old = rr.ttl();
-                rr.set_ttl(apply(old));
+            for rr in &mut resp.authorities {
+                let old = rr.ttl;
+                rr.ttl = apply(old);
             }
-            for rr in resp.additionals_mut() {
-                let old = rr.ttl();
-                rr.set_ttl(apply(old));
+            for rr in &mut resp.additionals {
+                let old = rr.ttl;
+                rr.ttl = apply(old);
             }
         }
         Ok(())
@@ -79,10 +79,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn make_ctx_with_ttl(ttl: u32) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -90,7 +87,7 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
+        let mut resp = Message::response(0, OpCode::Query);
         resp.add_answer(Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             ttl,
@@ -105,28 +102,28 @@ mod tests {
         let t = Ttl::fixed(60);
         let mut ctx = make_ctx_with_ttl(3600);
         t.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers()[0].ttl(), 60);
+        assert_eq!(ctx.response().unwrap().answers[0].ttl, 60);
     }
     #[tokio::test]
     async fn min_clamps_up() {
         let t = Ttl::range(300, 0);
         let mut ctx = make_ctx_with_ttl(10);
         t.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers()[0].ttl(), 300);
+        assert_eq!(ctx.response().unwrap().answers[0].ttl, 300);
     }
     #[tokio::test]
     async fn max_clamps_down() {
         let t = Ttl::range(0, 600);
         let mut ctx = make_ctx_with_ttl(3600);
         t.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers()[0].ttl(), 600);
+        assert_eq!(ctx.response().unwrap().answers[0].ttl, 600);
     }
     #[tokio::test]
     async fn range_within_bounds() {
         let t = Ttl::range(100, 500);
         let mut ctx = make_ctx_with_ttl(250);
         t.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers()[0].ttl(), 250);
+        assert_eq!(ctx.response().unwrap().answers[0].ttl, 250);
     }
     #[test]
     fn from_str_fixed() {

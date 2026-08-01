@@ -130,6 +130,10 @@ impl DashboardStore {
         db_path: impl Into<String>,
         dhcp_leases: Vec<String>,
     ) -> Result<Self, DynError> {
+        // reqwest is built with the `rustls` feature (aws-lc-rs); install the
+        // process default before the HTTP client is constructed (also covers
+        // tests that build DashboardStore directly).
+        redns_core::install_rustls_crypto_provider();
         let logs_db_path = db_path.into();
         ensure_sqlite_file_exists(&logs_db_path)?;
         let geoip_db_path = geoip_db_path(&logs_db_path);
@@ -1142,7 +1146,7 @@ impl DashboardDnsHandler {
 
 fn dashboard_query_details(query: &Message, meta: &QueryMeta) -> (String, String, String, String) {
     let (qname, qtype) = query
-        .queries()
+        .queries
         .first()
         .map(|q| (q.name().to_ascii(), format!("{:?}", q.query_type())))
         .unwrap_or_else(|| (String::new(), String::new()));
@@ -1164,7 +1168,7 @@ fn dashboard_query_details(query: &Message, meta: &QueryMeta) -> (String, String
 }
 
 fn summarize_dashboard_result(resp: &Message, qname: &str) -> (String, String, Vec<String>, u32) {
-    let rcode = resp.response_code();
+    let rcode = resp.response_code;
     let (summary, rows) = persisted_dns_result(resp, qname);
     let ttl = min_answer_ttl(resp);
     (format!("{:?}", rcode), summary, rows, ttl)
@@ -1743,14 +1747,14 @@ async fn read_contained(path: &Path, base_canon: &Path, out: &mut Vec<u8>) -> bo
 }
 
 fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
-    let answers = resp.answers();
+    let answers = &resp.answers;
     if answers.is_empty() {
         return (String::new(), vec![]);
     }
 
     let mut rows = Vec::new();
     for answer in answers {
-        let ans_name = answer.name().to_ascii();
+        let ans_name = answer.name.to_ascii();
         let name_disp = if ans_name.eq_ignore_ascii_case(qname) {
             "@"
         } else {
@@ -1759,9 +1763,9 @@ fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
         rows.push(format!(
             "{} {} {:?} {}",
             name_disp,
-            answer.ttl(),
+            answer.ttl,
             answer.record_type(),
-            answer.data()
+            answer.data
         ));
     }
 
@@ -1771,17 +1775,17 @@ fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
 
 /// Extract the minimum answer TTL from a DNS response.
 fn min_answer_ttl(resp: &Message) -> u32 {
-    resp.answers().iter().map(|rr| rr.ttl()).min().unwrap_or(0)
+    resp.answers.iter().map(|rr| rr.ttl).min().unwrap_or(0)
 }
 
 fn persisted_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
-    let rcode = resp.response_code();
+    let rcode = resp.response_code;
     if rcode == ResponseCode::NXDomain
-        || (rcode == ResponseCode::NoError && resp.answers().is_empty())
+        || (rcode == ResponseCode::NoError && resp.answers.is_empty())
     {
         // Normal non-results (NXDOMAIN, empty NOERROR) are elided to save disk.
         (String::new(), Vec::new())
-    } else if resp.answers().is_empty() {
+    } else if resp.answers.is_empty() {
         // An error rcode (e.g. SERVFAIL) with no answers carries no records to
         // summarize, but the failure itself is worth keeping in the logs — emit
         // a compact diagnostic row so it stays visible in the dashboard.
@@ -2034,6 +2038,7 @@ fn resolve_ids_to_upstream_names(conn: &Connection, ids: &[u64]) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::OpCode;
 
     fn temp_db_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -2155,20 +2160,20 @@ mod tests {
     #[test]
     fn persisted_dns_result_elides_nxdomain_and_empty_noerror_only() {
         let qname = "example.com.";
-        let mut noerror = Message::new();
-        noerror.set_response_code(ResponseCode::NoError);
+        let mut noerror = Message::response(0, OpCode::Query);
+        noerror.metadata.response_code = ResponseCode::NoError;
         let (summary, rows) = persisted_dns_result(&noerror, qname);
         assert!(summary.is_empty());
         assert!(rows.is_empty());
 
-        let mut servfail = Message::new();
-        servfail.set_response_code(ResponseCode::ServFail);
+        let mut servfail = Message::response(0, OpCode::Query);
+        servfail.metadata.response_code = ResponseCode::ServFail;
         let (summary, rows) = persisted_dns_result(&servfail, qname);
         assert_eq!(summary, ""); // We are no longer returning summary text
         assert_eq!(rows, vec!["rcode=ServFail, answers=0".to_string()]);
 
-        let mut nxdomain = Message::new();
-        nxdomain.set_response_code(ResponseCode::NXDomain);
+        let mut nxdomain = Message::response(0, OpCode::Query);
+        nxdomain.metadata.response_code = ResponseCode::NXDomain;
         let (summary, rows) = persisted_dns_result(&nxdomain, qname);
         assert!(summary.is_empty());
         assert!(rows.is_empty());

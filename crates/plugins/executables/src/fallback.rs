@@ -113,7 +113,7 @@ fn wire_rcode(resp_wire: &[u8]) -> Option<u16> {
 /// response) fall through to the other branch.
 fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
     if let Some(resp) = outcome.response {
-        let rcode = resp.response_code();
+        let rcode = resp.response_code;
         if rcode == ResponseCode::Refused {
             return false;
         }
@@ -323,10 +323,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_query() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -338,11 +335,9 @@ mod tests {
 
     /// Builds a response with the given rcode for `query`.
     fn resp_with_rcode(query: &Message, rcode: ResponseCode) -> Message {
-        let mut resp = Message::new();
-        resp.set_id(query.id());
-        resp.set_message_type(MessageType::Response);
-        resp.set_response_code(rcode);
-        if let Some(q) = query.queries().first() {
+        let mut resp = Message::response(query.id, OpCode::Query);
+        resp.metadata.response_code = rcode;
+        if let Some(q) = query.queries.first() {
             resp.add_query(q.clone());
         }
         resp
@@ -359,7 +354,7 @@ mod tests {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let mut resp = self.resp.clone();
-            resp.set_id(ctx.query().id());
+            resp.metadata.id = ctx.query().id;
             ctx.set_response(Some(resp));
             Ok(())
         }
@@ -375,10 +370,8 @@ mod tests {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let q = ctx.question().unwrap().clone();
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
             resp.add_query(q);
             ctx.set_response(Some(resp));
             Ok(())
@@ -414,7 +407,7 @@ mod tests {
             "secondary must not be consulted when primary is a SERVFAIL"
         );
         let resp = ctx.response().expect("response set");
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+        assert_eq!(resp.response_code, ResponseCode::ServFail);
     }
 
     /// A REFUSED from the primary is NOT terminal — the secondary is
@@ -442,6 +435,6 @@ mod tests {
             "secondary must be tried after a REFUSED primary"
         );
         let resp = ctx.response().expect("response set");
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.response_code, ResponseCode::NoError);
     }
 }

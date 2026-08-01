@@ -77,13 +77,13 @@ impl RecursiveExecutable for UseAnswerOf {
         }
 
         // Rewrite the question name to the target (qtype/qclass unchanged).
-        ctx.query_mut().queries_mut()[0].set_name(self.target.clone());
+        ctx.query_mut().queries[0].set_name(self.target.clone());
 
         // Run downstream (e.g. a forward) against the target name.
         let result = next.exec_next(ctx).await;
 
         // Restore the original question name in the query.
-        ctx.query_mut().queries_mut()[0].set_name(original.clone());
+        ctx.query_mut().queries[0].set_name(original.clone());
 
         // Fix up the response: restore the question section and link the
         // original name to the target with a CNAME so the client can follow
@@ -92,9 +92,9 @@ impl RecursiveExecutable for UseAnswerOf {
         // otherwise the response is left untouched.
         if let Some(resp) = ctx.response_mut() {
             let saw_target_question =
-                resp.queries().iter().any(|q| q.name() == &self.target);
+                resp.queries.iter().any(|q| q.name() == &self.target);
 
-            for q in resp.queries_mut() {
+            for q in &mut resp.queries {
                 if q.name() == &self.target {
                     q.set_name(original.clone());
                 }
@@ -103,7 +103,7 @@ impl RecursiveExecutable for UseAnswerOf {
             // Skip the CNAME when the upstream already produced an answer
             // chain rooted at the original name.
             if saw_target_question
-                && !resp.answers().iter().any(|rr| rr.name() == &original)
+                && !resp.answers.iter().any(|rr| rr.name == original)
             {
                 let cname_rr = Record::from_rdata(
                     original.clone(),
@@ -111,8 +111,8 @@ impl RecursiveExecutable for UseAnswerOf {
                     RData::CNAME(hickory_proto::rr::rdata::CNAME(self.target.clone())),
                 );
                 let mut new_answers = vec![cname_rr];
-                new_answers.extend(resp.answers().iter().cloned());
-                *resp.answers_mut() = new_answers;
+                new_answers.extend(resp.answers.iter().cloned());
+                resp.answers = new_answers;
             }
         }
 
@@ -136,10 +136,8 @@ mod tests {
     impl Executable for ResponderExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             let q = ctx.question().unwrap().clone();
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
             resp.add_query(q.clone());
             resp.add_answer(Record::from_rdata(
                 q.name().clone(),
@@ -152,10 +150,7 @@ mod tests {
     }
 
     fn make_query(name: &str) -> Message {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii(name).unwrap())
@@ -186,15 +181,15 @@ mod tests {
 
         // The downstream saw the target name...
         let resp = ctx.response().unwrap();
-        assert_eq!(resp.answers().len(), 2);
+        assert_eq!(resp.answers.len(), 2);
         // ...linked by a CNAME from the original name...
-        assert_eq!(resp.answers()[0].record_type(), RecordType::CNAME);
-        assert_eq!(resp.answers()[0].name().to_ascii(), "example.com.");
+        assert_eq!(resp.answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(resp.answers[0].name.to_ascii(), "example.com.");
         // ...to the target's own A record.
-        assert_eq!(resp.answers()[1].record_type(), RecordType::A);
-        assert_eq!(resp.answers()[1].name().to_ascii(), "www.example.com.");
+        assert_eq!(resp.answers[1].record_type(), RecordType::A);
+        assert_eq!(resp.answers[1].name.to_ascii(), "www.example.com.");
         // Question section and query are restored to the original qname.
-        assert_eq!(resp.queries()[0].name().to_ascii(), "example.com.");
+        assert_eq!(resp.queries[0].name().to_ascii(), "example.com.");
         assert_eq!(ctx.question().unwrap().name().to_ascii(), "example.com.");
     }
 
@@ -206,8 +201,8 @@ mod tests {
 
         let resp = ctx.response().unwrap();
         // No synthesized CNAME — the target is the original name.
-        assert_eq!(resp.answers().len(), 1);
-        assert_eq!(resp.answers()[0].record_type(), RecordType::A);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].record_type(), RecordType::A);
     }
 
     #[tokio::test]
@@ -223,10 +218,8 @@ mod tests {
 
         // A response for the original qname already exists (e.g. from an
         // earlier forward node).
-        let mut resp = Message::new();
-        resp.set_id(1)
-            .set_message_type(MessageType::Response)
-            .set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(1, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_query(ctx.question().unwrap().clone());
         resp.add_answer(Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
@@ -239,10 +232,10 @@ mod tests {
 
         let resp = ctx.response().unwrap();
         // Unmodified: single A record, no CNAME, question unchanged.
-        assert_eq!(resp.answers().len(), 1);
-        assert_eq!(resp.answers()[0].record_type(), RecordType::A);
-        assert_eq!(resp.answers()[0].name().to_ascii(), "example.com.");
-        assert_eq!(resp.queries()[0].name().to_ascii(), "example.com.");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].record_type(), RecordType::A);
+        assert_eq!(resp.answers[0].name.to_ascii(), "example.com.");
+        assert_eq!(resp.queries[0].name().to_ascii(), "example.com.");
     }
 
     #[test]

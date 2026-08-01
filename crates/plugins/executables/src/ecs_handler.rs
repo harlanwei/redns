@@ -88,7 +88,7 @@ impl EcsHandler {
     /// Add ECS option to the query via the Edns API.
     fn add_ecs_to_query(msg: &mut hickory_proto::op::Message, subnet: ClientSubnet) {
         // Use the Edns builder to attach ECS.
-        let mut edns = msg.extensions().as_ref().cloned().unwrap_or_else(Edns::new);
+        let mut edns = msg.edns.as_ref().cloned().unwrap_or_else(Edns::new);
         edns.options_mut()
             .insert(hickory_proto::rr::rdata::opt::EdnsOption::Subnet(subnet));
         msg.set_edns(edns);
@@ -96,7 +96,7 @@ impl EcsHandler {
 
     /// Check if the query already has an ECS option in its EDNS.
     fn has_ecs(msg: &hickory_proto::op::Message) -> bool {
-        if let Some(edns) = msg.extensions().as_ref() {
+        if let Some(edns) = msg.edns.as_ref() {
             edns.options()
                 .as_ref()
                 .iter()
@@ -154,10 +154,7 @@ mod tests {
     }
 
     fn make_query() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

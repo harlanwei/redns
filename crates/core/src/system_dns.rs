@@ -210,14 +210,14 @@ pub async fn system_fallback_resolve(query: &Message) -> PluginResult<Option<Mes
         debug!(nameserver = %ns, "attempting system DNS fallback");
         match resolve_via_udp(&query_wire, *ns, SYSTEM_DNS_TIMEOUT).await {
             Ok(resp)
-                if resp.response_code() == ResponseCode::NoError
-                    || resp.response_code() == ResponseCode::NXDomain =>
+                if resp.response_code == ResponseCode::NoError
+                    || resp.response_code == ResponseCode::NXDomain =>
             {
-                debug!(nameserver = %ns, rcode = ?resp.response_code(), "system DNS fallback succeeded");
+                debug!(nameserver = %ns, rcode = ?resp.response_code, "system DNS fallback succeeded");
                 return Ok(Some(resp));
             }
             Ok(resp) => {
-                debug!(nameserver = %ns, rcode = ?resp.response_code(), "system DNS fallback returned error rcode");
+                debug!(nameserver = %ns, rcode = ?resp.response_code, "system DNS fallback returned error rcode");
             }
             Err(e) => {
                 debug!(nameserver = %ns, error = %e, "system DNS fallback failed");

@@ -70,18 +70,18 @@ impl RecursiveExecutable for Redirect {
         };
 
         // Rewrite the question name to the target.
-        ctx.query_mut().queries_mut()[0].set_name(target.clone());
+        ctx.query_mut().queries[0].set_name(target.clone());
 
         // Execute downstream with rewritten name.
         let result = next.exec_next(ctx).await;
 
         // Restore original name in query.
-        ctx.query_mut().queries_mut()[0].set_name(qname.clone());
+        ctx.query_mut().queries[0].set_name(qname.clone());
 
         // If there's a response, restore question and inject CNAME.
         if let Some(resp) = ctx.response_mut() {
             // Fix question name in response.
-            for q in resp.queries_mut() {
+            for q in &mut resp.queries {
                 if q.name() == &target {
                     q.set_name(qname.clone());
                 }
@@ -95,8 +95,8 @@ impl RecursiveExecutable for Redirect {
             );
 
             let mut new_answers = vec![cname_rr];
-            new_answers.extend(resp.answers().iter().cloned());
-            *resp.answers_mut() = new_answers;
+            new_answers.extend(resp.answers.iter().cloned());
+            resp.answers = new_answers;
         }
 
         result
@@ -118,10 +118,8 @@ mod tests {
     impl Executable for ResponderExec {
         async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
             let q = ctx.question().unwrap().clone();
-            let mut resp = Message::new();
-            resp.set_id(ctx.query().id());
-            resp.set_message_type(MessageType::Response);
-            resp.set_response_code(ResponseCode::NoError);
+            let mut resp = Message::response(ctx.query().id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
             resp.add_query(q.clone());
             resp.add_answer(Record::from_rdata(
                 q.name().clone(),
@@ -153,10 +151,7 @@ mod tests {
         ];
         let seq = Sequence::new(chain);
 
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("alias.com.").unwrap())
@@ -168,9 +163,9 @@ mod tests {
         seq.exec(&mut ctx).await.unwrap();
         let resp = ctx.response().unwrap();
         // Should have CNAME + A records.
-        assert!(resp.answers().len() >= 2);
+        assert!(resp.answers.len() >= 2);
         // First answer should be CNAME.
-        assert_eq!(resp.answers()[0].record_type(), RecordType::CNAME);
+        assert_eq!(resp.answers[0].record_type(), RecordType::CNAME);
     }
 
     #[tokio::test]
@@ -188,10 +183,7 @@ mod tests {
         ];
         let seq = Sequence::new(chain);
 
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("normal.com.").unwrap())
@@ -200,6 +192,6 @@ mod tests {
         });
         let mut ctx = Context::new(msg);
         seq.exec(&mut ctx).await.unwrap();
-        assert_eq!(ctx.response().unwrap().answers().len(), 1); // Just the A record.
+        assert_eq!(ctx.response().unwrap().answers.len(), 1); // Just the A record.
     }
 }

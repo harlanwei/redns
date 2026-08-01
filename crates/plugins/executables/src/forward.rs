@@ -721,7 +721,7 @@ impl Forward {
         cached_query_wire: Option<Arc<Vec<u8>>>,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let qname = query
-            .queries()
+            .queries
             .first()
             .map(|q| q.name().to_ascii())
             .unwrap_or_default();
@@ -947,8 +947,8 @@ upstreams:
 
         // Repaired message must parse.
         let msg = Message::from_vec(&repaired).expect("repaired wire should parse");
-        assert_eq!(msg.answers().len(), 1);
-        let rdata = msg.answers()[0].data();
+        assert_eq!(msg.answers.len(), 1);
+        let rdata = &msg.answers[0].data;
         if let hickory_proto::rr::RData::AAAA(ipv6) = rdata {
             assert_eq!(
                 ipv6.0,

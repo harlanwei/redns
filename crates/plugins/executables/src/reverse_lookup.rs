@@ -8,16 +8,15 @@
 //! When a PTR query arrives, returns cached domain if available.
 
 use async_trait::async_trait;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use lru::LruCache;
 use parking_lot::Mutex;
+use quick_cache::sync::Cache as QuickCache;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 /// Reverse lookup configuration.
@@ -55,6 +54,7 @@ impl ReverseLookupConfig {
     }
 }
 
+#[derive(Clone)]
 struct CacheEntry {
     domain: String,
     expires: Instant,
@@ -63,25 +63,25 @@ struct CacheEntry {
 /// Reverse IP→domain cache.
 pub struct ReverseLookup {
     config: ReverseLookupConfig,
-    cache: Mutex<LruCache<IpAddr, CacheEntry>>,
+    cache: Mutex<QuickCache<IpAddr, CacheEntry>>,
 }
 
 impl ReverseLookup {
     pub fn new(config: ReverseLookupConfig) -> Self {
-        let cap = NonZeroUsize::new(config.size.max(1)).unwrap();
+        let cap = config.size.max(1);
         Self {
             config,
-            cache: Mutex::new(LruCache::new(cap)),
+            cache: Mutex::new(QuickCache::new(cap)),
         }
     }
 
     /// Look up the cached domain for an IP.
     fn lookup(&self, addr: &IpAddr) -> Option<String> {
-        let mut cache = self.cache.lock();
+        let cache = self.cache.lock();
         // `get` bumps recency, which is what we want for an LRU PTR cache.
         cache.get(addr).and_then(|entry| {
             if entry.expires > Instant::now() {
-                Some(entry.domain.clone())
+                Some(entry.domain)
             } else {
                 None
             }
@@ -94,20 +94,20 @@ impl ReverseLookup {
         let ttl = Duration::from_secs(self.config.ttl);
 
         // Use the query name as the canonical domain if available.
-        let qname = query.queries().first().map(|q| q.name().to_ascii());
+        let qname = query.queries.first().map(|q| q.name().to_ascii());
 
-        let mut cache = self.cache.lock();
-        for rr in response.answers() {
-            let ip: Option<IpAddr> = match rr.data() {
+        let cache = self.cache.lock();
+        for rr in &response.answers {
+            let ip: Option<IpAddr> = match rr.data {
                 RData::A(a) => Some(IpAddr::V4(a.0)),
                 RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                 _ => None,
             };
             if let Some(ip) = ip {
-                let domain = qname.clone().unwrap_or_else(|| rr.name().to_ascii());
-                // `LruCache` bounds capacity itself, evicting the least-recently
-                // used entry in O(1) — no full-map scan or sort under the lock.
-                cache.put(
+                let domain = qname.clone().unwrap_or_else(|| rr.name.to_ascii());
+                // `quick_cache` bounds capacity itself, evicting cold entries in
+                // O(1) — no full-map scan or sort under the lock.
+                cache.insert(
                     ip,
                     CacheEntry {
                         domain,
@@ -123,7 +123,7 @@ impl ReverseLookup {
         if !self.config.handle_ptr {
             return None;
         }
-        let question = query.queries().first()?;
+        let question = query.queries.first()?;
         if question.query_type() != RecordType::PTR {
             return None;
         }
@@ -134,17 +134,15 @@ impl ReverseLookup {
         let domain = self.lookup(&ip)?;
 
         // Build PTR response.
-        let mut resp = Message::new();
-        resp.set_id(query.id());
-        resp.set_message_type(MessageType::Response);
-        resp.set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(query.id, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_query(question.clone());
 
         let ptr_rdata = RData::PTR(hickory_proto::rr::rdata::PTR(
             Name::from_ascii(&domain).unwrap_or_else(|_| Name::root()),
         ));
         let mut rr = Record::from_rdata(question.name().clone(), 5, ptr_rdata);
-        rr.set_dns_class(DNSClass::IN);
+        rr.dns_class = DNSClass::IN;
         resp.add_answer(rr);
 
         Some(resp)
@@ -212,11 +210,7 @@ mod tests {
     use hickory_proto::rr::Name;
 
     fn make_a_response() -> (Message, Message) {
-        let mut query = Message::new();
-        query
-            .set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
         query.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -224,10 +218,8 @@ mod tests {
             q
         });
 
-        let mut resp = Message::new();
-        resp.set_id(1);
-        resp.set_message_type(MessageType::Response);
-        resp.set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(1, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_answer(Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
             60,
@@ -259,11 +251,7 @@ mod tests {
         rl.save_ips(&query, &resp);
 
         // Build PTR query.
-        let mut ptr_query = Message::new();
-        ptr_query
-            .set_id(2)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut ptr_query = Message::new(2, MessageType::Query, OpCode::Query);
         ptr_query.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("4.3.2.1.in-addr.arpa.").unwrap())
@@ -273,7 +261,7 @@ mod tests {
 
         let resp = rl.try_respond_ptr(&ptr_query);
         assert!(resp.is_some());
-        assert_eq!(resp.unwrap().answers().len(), 1);
+        assert_eq!(resp.unwrap().answers.len(), 1);
     }
 
     #[test]
@@ -292,14 +280,14 @@ mod tests {
         });
 
         let mk = |last_octet: u8, name: &str| {
-            let mut query = Message::new();
+            let mut query = Message::new(0, MessageType::Query, OpCode::Query);
             query.add_query({
                 let mut q = Query::new();
                 q.set_name(Name::from_ascii(name).unwrap())
                     .set_query_type(RecordType::A);
                 q
             });
-            let mut resp = Message::new();
+            let mut resp = Message::response(0, OpCode::Query);
             resp.add_answer(Record::from_rdata(
                 Name::from_ascii(name).unwrap(),
                 60,

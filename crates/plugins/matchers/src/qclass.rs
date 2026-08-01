@@ -61,10 +61,7 @@ mod tests {
     use hickory_proto::rr::{DNSClass, Name, RecordType};
 
     fn make_query_class(class: DNSClass) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

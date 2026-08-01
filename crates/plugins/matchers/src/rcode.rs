@@ -48,7 +48,7 @@ impl RcodeMatcher {
 impl Matcher for RcodeMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(resp) = ctx.response() {
-            Ok(self.allowed.contains(&resp.response_code().into()))
+            Ok(self.allowed.contains(&resp.response_code.into()))
         } else {
             Ok(false)
         }
@@ -62,10 +62,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
 
     fn make_ctx_with_resp(rcode: ResponseCode) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -73,8 +70,8 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
-        resp.set_response_code(rcode);
+        let mut resp = Message::response(0, OpCode::Query);
+        resp.metadata.response_code = rcode;
         ctx.set_response(Some(resp));
         ctx
     }
@@ -89,10 +86,7 @@ mod tests {
     #[test]
     fn no_response_returns_false() {
         let m = RcodeMatcher::new([0]);
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

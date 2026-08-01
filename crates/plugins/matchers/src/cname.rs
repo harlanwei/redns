@@ -73,9 +73,9 @@ impl Matcher for CnameMatcher {
             Some(r) => r,
             None => return Ok(false),
         };
-        for rr in resp.answers() {
+        for rr in &resp.answers {
             if rr.record_type() == hickory_proto::rr::RecordType::CNAME {
-                let rdata = rr.data();
+                let rdata = &rr.data;
                 if let hickory_proto::rr::RData::CNAME(cname) = rdata
                     && self.matches_name(&cname.0.to_ascii())
                 {
@@ -94,10 +94,7 @@ mod tests {
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     fn make_ctx_with_cname(target: &str) -> Context {
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("alias.com.").unwrap())
@@ -105,10 +102,8 @@ mod tests {
             q
         });
         let mut ctx = Context::new(msg);
-        let mut resp = Message::new();
-        resp.set_id(1)
-            .set_message_type(MessageType::Response)
-            .set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(1, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_answer(Record::from_rdata(
             Name::from_ascii("alias.com.").unwrap(),
             300,
@@ -143,10 +138,7 @@ mod tests {
     #[test]
     fn no_response_returns_false() {
         let m = CnameMatcher::from_str_args("anything.com.");
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())

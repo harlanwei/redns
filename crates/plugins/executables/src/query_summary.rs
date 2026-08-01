@@ -43,7 +43,7 @@ impl RecursiveExecutable for QuerySummary {
             .map(|q| format!("{}", q.name()))
             .unwrap_or_default();
         let has_resp = ctx.response().is_some();
-        let rcode = ctx.response().map(|r| format!("{}", r.response_code()));
+        let rcode = ctx.response().map(|r| format!("{}", r.response_code));
         let elapsed = ctx.start_time().elapsed();
         match &result {
             Ok(()) => {

@@ -135,7 +135,7 @@ impl Context {
         let id = CONTEXT_UID.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Extract client EDNS and replace with our own.
-        let client_edns: Option<Edns> = query.extensions().as_ref().cloned();
+        let client_edns: Option<Edns> = query.edns.clone();
         let mut new_edns = Edns::new();
         new_edns.set_max_payload(edns_udp_size);
 
@@ -217,7 +217,7 @@ impl Context {
 
     /// Returns the first query question, if any.
     pub fn question(&self) -> Option<&Query> {
-        self.query.queries().first()
+        self.query.queries.first()
     }
 
     /// Returns the EDNS0 OPT sent by the client (may be `None`).
@@ -414,10 +414,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_query() -> Message {
-        let mut msg = Message::new();
-        msg.set_id(1234)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query);
+        let mut msg = Message::new(1234, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -428,11 +425,9 @@ mod tests {
     }
 
     fn make_response(ttl: u32) -> Message {
-        let mut resp = Message::new();
-        resp.set_id(1234)
-            .set_message_type(MessageType::Response)
-            .set_op_code(OpCode::Query)
-            .set_response_code(ResponseCode::NoError);
+        let mut resp = Message::response(1234, OpCode::Query);
+        resp.metadata.op_code = OpCode::Query;
+        resp.metadata.response_code = ResponseCode::NoError;
         resp.add_query({
             let mut q = Query::new();
             q.set_name(Name::from_ascii("example.com.").unwrap())
@@ -482,7 +477,7 @@ mod tests {
         let mut ctx = Context::new(make_query());
         assert!(ctx.response().is_none());
 
-        let resp = Message::new();
+        let resp = Message::response(0, OpCode::Query);
         ctx.set_response(Some(resp));
         assert!(ctx.response().is_some());
 
@@ -498,8 +493,8 @@ mod tests {
         ctx.set_response_wire(Some(wire.clone()));
 
         let resp = ctx.response().expect("wire response should decode");
-        assert_eq!(resp.id(), 1234);
-        assert_eq!(resp.answers()[0].ttl(), 300);
+        assert_eq!(resp.id, 1234);
+        assert_eq!(resp.answers[0].ttl, 300);
         assert_eq!(ctx.response_wire(), Some(wire.as_slice()));
     }
 
@@ -509,10 +504,10 @@ mod tests {
         ctx.set_response_wire(Some(make_response(300).to_vec().unwrap()));
 
         let resp = ctx.response_mut().expect("wire response should decode");
-        resp.answers_mut()[0].set_ttl(60);
+        resp.answers[0].ttl = 60;
 
         assert!(ctx.response_wire().is_none());
-        assert_eq!(ctx.response().unwrap().answers()[0].ttl(), 60);
+        assert_eq!(ctx.response().unwrap().answers[0].ttl, 60);
     }
 
     #[test]
