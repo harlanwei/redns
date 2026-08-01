@@ -18,6 +18,7 @@ pub mod reverse_lookup;
 pub mod shuffle;
 pub mod sleep;
 pub mod ttl;
+pub mod use_answer_of;
 
 pub use arbitrary::Arbitrary;
 pub use black_hole::BlackHole;
@@ -35,3 +36,4 @@ pub use reverse_lookup::ReverseLookup;
 pub use shuffle::Shuffle;
 pub use sleep::Sleep;
 pub use ttl::Ttl;
+pub use use_answer_of::UseAnswerOf;
