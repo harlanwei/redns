@@ -335,10 +335,6 @@ fn register_builtins(builder: &mut ChainBuilder, asn_db: Option<Arc<redns_matche
         Box::new(|args: &str| Ok(Box::new(Ttl::from_str_args(args)?) as Box<dyn Executable>)),
     );
     builder.register_exec(
-        "arbitrary",
-        Box::new(|_| Ok(Box::new(Arbitrary::new()) as Box<dyn Executable>)),
-    );
-    builder.register_exec(
         "sleep",
         Box::new(|args: &str| Ok(Box::new(Sleep::from_str_args(args)?) as Box<dyn Executable>)),
     );
@@ -407,13 +403,6 @@ fn register_builtins(builder: &mut ChainBuilder, asn_db: Option<Arc<redns_matche
         Box::new(|args: &str| {
             let cfg = redns_executables::reverse_lookup::ReverseLookupConfig::from_str_args(args)?;
             Ok(Box::new(ReverseLookup::new(cfg)) as Box<dyn RecursiveExecutable>)
-        }),
-    );
-    builder.register_rec_exec(
-        "metrics_collector",
-        Box::new(|args: &str| {
-            let cfg = redns_executables::metrics::MetricsConfig::from_str_args(args)?;
-            Ok(Box::new(MetricsCollector::new(cfg)) as Box<dyn RecursiveExecutable>)
         }),
     );
 

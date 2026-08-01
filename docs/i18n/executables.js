@@ -118,17 +118,6 @@ rednsI18nAdd({
       "s.details.li3": "查询类型和类别保持不变。",
     },
 
-    "exec-metrics-collector": {
-      "meta.title": "metrics_collector — ReDNS 文档",
-      "page.lead": "面向查询、错误、活动处理数与延迟的轻量级进程内计数器——零外部依赖。快照写入日志。",
-      "s.usage.p": "在能看到所有流量的规则中引用它，例如主序列的第一条规则：",
-      "p.name.d": "此收集器实例的标签，包含在日志输出中。当为不同规则配置多个收集器时很有用。",
-      "s.details.li1": "统计：查询总数、错误总数、当前活动处理数、响应延迟总和（用于计算平均值）。",
-      "s.details.li2": "计数器是原子的、无锁的；收集器每次查询的开销可忽略。",
-      "s.details.li3": "快照通过常规 <code>info</code> 日志通道输出——从日志文件或 stdout 收集。",
-      "s.details.li4": "需要更丰富、由仪表盘支撑的流量视图时，请改用<a href=\"dashboard.html\">Web 仪表盘</a>。",
-    },
-
     "exec-shuffle": {
       "meta.title": "shuffle — ReDNS 文档",
       "page.lead": "随机打乱应答、授权和附加区的顺序——把客户端分散到多 A 记录各地址上的经典轮询技术。",
@@ -180,13 +169,6 @@ rednsI18nAdd({
       "p.none.d": "此执行器不带参数。",
       "s.details.li1": "链继续，但上下文为空——后面的规则看不到响应。",
       "s.details.li2": "客户端会重试其他解析器，因此最好与 <code>accept</code> 组合，或放在匹配流量的最后。",
-    },
-
-    "exec-arbitrary": {
-      "meta.title": "arbitrary — ReDNS 文档",
-      "page.lead": "用以编程方式添加的记录应答查询——没有配置语法。它为嵌入 ReDNS 的开发者或编写测试而存在。",
-      "s.usage.p": "在链中不带参数注册；记录通过 Rust API（<code>add_record</code>、<code>add_a</code>、<code>add_aaaa</code>）在服务前填充。需要配置中的静态应答时，请改用 <a href=\"exec-hosts.html\"><code>hosts</code></a> 或 <a href=\"exec-black-hole.html\"><code>black_hole</code></a>。",
-      "p.none.d": "无配置参数。记录由编程 API 提供。",
     },
 
     "exec-udp-server": {

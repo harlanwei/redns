@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title data-i18n="meta.title">Plugins — ReDNS documentation</title>
-<meta name="description" content="Index of all ReDNS plugins: 16 matchers and 21 executables, one page per plugin." />
+<meta name="description" content="Index of all ReDNS plugins: 16 matchers and 19 executables, one page per plugin." />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
 <link rel="stylesheet" href="style.css" />
 </head>
@@ -50,7 +50,7 @@
     <div class="page-head">
       <h1 data-i18n="page.title">Plugins</h1>
       <p class="lead" data-i18n="page.lead">
-        ReDNS ships with 16 matchers and 21 executables. Each plugin has its own page with a
+        ReDNS ships with 16 matchers and 19 executables. Each plugin has its own page with a
         full parameter reference — whether each parameter is required, its type, its default,
         and what it does. Start with the <a href="rules.html">Rules</a> page if you have not
         read it yet.
@@ -94,14 +94,12 @@
         <a class="link-card" href="exec-ttl.html"><span class="lc-name">ttl</span><span class="lc-desc" data-i18n="lc.ttl">Fix or clamp response TTLs.</span></a>
         <a class="link-card" href="exec-reverse-lookup.html"><span class="lc-name">reverse_lookup</span><span class="lc-desc" data-i18n="lc.reverse_lookup">Answer PTR from cached A/AAAA answers.</span></a>
         <a class="link-card" href="exec-use-answer-of.html"><span class="lc-name">use-answer-of</span><span class="lc-desc" data-i18n="lc.use_answer_of">Answer with another name's records.</span></a>
-        <a class="link-card" href="exec-metrics-collector.html"><span class="lc-name">metrics_collector</span><span class="lc-desc" data-i18n="lc.metrics_collector">In-process query/error counters.</span></a>
         <a class="link-card" href="exec-shuffle.html"><span class="lc-name">shuffle</span><span class="lc-desc" data-i18n="lc.shuffle">Randomize record order (round robin).</span></a>
         <a class="link-card" href="exec-accept.html"><span class="lc-name">accept</span><span class="lc-desc" data-i18n="lc.accept">Stop the chain, keep the response.</span></a>
         <a class="link-card" href="exec-reject.html"><span class="lc-name">reject</span><span class="lc-desc" data-i18n="lc.reject">Answer with an rcode, stop the chain.</span></a>
         <a class="link-card" href="exec-sleep.html"><span class="lc-name">sleep</span><span class="lc-desc" data-i18n="lc.sleep">Delay the query (rate limiting).</span></a>
         <a class="link-card" href="exec-debug-print.html"><span class="lc-name">debug_print</span><span class="lc-desc" data-i18n="lc.debug_print">Log the full query context.</span></a>
         <a class="link-card" href="exec-drop-resp.html"><span class="lc-name">drop_resp</span><span class="lc-desc" data-i18n="lc.drop_resp">Discard the response (client times out).</span></a>
-        <a class="link-card" href="exec-arbitrary.html"><span class="lc-name">arbitrary</span><span class="lc-desc" data-i18n="lc.arbitrary">Serve records added programmatically.</span></a>
         <a class="link-card" href="exec-udp-server.html"><span class="lc-name">udp_server</span><span class="lc-desc" data-i18n="lc.udp_server">Declare a UDP listener as a plugin.</span></a>
         <a class="link-card" href="exec-tcp-server.html"><span class="lc-name">tcp_server</span><span class="lc-desc" data-i18n="lc.tcp_server">Declare a TCP listener as a plugin.</span></a>
       </div>
