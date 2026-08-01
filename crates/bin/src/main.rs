@@ -21,7 +21,9 @@ use redns_core::{PluginRegistry, Sequence};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -166,8 +168,146 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
     default
 }
 
+/// URL of the default ASN database used when the config references the `asn`
+/// matcher without an explicit `asn_db`. A MaxMind DB of origin ASNs
+/// published by sapics/ip-location-db (~10 MB).
+const DEFAULT_ASN_DB_URL: &str =
+    "https://github.com/sapics/ip-location-db/releases/download/latest/origin-asn.mmdb";
+/// Local cache file name for the auto-downloaded default ASN database.
+const DEFAULT_ASN_DB_FILE: &str = "origin-asn.mmdb";
+
+/// Resolves the cache path for the auto-downloaded default ASN database:
+/// `$XDG_CACHE_HOME/redns/origin-asn.mmdb`, falling back to
+/// `~/.cache/redns/origin-asn.mmdb`, then `./origin-asn.mmdb`.
+fn default_asn_db_cache_path() -> PathBuf {
+    asn_db_cache_path(
+        std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Pure helper for [`default_asn_db_cache_path`], split out for testing.
+fn asn_db_cache_path(xdg_cache_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    if let Some(dir) = xdg_cache_home.filter(|d| !d.trim().is_empty()) {
+        return PathBuf::from(dir).join("redns").join(DEFAULT_ASN_DB_FILE);
+    }
+    if let Some(dir) = home.filter(|d| !d.trim().is_empty()) {
+        return PathBuf::from(dir)
+            .join(".cache")
+            .join("redns")
+            .join(DEFAULT_ASN_DB_FILE);
+    }
+    PathBuf::from(DEFAULT_ASN_DB_FILE)
+}
+
+/// Returns `true` when the config references the `asn` matcher anywhere:
+/// as a named plugin (`type: asn`) or inside a sequence rule
+/// (`matches: asn ...` / `matches: !asn ...`).
+fn config_uses_asn(cfg: &redns_core::config::Config) -> bool {
+    cfg.plugins.iter().any(|plugin| {
+        if plugin.plugin_type == "asn" {
+            return true;
+        }
+        if plugin.plugin_type != "sequence" {
+            return false;
+        }
+        let rule_args: Vec<redns_core::RuleArgs> =
+            redns_core::config::deserialize_yaml_str(&plugin.args).unwrap_or_default();
+        rule_args
+            .iter()
+            .map(redns_core::config::parse_rule_args)
+            .any(|rc| rc.matches.iter().any(|m| m.match_type == "asn"))
+    })
+}
+
+/// Loads the ASN database backing the `asn` matcher.
+///
+/// When the user configured `asn_db`, those MaxMind DB files are loaded.
+/// Otherwise, if the config uses the `asn` matcher, the default
+/// `origin-asn.mmdb` database is downloaded from GitHub on first use and
+/// cached on disk (see [`default_asn_db_cache_path`]); later starts reuse the
+/// cache. Returns `None` when no `asn` matcher is used and no database is
+/// configured.
+async fn load_asn_db(
+    cfg: &redns_core::config::Config,
+) -> Result<Option<Arc<redns_matchers::AsnDb>>, redns_core::PluginError> {
+    let mut db = redns_matchers::AsnDb::new();
+    if !cfg.asn_db.is_empty() {
+        db.load_files(&cfg.asn_db)?;
+        info!(files = ?cfg.asn_db, "ASN database loaded");
+        return Ok(Some(Arc::new(db)));
+    }
+    if !config_uses_asn(cfg) {
+        return Ok(None);
+    }
+
+    let cache_path = default_asn_db_cache_path();
+    if !cache_path.exists() {
+        download_default_asn_db(&cache_path).await?;
+    }
+    db.load_file(&cache_path.to_string_lossy())?;
+    info!(path = %cache_path.display(), "default ASN database loaded");
+    Ok(Some(Arc::new(db)))
+}
+
+/// Downloads the default ASN database from GitHub releases into `path`.
+///
+/// The download is written to a temporary sibling file first and renamed
+/// into place, so an interrupted download never leaves a truncated database
+/// that would be silently reused on the next start.
+async fn download_default_asn_db(path: &std::path::Path) -> Result<(), redns_core::PluginError> {
+    info!(url = DEFAULT_ASN_DB_URL, "downloading default ASN database");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("redns/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    let resp = client
+        .get(DEFAULT_ASN_DB_URL)
+        .send()
+        .await
+        .map_err(|e| -> redns_core::PluginError {
+            format!("failed to download default ASN database: {e}").into()
+        })?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "failed to download default ASN database: HTTP {}",
+            resp.status()
+        )
+        .into());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| -> redns_core::PluginError {
+            format!("failed to read default ASN database download: {e}").into()
+        })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| -> redns_core::PluginError {
+            format!(
+                "failed to create cache directory '{}': {e}",
+                parent.display()
+            )
+            .into()
+        })?;
+    }
+    let tmp = path.with_extension("mmdb.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| -> redns_core::PluginError {
+        format!("failed to write '{}': {e}", tmp.display()).into()
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| -> redns_core::PluginError {
+        format!("failed to move '{}' into place: {e}", tmp.display()).into()
+    })?;
+    info!(
+        path = %path.display(),
+        size = bytes.len(),
+        "default ASN database downloaded"
+    );
+    Ok(())
+}
+
 /// Registers all built-in matcher and executor factories on the given builder.
-fn register_builtins(builder: &mut ChainBuilder) {
+fn register_builtins(builder: &mut ChainBuilder, asn_db: Option<Arc<redns_matchers::AsnDb>>) {
     use redns_core::built_in::*;
     use redns_core::plugin::{Executable, Matcher, RecursiveExecutable};
     use redns_executables::*;
@@ -340,6 +480,23 @@ fn register_builtins(builder: &mut ChainBuilder) {
             Ok(Box::new(StringExpMatcher::from_str_args(args)?) as Box<dyn Matcher>)
         }),
     );
+    builder.register_matcher(
+        "asn",
+        Box::new(move |args: &str| {
+            let db = asn_db.clone().ok_or_else(
+                || -> Box<dyn std::error::Error + Send + Sync> {
+                    "asn matcher requires the top-level `asn_db` config key (path to a MaxMind DB file) — automatic download of the default database is unavailable".into()
+                },
+            )?;
+            Ok(Box::new(AsnMatcher::from_str_args(args, db)?) as Box<dyn Matcher>)
+        }),
+    );
+    builder.register_rec_exec(
+        "use-answer-of",
+        Box::new(|args: &str| {
+            Ok(Box::new(UseAnswerOf::from_str_args(args)?) as Box<dyn RecursiveExecutable>)
+        }),
+    );
 
     // ── Data providers (registered as matchers) ──────────────────
     builder.register_matcher(
@@ -402,8 +559,10 @@ async fn run_server(
     let registry = PluginRegistry::new();
     let _redns = Redns::new(cfg.clone(), registry)?;
 
+    let asn_db = load_asn_db(&cfg).await?;
+
     let mut builder = ChainBuilder::new();
-    register_builtins(&mut builder);
+    register_builtins(&mut builder, asn_db);
 
     // Register forward plugin with upstream collection for metrics API.
     // Uses a Mutex during startup only; frozen into Arc<[]> before serving.
@@ -934,7 +1093,11 @@ async fn handle_api_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheBuildConfig, bind_tcp_listener, bind_udp_socket, parse_cache_args};
+    use super::{
+        CacheBuildConfig, asn_db_cache_path, bind_tcp_listener, bind_udp_socket, config_uses_asn,
+        parse_cache_args,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn cache_size_parses_plain_integer_arg() {
@@ -988,5 +1151,69 @@ mod tests {
         let ipv6 = bind_tcp_listener(&format!("[::]:{port}")).expect("bind IPv6 TCP listener");
 
         assert_eq!(ipv6.local_addr().expect("read IPv6 TCP addr").port(), port);
+    }
+
+    #[test]
+    fn asn_db_cache_path_prefers_xdg() {
+        assert_eq!(
+            asn_db_cache_path(Some("/tmp/xdg"), Some("/home/u")),
+            PathBuf::from("/tmp/xdg/redns/origin-asn.mmdb")
+        );
+    }
+
+    #[test]
+    fn asn_db_cache_path_falls_back_to_home() {
+        assert_eq!(
+            asn_db_cache_path(None, Some("/home/u")),
+            PathBuf::from("/home/u/.cache/redns/origin-asn.mmdb")
+        );
+    }
+
+    #[test]
+    fn asn_db_cache_path_ignores_blank_dirs_and_defaults_to_cwd() {
+        assert_eq!(
+            asn_db_cache_path(Some("   "), None),
+            PathBuf::from("origin-asn.mmdb")
+        );
+        assert_eq!(asn_db_cache_path(None, None), PathBuf::from("origin-asn.mmdb"));
+    }
+
+    #[test]
+    fn config_uses_asn_detects_sequence_rule() {
+        let cfg: redns_core::Config = serde_saphyr::from_str(
+            "plugins:\n  - type: sequence\n    args:\n      - matches: asn 13335\n        exec: accept\n",
+        )
+        .unwrap();
+        assert!(config_uses_asn(&cfg));
+    }
+
+    #[test]
+    fn config_uses_asn_detects_reverse_rule() {
+        let cfg: redns_core::Config = serde_saphyr::from_str(
+            "plugins:\n  - type: sequence\n    args:\n      - matches: '!asn 13335'\n        exec: accept\n",
+        )
+        .unwrap();
+        assert!(config_uses_asn(&cfg));
+    }
+
+    #[test]
+    fn config_uses_asn_detects_named_plugin() {
+        let cfg: redns_core::Config = serde_saphyr::from_str(
+            "plugins:\n  - tag: my_asn\n    type: asn\n    args: '13335'\n",
+        )
+        .unwrap();
+        assert!(config_uses_asn(&cfg));
+    }
+
+    #[test]
+    fn config_uses_asn_false_without_asn() {
+        let cfg: redns_core::Config = serde_saphyr::from_str(
+            "plugins:\n  - type: sequence\n    args:\n      - matches: qtype 1\n        exec: accept\n",
+        )
+        .unwrap();
+        assert!(!config_uses_asn(&cfg));
+
+        let empty: redns_core::Config = serde_saphyr::from_str("log:\n  level: info\n").unwrap();
+        assert!(!config_uses_asn(&empty));
     }
 }

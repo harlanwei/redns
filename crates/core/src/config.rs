@@ -49,6 +49,14 @@ pub struct Config {
     /// RFC 6891 recommends at least 512; modern networks can handle 4096+.
     #[serde(default = "default_edns_size")]
     pub edns_udp_size: u16,
+    /// Paths to ASN database files (MaxMind DB format) backing the `asn`
+    /// matcher. Accepts a single path string or a list of paths. When this
+    /// key is omitted and the config uses the `asn` matcher, redns downloads
+    /// the default `origin-asn.mmdb` database (sapics/ip-location-db) on
+    /// first use and caches it under `$XDG_CACHE_HOME/redns/` (or
+    /// `~/.cache/redns/`).
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub asn_db: Vec<String>,
 }
 
 fn default_edns_size() -> u16 {
@@ -436,6 +444,22 @@ mod tests {
         assert!(rc.matches[1].reverse);
         assert_eq!(rc.matches[1].match_type, "has_resp");
         assert_eq!(rc.tag, "forward");
+    }
+
+    #[test]
+    fn asn_db_accepts_single_path_and_list() {
+        let cfg: Config = serde_saphyr::from_str("asn_db: /etc/redns/origin-asn.mmdb\n").unwrap();
+        assert_eq!(cfg.asn_db, vec!["/etc/redns/origin-asn.mmdb".to_string()]);
+
+        let cfg: Config =
+            serde_saphyr::from_str("asn_db:\n  - a.mmdb\n  - b.mmdb\n").unwrap();
+        assert_eq!(cfg.asn_db, vec!["a.mmdb".to_string(), "b.mmdb".to_string()]);
+    }
+
+    #[test]
+    fn asn_db_defaults_to_empty() {
+        let cfg: Config = serde_saphyr::from_str("log:\n  level: info\n").unwrap();
+        assert!(cfg.asn_db.is_empty());
     }
 
     #[test]
