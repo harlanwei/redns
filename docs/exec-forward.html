@@ -148,7 +148,7 @@
               <td data-i18n="common.no">No</td>
               <td data-i18n="type.string">string</td>
               <td data-i18n="dflt.disabled">absent (disabled)</td>
-              <td data-i18n="p.subprocess_suffix.d">Suffix for an out-of-process upstream that speaks DNS over a Unix socket. An advanced integration point for custom resolvers.</td>
+              <td data-i18n="p.subprocess_suffix.d">Suffix for an out-of-process upstream: the forward plugin spawns a second copy of the running redns binary itself, which renames itself to <code>redns&lt;suffix&gt;</code> (e.g. <code>redns-direct</code>), listens on a Unix socket, and resolves queries through the same configured chain. The main process delegates this forward's queries to it over the socket. Requires <code>upstreams</code> in the same plugin config, which the helper process uses directly.</td>
             </tr>
           </tbody>
         </table>

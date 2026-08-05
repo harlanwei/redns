@@ -1335,6 +1335,7 @@ dependencies = [
  "async-trait",
  "clap",
  "hickory-proto",
+ "libc",
  "mimalloc",
  "mime_guess",
  "parking_lot",

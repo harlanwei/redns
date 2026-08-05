@@ -13,11 +13,11 @@ use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -231,7 +231,23 @@ impl ForwardConfig {
 
 // ── Subprocess Upstream ──────────────────────────────────────────
 
+/// Environment variable carrying the Unix socket path to the helper process.
+///
+/// The forward plugin spawns a second copy of the *current* executable to act
+/// as an out-of-process upstream: that copy listens on a Unix socket and
+/// resolves queries through the normal config chain. The helper detects this
+/// mode via [`REDNS_FORWARD_SOCKET_ENV`]; [`REDNS_FORWARD_SUFFIX_ENV`] gives it
+/// its process-name suffix (`redns` → `redns<suffix>`), and
+/// [`REDNS_FORWARD_PARENT_PID_ENV`] lets it exit when the main process dies.
+/// These constants are shared with the `redns` binary so both sides agree on
+/// the contract.
+pub const REDNS_FORWARD_SOCKET_ENV: &str = "REDNS_FORWARD_SOCKET";
+pub const REDNS_FORWARD_SUFFIX_ENV: &str = "REDNS_FORWARD_SUFFIX";
+pub const REDNS_FORWARD_PARENT_PID_ENV: &str = "REDNS_FORWARD_PARENT_PID";
+
 const SUBPROCESS_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the parent waits for the helper to bind its socket after spawn.
+const SUBPROCESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct SubprocessUpstream {
     socket_path: String,
@@ -239,49 +255,68 @@ struct SubprocessUpstream {
 }
 
 impl SubprocessUpstream {
+    /// Spawns the helper process.
+    ///
+    /// The helper is the very same executable that is currently running —
+    /// there is no separate `redns<suffix>` binary. It is launched with the
+    /// parent's own CLI arguments (so it loads the same config) plus the
+    /// `REDNS_FORWARD_*` environment contract, and it renames itself to
+    /// `redns<suffix>` so the two processes are distinguishable in `ps`.
+    ///
+    /// Returns once the helper's Unix socket is accepting connections.
     fn new(suffix: &str, socket_path: &str) -> PluginResult<Self> {
         let current_exe =
             std::env::current_exe().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("subprocess: failed to get current exe path: {e}").into()
             })?;
 
-        let exe_str = current_exe.to_string_lossy();
-        let parent_name = current_exe
-            .file_name()
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("subprocess: cannot determine exe name from '{exe_str}'").into()
-            })?
-            .to_string_lossy();
-        let new_name = format!("{parent_name}{suffix}");
-        let subprocess_path = current_exe.with_file_name(&new_name);
+        let mut cmd = Command::new(&current_exe);
+        // Replay our own argv (e.g. `start --config …`) so the helper loads
+        // the same configuration; the environment carries the subprocess
+        // contract instead of new CLI flags.
+        cmd.args(std::env::args().skip(1))
+            .env(REDNS_FORWARD_SOCKET_ENV, socket_path)
+            .env(REDNS_FORWARD_SUFFIX_ENV, suffix)
+            .env(REDNS_FORWARD_PARENT_PID_ENV, std::process::id().to_string());
 
-        if !subprocess_path.exists() {
-            return Err(format!(
-                "subprocess: binary not found at '{}'",
-                subprocess_path.display()
-            )
-            .into());
-        }
-
-        let child = Command::new(&*subprocess_path)
-            .arg("start")
-            .arg("--socket")
-            .arg(socket_path)
+        let mut child = cmd
             .spawn()
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!(
-                    "subprocess: failed to spawn '{}': {e}",
-                    subprocess_path.display()
-                )
-                .into()
+                format!("subprocess: failed to spawn '{}': {e}", current_exe.display()).into()
             })?;
 
         info!(
-            binary = %subprocess_path.display(),
+            binary = %current_exe.display(),
             socket = %socket_path,
             pid = ?child.id(),
             "subprocess spawned"
         );
+
+        // Wait until the helper has bound its socket (or died trying), so the
+        // first exchange does not race the helper's startup.
+        let deadline = Instant::now() + SUBPROCESS_STARTUP_TIMEOUT;
+        loop {
+            if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!(
+                    "subprocess exited early (status {status}) before binding '{socket_path}'"
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                // The helper never came up; don't leave it running orphaned.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "subprocess socket '{socket_path}' not ready within {}s",
+                    SUBPROCESS_STARTUP_TIMEOUT.as_secs()
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         Ok(Self {
             socket_path: socket_path.to_string(),
@@ -325,7 +360,9 @@ impl Drop for SubprocessUpstream {
         if let Ok(mut child) = self.child.try_lock()
             && let Some(child) = child.as_mut()
         {
-            let _ = child.start_kill();
+            let _ = child.kill();
+            // Reap the child so we don't leak a defunct process entry.
+            let _ = child.wait();
         }
     }
 }
@@ -463,7 +500,16 @@ pub struct Forward {
 
 impl Forward {
     pub fn new(cfg: ForwardConfig, name: &str) -> PluginResult<Self> {
-        if cfg.upstreams.is_empty() && cfg.subprocess_suffix.is_none() {
+        // The helper process itself is spawned with REDNS_FORWARD_SOCKET_ENV
+        // set; inside it every forward instance must use its configured
+        // upstreams directly and never spawn a nested helper (which would
+        // recurse forever).
+        let in_subprocess = std::env::var(REDNS_FORWARD_SOCKET_ENV).is_ok();
+        Self::new_impl(cfg, name, in_subprocess)
+    }
+
+    fn new_impl(cfg: ForwardConfig, name: &str, in_subprocess: bool) -> PluginResult<Self> {
+        if cfg.upstreams.is_empty() && (cfg.subprocess_suffix.is_none() || in_subprocess) {
             return Err("forward: no upstreams configured".into());
         }
 
@@ -491,26 +537,36 @@ impl Forward {
         }
 
         if let Some(ref suffix) = cfg.subprocess_suffix {
-            // Include PID in the socket path to avoid collisions between multiple
-            // instances or stale sockets from crashed runs. The subprocess helper
-            // will be spawned with this same path.
-            let socket_path = format!(
-                "/tmp/redns{}-{}.sock",
-                suffix.replace('-', "_"),
-                std::process::id()
-            );
-            let sub = SubprocessUpstream::new(suffix, &socket_path)?;
-            let sub_name = format!("subprocess{suffix}");
-            let uw = Arc::new(UpstreamWrapper::new(
-                Box::new(sub),
-                sub_name.clone(),
-                "Unix".into(),
-            ));
-            upstreams.push(uw);
-            tag_index
-                .entry(sub_name)
-                .or_default()
-                .push(upstreams.len() - 1);
+            if in_subprocess {
+                info!(
+                    suffix = %suffix,
+                    "forward: subprocess mode, using configured upstreams directly"
+                );
+            } else {
+                // Include PID in the socket path to avoid collisions between
+                // multiple instances or stale sockets from crashed runs. The
+                // helper is spawned with this same path.
+                let safe_suffix: String = suffix
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let socket_path = format!(
+                    "/tmp/redns{safe_suffix}-{}.sock",
+                    std::process::id()
+                );
+                let sub = SubprocessUpstream::new(suffix, &socket_path)?;
+                let sub_name = format!("subprocess{suffix}");
+                let uw = Arc::new(UpstreamWrapper::new(
+                    Box::new(sub),
+                    sub_name.clone(),
+                    "Unix".into(),
+                ));
+                upstreams.push(uw);
+                tag_index
+                    .entry(sub_name)
+                    .or_default()
+                    .push(upstreams.len() - 1);
+            }
         }
 
         let concurrent = if cfg.concurrent == 0 {
@@ -774,6 +830,41 @@ mod tests {
         let cfg = ForwardConfig::from_yaml_str(yaml).unwrap();
         assert_eq!(cfg.subprocess_suffix.as_deref(), Some("-direct"));
         assert!(cfg.upstreams.is_empty());
+    }
+
+    #[test]
+    fn forward_subprocess_mode_uses_upstreams_without_spawning() {
+        // Simulates running inside the helper process: REDNS_FORWARD_SOCKET_ENV
+        // is set, so the forward must use its configured upstreams directly and
+        // must NOT look for a (nonexistent) `redns<suffix>` binary.
+        let cfg = ForwardConfig {
+            upstreams: vec![UpstreamConfig {
+                addr: "udp://8.8.8.8:53".into(),
+                tag: None,
+                dial_addr: None,
+                bootstrap: None,
+                pool_max_idle: None,
+            }],
+            concurrent: 1,
+            subprocess_suffix: Some("-direct".into()),
+            pool_max_idle: None,
+        };
+        let f = Forward::new_impl(cfg, "test", true).unwrap();
+        assert_eq!(f.upstreams().len(), 1);
+        assert_eq!(f.upstreams()[0].name(), "udp://8.8.8.8:53");
+    }
+
+    #[test]
+    fn forward_subprocess_mode_without_upstreams_fails() {
+        // Inside the helper a suffix alone cannot work — there is nothing to
+        // delegate to and spawning a nested helper would recurse forever.
+        let cfg = ForwardConfig {
+            upstreams: vec![],
+            concurrent: 1,
+            subprocess_suffix: Some("-direct".into()),
+            pool_max_idle: None,
+        };
+        assert!(Forward::new_impl(cfg, "test", true).is_err());
     }
 
     #[test]

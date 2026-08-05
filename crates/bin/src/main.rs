@@ -12,20 +12,26 @@ mod dashboard;
 mod http;
 
 use clap::{Parser, Subcommand};
+use hickory_proto::op::Message;
 use redns_core::chain_builder::ChainBuilder;
 use redns_core::config::parse_rule_args;
 use redns_core::redns::{Redns, find_and_load_config, load_config_file};
-use redns_core::server::EntryHandler;
+use redns_core::server::{DnsHandler, EntryHandler, QueryMeta};
 use redns_core::upstream::UpstreamWrapper;
 use redns_core::{PluginRegistry, Sequence};
+use redns_executables::forward::{
+    REDNS_FORWARD_PARENT_PID_ENV, REDNS_FORWARD_SOCKET_ENV, REDNS_FORWARD_SUFFIX_ENV,
+};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, UdpSocket};
-use tracing::{error, info, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket, UnixListener};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// `"<version> (<short-commit>)"` — shown by `--version`, the `version`
@@ -503,6 +509,27 @@ async fn run_server(
     working_dir: Option<String>,
     cli_udp_backend: Option<String>,
 ) -> Result<(), redns_core::PluginError> {
+    // ── Forward-helper mode ─────────────────────────────────────
+    // The forward plugin (SubprocessUpstream) spawns us as its out-of-process
+    // upstream by setting REDNS_FORWARD_SOCKET_ENV. In that mode we rename
+    // ourselves to `redns<suffix>` (e.g. `redns-direct`), skip the network
+    // listeners/dashboard/API, and serve queries over the Unix socket instead.
+    let subprocess_socket = std::env::var(REDNS_FORWARD_SOCKET_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let subprocess_suffix = std::env::var(REDNS_FORWARD_SUFFIX_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let subprocess_parent_pid = std::env::var(REDNS_FORWARD_PARENT_PID_ENV)
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&p| p > 0);
+    let subprocess_mode = subprocess_socket.is_some();
+
+    if subprocess_mode {
+        set_process_name(&format!("redns{}", subprocess_suffix.as_deref().unwrap_or("")));
+    }
+
     if let Some(ref dir) = working_dir {
         std::env::set_current_dir(dir).map_err(|e| -> redns_core::PluginError {
             format!("failed to change working directory to {}: {}", dir, e).into()
@@ -527,7 +554,9 @@ async fn run_server(
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            // The helper must append: truncating would clobber the main
+            // process's log right after it was opened.
+            .truncate(!subprocess_mode)
             .open(log_file)
             .unwrap_or_else(|e| panic!("failed to open log file '{}': {}", log_file, e));
         let subscriber = tracing_subscriber::fmt()
@@ -748,12 +777,62 @@ async fn run_server(
         }
     }
 
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    if subprocess_mode {
+        // Forward-helper mode: no UDP/TCP listeners, no dashboard, no API —
+        // the entry sequence is served over the Unix socket instead.
+        let entry = servers
+            .iter()
+            .find(|s| !s.entry.is_empty())
+            .map(|s| s.entry.clone())
+            .ok_or_else(|| -> redns_core::PluginError {
+                error!("forward subprocess: no server entry sequence configured");
+                "forward subprocess: no server entry sequence configured".into()
+            })?;
+        let entry_exec = builder.get_named_exec(&entry).ok_or_else(|| -> redns_core::PluginError {
+            error!(entry = %entry, "forward subprocess: entry sequence not found");
+            format!("forward subprocess: entry sequence '{}' not found", entry).into()
+        })?;
+        let handler: Arc<dyn DnsHandler> =
+            Arc::new(EntryHandler::with_best_effort(entry_exec, cfg.best_effort));
+
+        // Exit when the parent process dies so we never linger as an orphan.
+        if let Some(ppid) = subprocess_parent_pid {
+            let c = cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if !process_alive(ppid) {
+                        info!(parent_pid = ppid, "forward subprocess: parent exited, shutting down");
+                        c.cancel();
+                        return;
+                    }
+                }
+            });
+        }
+
+        let socket_path = subprocess_socket.clone().ok_or_else(|| -> redns_core::PluginError {
+            "forward subprocess: socket path missing".into()
+        })?;
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_forward_subprocess(&socket_path, handler, c.clone()).await {
+                error!(error = %e, "forward subprocess server error");
+                // A fatal serve error (e.g. bind failure) means we can never
+                // do our job — exit instead of idling until the parent kills us.
+                c.cancel();
+            }
+        });
+
+        return finish_shutdown(cancel).await;
+    }
+
     if servers.is_empty() {
         error!("no servers configured");
         return Err("no servers configured".into());
     }
 
-    let cancel = tokio_util::sync::CancellationToken::new();
     let sqlite_path = cfg
         .dashboard
         .sqlite
@@ -947,8 +1026,20 @@ async fn run_server(
         }
     }
 
+    finish_shutdown(cancel).await
+}
+
+/// Shared shutdown tail for both the main server and the forward-helper
+/// process: log startup, wait for a shutdown signal (the helper also exits
+/// when its parent dies, via the cancellation token), then cancel all tasks.
+async fn finish_shutdown(cancel: CancellationToken) -> Result<(), redns_core::PluginError> {
     info!("redns started");
-    wait_for_shutdown_signal().await;
+    tokio::select! {
+        _ = wait_for_shutdown_signal() => {}
+        _ = cancel.cancelled() => {
+            info!("shutdown requested via cancellation");
+        }
+    }
     info!("shutting down...");
     cancel.cancel();
     // Give servers time to clean up.
@@ -997,6 +1088,176 @@ async fn wait_for_shutdown_signal() {
         if let Err(e) = tokio::signal::ctrl_c().await {
             warn!(error = %e, "failed to listen for ctrl-c");
         }
+    }
+}
+
+// ── Forward-helper mode (out-of-process upstream) ────────────────
+//
+// The forward plugin's `subprocess_suffix` option spawns a second copy of the
+// current executable as an out-of-process upstream. That copy detects the
+// role via the REDNS_FORWARD_* environment variables (see forward.rs), renames
+// itself to `redns<suffix>`, and serves the configured entry sequence over a
+// Unix socket instead of binding UDP/TCP listeners.
+
+/// Best-effort rename so the forward helper shows up as `redns<suffix>`
+/// (e.g. `redns-direct`) in `ps`/`top` rather than a second `redns`.
+fn set_process_name(name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        // PR_SET_NAME updates /proc/self/comm (truncated to 15 chars).
+        let Ok(cname) = std::ffi::CString::new(name) else {
+            return;
+        };
+        let ret = unsafe {
+            libc::prctl(libc::PR_SET_NAME, cname.as_ptr() as libc::c_ulong, 0, 0, 0)
+        };
+        if ret != 0 {
+            warn!(
+                name = %name,
+                error = %std::io::Error::last_os_error(),
+                "failed to set process name"
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // pthread_setname_np names the calling thread; visible in some tools.
+        let Ok(cname) = std::ffi::CString::new(name) else {
+            return;
+        };
+        let ret = unsafe { libc::pthread_setname_np(cname.as_ptr()) };
+        if ret != 0 {
+            warn!(
+                name = %name,
+                error = %std::io::Error::last_os_error(),
+                "failed to set process name"
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        debug!(name = %name, "process rename not supported on this platform");
+    }
+}
+
+/// Returns true if a process with the given PID exists.
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    // kill(pid, 0) probes existence without delivering a signal.
+    let ret = unsafe { libc::kill(pid, 0) };
+    if ret == 0 {
+        return true;
+    }
+    // EPERM means the process exists but belongs to another user.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: i32) -> bool {
+    true
+}
+
+/// Serves DNS queries over a Unix domain socket in forward-helper mode.
+///
+/// The forward plugin's `SubprocessUpstream` is the client: it opens a
+/// connection per query, writes a 2-byte big-endian length followed by the
+/// query wire, and reads a length-prefixed response wire (the same framing as
+/// TCP DNS). Runs until the cancellation token fires.
+async fn serve_forward_subprocess(
+    socket_path: &str,
+    handler: Arc<dyn DnsHandler>,
+    cancel: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Remove a stale socket left by a crashed run. Socket paths embed the
+    // parent PID, so this can never clobber a live helper.
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|e| format!("forward subprocess: failed to bind '{socket_path}': {e}"))?;
+    info!(socket = %socket_path, "forward subprocess listening");
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _peer) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "forward subprocess: accept failed");
+                        continue;
+                    }
+                };
+                let handler = handler.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_forward_subprocess_conn(stream, handler, cancel).await
+                    {
+                        debug!(error = %e, "forward subprocess: connection error");
+                    }
+                });
+            }
+            _ = cancel.cancelled() => {
+                debug!("forward subprocess shutting down");
+                break;
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(socket_path);
+    Ok(())
+}
+
+/// Serves one Unix socket connection: length-prefixed query in, response out.
+async fn handle_forward_subprocess_conn(
+    mut stream: tokio::net::UnixStream,
+    handler: Arc<dyn DnsHandler>,
+    cancel: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The parent enforces its own exchange timeout, so this read timeout is
+    // only a guard against a stuck peer pinning the task forever.
+    const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let mut len_buf = [0u8; 2];
+        match tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return Ok(()), // EOF or timeout — connection finished.
+        }
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+        if msg_len == 0 {
+            return Ok(());
+        }
+
+        let mut msg_buf = vec![0u8; msg_len];
+        match tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut msg_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return Ok(()),
+        }
+
+        let query = match Message::from_vec(&msg_buf) {
+            Ok(q) => q,
+            Err(e) => {
+                debug!(error = %e, "forward subprocess: invalid DNS query");
+                return Ok(());
+            }
+        };
+
+        let meta = QueryMeta {
+            protocol: Some("unix".to_string()),
+            from_udp: false,
+            client_addr: None,
+            url_path: None,
+            server_name: None,
+            selected_upstreams: None,
+            query_wire: Some(Arc::new(msg_buf)),
+        };
+
+        let resp_bytes = handler.handle_tcp(query, meta).await?;
+        let len = (resp_bytes.len() as u16).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&resp_bytes).await?;
     }
 }
 

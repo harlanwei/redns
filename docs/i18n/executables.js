@@ -13,7 +13,7 @@ rednsI18nAdd({
       "p.bootstrap.d": "用于解析上游主机名的 DNS 服务器（适用于 DoH/DoT）。",
       "p.pool_max_idle.d": "单个上游的空闲连接/套接字池上限。也可在 forward 层设置一次，应用于所有上游。",
       "p.concurrent.d": "同时查询的上游数量；延迟最低的最佳响应胜出。与延迟感知的选择机制配合。",
-      "p.subprocess_suffix.d": "通过 Unix 套接字使用 DNS 的外部进程上游的后缀——面向自定义解析器的高级集成点。",
+      "p.subprocess_suffix.d": "外部进程上游的后缀：forward 插件会再启动一份当前 redns 可执行文件作为子进程，子进程以 <code>redns&lt;suffix&gt;</code>（如 <code>redns-direct</code>）为进程名，通过 Unix 套接字监听，并按相同配置的链解析查询；主进程通过该套接字把本 forward 的查询委托给它。需要同时配置 <code>upstreams</code>，供子进程直接使用。",
       "s.details.li1": "上游按 EMA 延迟和连续错误数评分；健康、快速的上游优先。",
       "s.details.li2": "启动时会探测 DoT 流水线（RFC 7766）支持，让查询共享一条 TLS 连接。",
       "s.details.li3": "带 TC 标志的 UDP 响应会自动改走 TCP 重试。",
