@@ -927,26 +927,6 @@ fn configure_upstream_socket(sock: &socket2::SockRef<'_>) {
     let _ = sock.set_tcp_nodelay(true);
 
     let keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
-    // KEEPINTVL/KEEPCNT are not settable on every platform socket2 targets
-    // (e.g. OpenBSD); degrade to kernel defaults there.
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "visionos",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "cygwin",
-        target_os = "windows",
-        target_os = "nuttx",
-    ))]
     let keepalive = keepalive
         .with_interval(TCP_KEEPALIVE_INTERVAL)
         .with_retries(TCP_KEEPALIVE_RETRIES);
