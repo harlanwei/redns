@@ -1372,6 +1372,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde-saphyr",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-util",

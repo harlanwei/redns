@@ -897,18 +897,90 @@ impl Upstream for PipelinedTlsUpstream {
 
 // ── Shared TCP/TLS helpers ──────────────────────────────────────
 
-/// Connect to a TCP address with timeout.
+/// Idle time before the first TCP keepalive probe is sent on an upstream
+/// connection.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+/// Interval between keepalive probes once the idle time has elapsed.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Unacknowledged probes before the kernel declares the connection dead.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+/// Maximum time transmitted data may remain unacknowledged before the kernel
+/// aborts the connection (Linux `TCP_USER_TIMEOUT`, RFC 5482). Also bounds how
+/// long an unacknowledged keepalive probe can delay death detection.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Configure an outbound upstream TCP socket for kernel-level death detection.
+///
+/// A connection silently dropped by a NAT/firewall mid-path produces no RST:
+/// writes appear to succeed (the kernel buffers them) while reads block until
+/// the exchange timeout, and the pool keeps handing out the dead socket.
+/// Aggressive keepalive probes plus TCP_USER_TIMEOUT make the kernel surface
+/// the death in seconds instead of minutes, so the reader task errors out and
+/// the pool drops the socket. Worst case, an idle dead connection is detected
+/// in ~15s + retries × interval; a connection with unacknowledged in-flight
+/// data in ~TCP_USER_TIMEOUT.
+///
+/// Option failures are non-fatal: the connection still works, just with the
+/// kernel's default (much slower) liveness detection.
+fn configure_upstream_socket(sock: &socket2::SockRef<'_>) {
+    let _ = sock.set_tcp_nodelay(true);
+
+    let keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    // KEEPINTVL/KEEPCNT are not settable on every platform socket2 targets
+    // (e.g. OpenBSD); degrade to kernel defaults there.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "cygwin",
+        target_os = "windows",
+        target_os = "nuttx",
+    ))]
+    let keepalive = keepalive
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    let _ = sock.set_tcp_keepalive(&keepalive);
+
+    // TCP_USER_TIMEOUT only exists on Linux-family targets; macOS degrades to
+    // keepalive-only detection.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = sock.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
+
+    // tokio's from_std requires non-blocking mode; keep the invariant explicit.
+    let _ = sock.set_nonblocking(true);
+}
+
+/// Connect to a TCP address with timeout, configured for fast death detection.
 async fn tcp_connect(addr: SocketAddr, timeout: Duration) -> PluginResult<TcpStream> {
     let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
             "tcp connect timed out".into()
         })?
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("tcp connect: {e}").into()
-        })?;
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+        .map_err(tcp_io_error)?;
+
+    // Socket options live below tokio's API surface; apply them on the raw fd
+    // before handing the stream back. On unix `into_std` preserves the
+    // non-blocking mode tokio set, which `from_std` requires.
+    let std_stream = stream.into_std().map_err(tcp_io_error)?;
+    configure_upstream_socket(&socket2::SockRef::from(&std_stream));
+    TcpStream::from_std(std_stream).map_err(tcp_io_error)
+}
+
+/// Map an io error into the plugin error type with connect context.
+fn tcp_io_error(e: std::io::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    format!("tcp connect: {e}").into()
 }
 
 /// Exchange a DNS query over any length-prefixed byte stream (TCP or TLS).
@@ -2516,6 +2588,27 @@ mod tests {
     fn parse_bare_addr_defaults_udp() {
         let u = new_upstream("8.8.8.8:53", UpstreamOpts::default());
         assert!(u.is_ok());
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_configures_liveness_socket_options() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Keep the accepted side alive while we inspect our socket.
+        let accept = tokio::task::spawn_blocking(move || {
+            let (_stream, _peer) = listener.accept().unwrap();
+        });
+
+        let stream = tcp_connect(addr, Duration::from_secs(5)).await.unwrap();
+        let sock = socket2::SockRef::from(&stream);
+
+        assert!(stream.nodelay().unwrap());
+        assert!(sock.keepalive().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(TCP_USER_TIMEOUT));
+
+        accept.await.unwrap();
     }
 
     #[test]

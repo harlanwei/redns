@@ -23,6 +23,9 @@ http = "1.4.0"
 bytes = "1.11.1"
 parking_lot = "0.12"
 libc = "0.2"
+# Outbound upstream sockets use socket2 for TCP keepalive / TCP_USER_TIMEOUT
+# ("all" enables set_tcp_user_timeout on Linux).
+socket2 = { version = "0.6", features = ["all"] }
 
 # io_uring support for UDP server (Linux-only)
 [target.'cfg(target_os = "linux")'.dependencies]
