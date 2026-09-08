@@ -1,5 +1,14 @@
 export type TabId = 'logs' | 'clients' | 'cache' | 'upstreams';
 
+/** Log-history window selectable in the UI (hash-router `range` param). */
+export type TimeRange = '1m' | '5m' | '1h' | 'all';
+
+/** Visual style of a toast notification. */
+export type ToastKind = 'success' | 'danger' | 'info';
+
+/** Columns of the log table that can be toggled. */
+export type LogColumnId = 'age' | 'client' | 'query' | 'rcode' | 'ttl' | 'latency';
+
 export type DnsLogEntry = {
   id: number;
   ts_unix_ms: number;

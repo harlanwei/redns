@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -37,8 +37,13 @@ pub const DEFAULT_DUMP_INTERVAL: Duration = Duration::from_secs(300);
 const SHARDING_MIN_CAPACITY: usize = 4096;
 
 /// File persistence magic header and version.
+///
+/// Version 2 extends each entry with the full [`CacheKey`] view fields
+/// (QCLASS, RD/CD/AD/DO bits, EDNS-options hash). Version 1 files are
+/// rejected: their keys cannot be reconstructed safely, so entries from an
+/// older version must not be served under a version-2 key.
 const FILE_MAGIC: &[u8; 10] = b"REDNSCACHE";
-const FILE_VERSION: u8 = 1;
+const FILE_VERSION: u8 = 2;
 
 /// Configuration for cache file persistence.
 #[derive(Debug, Clone)]
@@ -74,16 +79,38 @@ struct CachedEntry {
     original_ttl: u32,
 }
 
-/// Cache key: lowercased QNAME + QTYPE.
+/// Query-view bits packed into [`CacheKey`]. Answers can differ on all of
+/// these, so they partition the cache.
+const VIEW_RD: u8 = 1 << 0;
+const VIEW_CD: u8 = 1 << 1;
+const VIEW_AD: u8 = 1 << 2;
+const VIEW_DO: u8 = 1 << 3;
+
+/// Cache key: everything the response depends on beyond the passage of time —
+/// lowercased QNAME + QTYPE + QCLASS, the request view (RD/CD/AD header flags
+/// and the DNSSEC-OK bit) and a hash of the logical query's EDNS options (e.g.
+/// an ECS option injected per client by `ecs_handler`).
+///
+/// Partitioning by CD/DO matters most: a validating upstream's CD=1 answer is
+/// *unchecked* and must never be served to a CD=0 client (which the upstream
+/// would have answered with SERVFAIL), and a DO=1 answer carries DNSSEC
+/// records a DO=0 answer lacks.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct CacheKey {
     qname: String,
     qtype: RecordType,
+    qclass: hickory_proto::rr::DNSClass,
+    view: u8,
+    options_hash: u64,
 }
 
 impl fmt::Display for CacheKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.qname, self.qtype)
+        write!(
+            f,
+            "{}:{}:class={:?}:view={:#x}:opts={:#x}",
+            self.qname, self.qtype, self.qclass, self.view, self.options_hash
+        )
     }
 }
 
@@ -104,15 +131,42 @@ impl CachedEntry {
     }
 }
 
-/// Build the cache key from DNS question data.
+/// Build the cache key from DNS question data and the request's query view.
 fn cache_key(ctx: &Context) -> Option<CacheKey> {
-    ctx.question().map(|q| {
-        let mut qname = q.name().to_ascii();
-        qname.make_ascii_lowercase();
-        CacheKey {
-            qname,
-            qtype: q.query_type(),
-        }
+    let q = ctx.question()?;
+    let query = ctx.query();
+    let mut qname = q.name().to_ascii();
+    qname.make_ascii_lowercase();
+
+    let mut view = 0u8;
+    if query.metadata.recursion_desired {
+        view |= VIEW_RD;
+    }
+    if query.metadata.checking_disabled {
+        view |= VIEW_CD;
+    }
+    if query.metadata.authentic_data {
+        view |= VIEW_AD;
+    }
+    if query.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok) {
+        view |= VIEW_DO;
+    }
+
+    // Hash the logical query's EDNS options (stable SipHash with fixed keys).
+    // Deterministic across runs so persisted keys stay valid; a hash change
+    // across toolchains only orphans persisted entries, never mis-hits.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Some(edns) = &query.edns {
+        edns.options().options.hash(&mut hasher);
+    }
+
+    Some(CacheKey {
+        qname,
+        qtype: q.query_type(),
+        qclass: q.query_class(),
+        view,
+        options_hash: hasher.finish(),
     })
 }
 
@@ -237,20 +291,81 @@ pub struct Cache {
 struct CacheInner {
     id: usize,
     shard_count: usize,
-    shards: Vec<Mutex<QuickCache<CacheKey, CachedEntry>>>,
+    shards: Vec<QuickCache<CacheKey, CachedEntry>>,
     shard_hasher: ahash::RandomState,
     /// Deduplicates background lazy refreshes for the same key.
     inflight_refreshes: Mutex<HashSet<CacheKey>>,
     /// Coalesces concurrent cache misses so only one query fetches upstream.
-    inflight_misses: Mutex<ahash::HashMap<CacheKey, Arc<Notify>>>,
+    inflight_misses: Mutex<ahash::HashMap<CacheKey, Arc<MissState>>>,
     lazy_ttl: Duration,
-    /// Captured downstream chain + server metadata for background refreshes.
-    /// Set once on first `exec_recursive` call.
-    refresh_chain: Mutex<Option<(ChainWalker, redns_core::context::ServerMeta)>>,
     /// Total cache hits (fresh + stale).
     hit_total: AtomicU64,
     /// Total cache misses.
     miss_total: AtomicU64,
+}
+
+/// The completed outcome of a miss leader, shared with its followers.
+#[derive(Clone)]
+enum SharedOutcome {
+    /// A response the leader produced — including ones inadmissible for
+    /// persistent caching (TTL zero, REFUSED, TC=1) — so a burst of concurrent
+    /// queries for such a name does not degenerate into a serial fetch queue.
+    Response {
+        resp_wire: Arc<Vec<u8>>,
+        ttl_offsets: Arc<[usize]>,
+        ttl: u32,
+    },
+    /// The leader's chain failed; followers share the failure instead of each
+    /// repeating it upstream.
+    Error(String),
+}
+
+/// Shared between a miss leader and its followers.
+struct MissState {
+    /// Clone source for follower receivers. Completion is signalled by the
+    /// leader's sender being dropped (closing the channel and failing every
+    /// `changed()`), which happens on all leader exit paths.
+    completion: watch::Receiver<()>,
+    outcome: Mutex<Option<SharedOutcome>>,
+}
+
+/// What a follower waits on: the leader's watch channel (closed on every exit
+/// path, including cancellation) plus the shared outcome slot.
+struct MissFollower {
+    receiver: watch::Receiver<()>,
+    state: Arc<MissState>,
+}
+
+impl MissFollower {
+    fn take_outcome(&self) -> Option<SharedOutcome> {
+        self.state.outcome.lock().clone()
+    }
+}
+
+/// Closing the channel wakes followers even if they haven't started waiting yet.
+/// Drop also runs when a leader is cancelled or its downstream chain panics.
+struct MissGuard<'a> {
+    inner: &'a CacheInner,
+    key: &'a CacheKey,
+    state: Arc<MissState>,
+    _completion: watch::Sender<()>,
+}
+
+impl Drop for MissGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.inflight_misses.lock().remove(self.key);
+    }
+}
+
+struct RefreshGuard {
+    inner: Arc<CacheInner>,
+    key: CacheKey,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.inner.inflight_refreshes.lock().remove(&self.key);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -290,7 +405,7 @@ impl Cache {
         let shard_cap = std::cmp::max(1, cap.div_ceil(shard_count));
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Mutex::new(QuickCache::new(shard_cap)));
+            shards.push(QuickCache::new(shard_cap));
         }
 
         let id = CACHE_ID.fetch_add(1, Ordering::Relaxed);
@@ -303,7 +418,6 @@ impl Cache {
             inflight_refreshes: Mutex::new(HashSet::new()),
             inflight_misses: Mutex::new(ahash::HashMap::default()),
             lazy_ttl,
-            refresh_chain: Mutex::new(None),
             hit_total: AtomicU64::new(0),
             miss_total: AtomicU64::new(0),
         });
@@ -356,9 +470,31 @@ impl Cache {
         Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL, None)
     }
 
-    fn get_shard(&self, key: &CacheKey) -> &Mutex<QuickCache<CacheKey, CachedEntry>> {
+    fn get_shard(&self, key: &CacheKey) -> &QuickCache<CacheKey, CachedEntry> {
         let hash = self.inner.shard_hasher.hash_one(key);
         &self.inner.shards[(hash as usize) % self.inner.shard_count]
+    }
+
+    fn register_miss<'a>(&'a self, key: &'a CacheKey) -> Result<MissGuard<'a>, MissFollower> {
+        let mut inflight = self.inner.inflight_misses.lock();
+        if let Some(state) = inflight.get(key) {
+            return Err(MissFollower {
+                receiver: state.completion.clone(),
+                state: state.clone(),
+            });
+        }
+        let (completion, receiver) = watch::channel(());
+        let state = Arc::new(MissState {
+            completion: receiver,
+            outcome: Mutex::new(None),
+        });
+        inflight.insert(key.clone(), state.clone());
+        Ok(MissGuard {
+            inner: &self.inner,
+            key,
+            state,
+            _completion: completion,
+        })
     }
 }
 
@@ -388,9 +524,8 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
         let mut shards = Vec::with_capacity(cache.shards.len());
 
         for (index, shard) in cache.shards.iter().enumerate() {
-            let store = shard.lock();
-            let entries = store.len();
-            let capacity = store.capacity() as usize;
+            let entries = shard.len();
+            let capacity = shard.capacity() as usize;
             total_entries += entries;
             total_capacity += capacity;
             shards.push(CacheShardSnapshot {
@@ -424,18 +559,11 @@ enum CacheLookup {
 impl Cache {
     /// Look up a key and build response wire for the current query ID.
     ///
-    /// The shard lock is held only long enough to clone the cheap `Arc`s and
-    /// read the TTL; the full wire clone and TTL patch happen after the guard
-    /// is dropped so concurrent lookups on the same shard are not serialized
-    /// behind response construction cost.
+    /// `quick_cache` releases its internal lock before returning the owned entry,
+    /// so cloning and patching the response don't serialize concurrent lookups.
     fn lookup_and_build(&self, key: &CacheKey, query_id: u16) -> CacheLookup {
-        // Captured under the lock: (wire, offsets, ttl, is_stale).
         let captured = {
-            let shard = self.get_shard(key);
-            let store = shard.lock();
-            // `quick_cache::get` returns an owned clone and bumps recency,
-            // so the `Arc`s are cheap to pull out of the shard lock.
-            match store.get(key) {
+            match self.get_shard(key).get(key) {
                 Some(entry) if !entry.is_expired() => {
                     let ttl = entry.remaining_ttl();
                     Some((entry.resp_wire, entry.ttl_offsets, ttl, false))
@@ -459,6 +587,21 @@ impl Cache {
             }
             None => CacheLookup::Miss,
         }
+    }
+
+    fn serve_cached(&self, key: &CacheKey, ctx: &mut Context, next: &ChainWalker) -> bool {
+        let (wire, stale) = match self.lookup_and_build(key, ctx.query().id) {
+            CacheLookup::Hit(wire) => (wire, false),
+            CacheLookup::Stale(wire) => (wire, true),
+            CacheLookup::Miss => return false,
+        };
+        self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
+        ctx.set_response_wire(Some(wire));
+        ctx.set_mark(MARK_CACHE_HIT);
+        if stale {
+            self.spawn_refresh_for_key(key, ctx, next.clone());
+        }
+        true
     }
 }
 
@@ -484,132 +627,121 @@ fn build_response_wire(
 #[async_trait]
 impl RecursiveExecutable for Cache {
     async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
-        // Capture the refresh chain on first call.
-        {
-            let mut chain_slot = self.inner.refresh_chain.lock();
-            if chain_slot.is_none() {
-                *chain_slot = Some((next.clone(), ctx.server_meta.clone()));
-            }
-        }
-
         let key = match cache_key(ctx) {
             Some(k) => k,
             None => return next.exec_next(ctx).await,
         };
 
         loop {
-            match self.lookup_and_build(&key, ctx.query().id) {
-                CacheLookup::Hit(wire) => {
-                    self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
-                    ctx.set_response_wire(Some(wire));
-                    ctx.set_mark(MARK_CACHE_HIT);
-                    return Ok(());
-                }
-                CacheLookup::Stale(wire) => {
-                    self.inner.hit_total.fetch_add(1, Ordering::Relaxed);
-                    ctx.set_response_wire(Some(wire));
-                    ctx.set_mark(MARK_CACHE_HIT);
-                    self.spawn_refresh_for_key(
-                        &key,
-                        ctx.query().clone(),
-                        ctx.server_meta.clone(),
-                        next.clone(),
-                    )
-                    .await;
-                    return Ok(());
-                }
-                CacheLookup::Miss => {}
+            if self.serve_cached(&key, ctx, &next) {
+                return Ok(());
             }
 
-            // Coalesce concurrent cache misses for the same key.
-            let notify = {
-                let mut inflight = self.inner.inflight_misses.lock();
-                if let Some(n) = inflight.get(&key) {
-                    Some(n.clone())
-                } else {
-                    inflight.insert(key.clone(), Arc::new(Notify::new()));
-                    None
+            let _leader = match self.register_miss(&key) {
+                Ok(leader) => leader,
+                Err(mut follower) => {
+                    // The leader closes the channel on every exit path. Closure
+                    // is remembered, unlike a Notify::notify_waiters wakeup.
+                    let _ = follower.receiver.changed().await;
+                    match follower.take_outcome() {
+                        Some(SharedOutcome::Response {
+                            resp_wire,
+                            ttl_offsets,
+                            ttl,
+                        }) => {
+                            // Adopt the leader's response even though it was
+                            // not eligible for persistent caching (TTL zero,
+                            // REFUSED, TC=1). Without this, every follower
+                            // would become the next leader and repeat the
+                            // upstream fetch serially.
+                            if let Some(wire) =
+                                build_response_wire(&resp_wire, &ttl_offsets, ctx.query().id, ttl)
+                            {
+                                ctx.set_response_wire(Some(wire));
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Some(SharedOutcome::Error(e)) => return Err(e.into()),
+                        // Leader was cancelled before producing anything:
+                        // retry (this task may become the next leader).
+                        None => continue,
+                    }
                 }
             };
 
-            if let Some(notify) = notify {
-                notify.notified().await;
-                // Another query populated the cache (or failed). Retry lookup.
-                continue;
+            // A previous leader may have populated the cache between our first
+            // lookup and registration. Don't launch a duplicate upstream fetch.
+            if self.serve_cached(&key, ctx, &next) {
+                return Ok(());
             }
 
-            // We are the leader for this key.
             self.inner.miss_total.fetch_add(1, Ordering::Relaxed);
             let result = next.exec_next(ctx).await;
-
-            // Always store (when possible) and always notify waiters, even on
-            // error, so waiters do not hang forever.
-            self.store(&key, ctx);
-
-            let notify = {
-                let mut inflight = self.inner.inflight_misses.lock();
-                inflight.remove(&key)
-            };
-            if let Some(notify) = notify {
-                notify.notify_waiters();
+            match &result {
+                Ok(()) => {
+                    // Publish the response for followers even when it is not
+                    // admissible for persistent caching.
+                    if let Some(shared) = self.store(&key, ctx) {
+                        *_leader.state.outcome.lock() = Some(shared);
+                    }
+                }
+                Err(e) => {
+                    *_leader.state.outcome.lock() = Some(SharedOutcome::Error(e.to_string()));
+                }
             }
-
             return result;
         }
     }
 }
 
 impl Cache {
-    fn store(&self, key: &CacheKey, ctx: &Context) {
+    /// Admit a response into the cache when eligible, and return it as a
+    /// shareable outcome for miss followers either way.
+    ///
+    /// Never cached:
+    /// - REFUSED — a transient upstream signal (rate limiting, policy, etc.);
+    /// - TC=1 — a truncated message is incomplete; caching one would poison
+    ///   later TCP-retry queries with an empty answer;
+    /// - minimum TTL of zero — would expire instantly anyway.
+    fn store(&self, key: &CacheKey, ctx: &Context) -> Option<SharedOutcome> {
         use hickory_proto::op::ResponseCode;
 
-        if let Some(resp) = ctx.response() {
-            let rcode = resp.response_code;
+        let resp = ctx.response()?;
+        let rcode = resp.response_code;
 
-            // Never cache REFUSED — it's a transient upstream signal (rate
-            // limiting, policy, etc.) and should not poison the cache.
-            if rcode == ResponseCode::Refused {
-                return;
-            }
+        let mut ttl = min_ttl(resp);
+        if rcode == ResponseCode::NXDomain {
+            ttl = ttl.min(30);
+        } else if rcode == ResponseCode::ServFail {
+            ttl = ttl.min(5);
+        }
 
-            let mut ttl = min_ttl(resp);
-            if rcode == ResponseCode::NXDomain {
-                ttl = ttl.min(30);
-            } else if rcode == ResponseCode::ServFail {
-                ttl = ttl.min(5);
-            }
+        let cacheable = rcode != ResponseCode::Refused && !resp.metadata.truncation && ttl != 0;
 
-            if ttl == 0 {
-                return;
-            }
+        let (wire, offsets) = build_stored_wire(resp, ttl)?;
 
-            let Some((wire, offsets)) = build_stored_wire(resp, ttl) else {
-                return;
-            };
-
-            let shard = self.get_shard(key);
-            let store = shard.lock();
-
-            store.insert(
+        if cacheable {
+            self.get_shard(key).insert(
                 key.clone(),
                 CachedEntry {
-                    resp_wire: Arc::new(wire),
-                    ttl_offsets: offsets.into(),
+                    resp_wire: Arc::new(wire.clone()),
+                    ttl_offsets: offsets.clone().into(),
                     stored_at: Instant::now(),
                     original_ttl: ttl,
                 },
             );
         }
+
+        Some(SharedOutcome::Response {
+            resp_wire: Arc::new(wire),
+            ttl_offsets: offsets.into(),
+            ttl,
+        })
     }
 
     /// Spawn a background refresh for a specific key, deduplicating via inflight_refreshes.
-    async fn spawn_refresh_for_key(
-        &self,
-        key: &CacheKey,
-        query: Message,
-        server_meta: redns_core::context::ServerMeta,
-        mut chain: ChainWalker,
-    ) {
+    fn spawn_refresh_for_key(&self, key: &CacheKey, parent: &Context, mut chain: ChainWalker) {
         let mut inflight = self.inner.inflight_refreshes.lock();
         let should_spawn = inflight.insert(key.clone());
         drop(inflight);
@@ -618,16 +750,19 @@ impl Cache {
             return;
         }
 
-        let mut refresh_ctx = Context::new(query);
-        refresh_ctx.server_meta = server_meta;
+        // Fork (don't rebuild) so the refresh query keeps the parent's
+        // already-normalized logical query, EDNS options and request settings.
+        let mut refresh_ctx = Context::fork_from(parent);
         let cache_clone = self.clone();
-        let refresh_key = key.clone();
+        let guard = RefreshGuard {
+            inner: self.inner.clone(),
+            key: key.clone(),
+        };
         tokio::spawn(async move {
-            let _ = chain.exec_next(&mut refresh_ctx).await;
-            cache_clone.store(&refresh_key, &refresh_ctx);
-
-            let mut inflight = cache_clone.inner.inflight_refreshes.lock();
-            inflight.remove(&refresh_key);
+            let refresh = guard;
+            if chain.exec_next(&mut refresh_ctx).await.is_ok() {
+                cache_clone.store(&refresh.key, &refresh_ctx);
+            }
         });
     }
 
@@ -645,10 +780,9 @@ impl Cache {
         let mut count: usize = 0;
 
         for shard in &self.inner.shards {
-            let store = shard.lock();
             // `quick_cache::iter` yields owned clones, so `key`/`entry` can be
             // used without holding references into the shard.
-            for (key, entry) in store.iter() {
+            for (key, entry) in shard.iter() {
                 let remaining = entry.remaining_ttl();
                 if remaining == 0 {
                     continue;
@@ -661,6 +795,9 @@ impl Cache {
                 entries_buf.write_all(&(qname_bytes.len() as u16).to_be_bytes())?;
                 entries_buf.write_all(qname_bytes)?;
                 entries_buf.write_all(&u16::from(key.qtype).to_be_bytes())?;
+                entries_buf.write_all(&u16::from(key.qclass).to_be_bytes())?;
+                entries_buf.write_all(&[key.view])?;
+                entries_buf.write_all(&key.options_hash.to_be_bytes())?;
                 entries_buf.write_all(&remaining.to_be_bytes())?;
 
                 let msg_wire = entry.resp_wire.as_slice();
@@ -772,6 +909,25 @@ impl Cache {
             let qtype_u16 = u16::from_be_bytes([data[pos], data[pos + 1]]);
             pos += 2;
 
+            if pos + 2 + 1 + 8 + 4 > data.len() {
+                break;
+            }
+            let qclass_u16 = u16::from_be_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            let view = data[pos];
+            pos += 1;
+            let options_hash = u64::from_be_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]);
+            pos += 8;
+
             if pos + 4 > data.len() {
                 break;
             }
@@ -806,6 +962,9 @@ impl Cache {
             let key = CacheKey {
                 qname,
                 qtype: RecordType::from(qtype_u16),
+                qclass: hickory_proto::rr::DNSClass::from(qclass_u16),
+                view,
+                options_hash,
             };
 
             // Normalize the loaded wire so all record TTLs equal the remaining
@@ -814,9 +973,7 @@ impl Cache {
             let offsets = extract_ttl_offsets(&wire);
             set_ttl_in_wire(&mut wire, &offsets, effective_remaining);
 
-            let shard = self.get_shard(&key);
-            let store = shard.lock();
-            store.insert(
+            self.get_shard(&key).insert(
                 key,
                 CachedEntry {
                     resp_wire: Arc::new(wire),
@@ -897,6 +1054,122 @@ mod tests {
         msg
     }
 
+    struct PendingFirstResponder(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Executable for PendingFirstResponder {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            if self.0.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                std::future::pending::<()>().await;
+            }
+            RespondWithTtl(60).exec(ctx).await
+        }
+    }
+
+    fn poll_pending(future: std::pin::Pin<&mut impl std::future::Future>) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut cx).is_pending());
+    }
+
+    #[tokio::test]
+    async fn cancelled_miss_wakes_waiters_and_allows_retry() {
+        let cache = Cache::new(128, Duration::ZERO, None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seq = Sequence::new(vec![
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(cache.clone())),
+            },
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(PendingFirstResponder(calls.clone()))),
+            },
+        ]);
+        let mut leader_ctx = Context::new(make_query());
+        let mut waiter_ctx = Context::new(make_query());
+        let mut leader = Box::pin(seq.exec(&mut leader_ctx));
+        poll_pending(leader.as_mut());
+        let mut waiter = Box::pin(seq.exec(&mut waiter_ctx));
+        poll_pending(waiter.as_mut());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        drop(leader);
+        assert!(cache.inner.inflight_misses.lock().is_empty());
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled leader must wake its waiter")
+            .unwrap();
+        assert!(waiter_ctx.has_response_output());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+
+        let mut cached_ctx = Context::new(make_query());
+        seq.exec(&mut cached_ctx).await.unwrap();
+        assert!(cached_ctx.has_mark(MARK_CACHE_HIT));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn completion_before_wait_is_not_lost() {
+        let cache = Cache::default_cache();
+        let ctx = Context::new(make_query());
+        let key = cache_key(&ctx).unwrap();
+        let leader = cache.register_miss(&key).ok().unwrap();
+        let mut waiter = cache.register_miss(&key).err().unwrap();
+
+        // Complete before the follower even constructs its waiting future.
+        drop(leader);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter.receiver.changed())
+                .await
+                .expect("completion must be remembered")
+                .is_err()
+        );
+        assert!(cache.register_miss(&key).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_miss_does_not_cache_partial_response_or_keep_leader() {
+        struct FailAfterResponse;
+        #[async_trait]
+        impl Executable for FailAfterResponse {
+            async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+                RespondWithTtl(60).exec(ctx).await?;
+                Err("downstream failed".into())
+            }
+        }
+        let cache = Cache::default_cache();
+        let mut ctx = Context::new(make_query());
+        let key = cache_key(&ctx).unwrap();
+        let next = ChainWalker::new(vec![ChainNode {
+            matchers: vec![],
+            executor: NodeExecutor::Simple(Box::new(FailAfterResponse)),
+        }].into(), None);
+        assert!(cache.exec_recursive(&mut ctx, next).await.is_err());
+        assert!(cache.inner.inflight_misses.lock().is_empty());
+        assert!(matches!(cache.lookup_and_build(&key, 1), CacheLookup::Miss));
+    }
+
+    #[tokio::test]
+    async fn executed_cache_does_not_retain_its_chain() {
+        let weak;
+        {
+            let cache = Cache::default_cache();
+            weak = Arc::downgrade(&cache.inner);
+            let seq = Sequence::new(vec![
+                ChainNode {
+                    matchers: vec![],
+                    executor: NodeExecutor::Recursive(Box::new(cache)),
+                },
+                ChainNode {
+                    matchers: vec![],
+                    executor: NodeExecutor::Simple(Box::new(RespondWithTtl(60))),
+                },
+            ]);
+            seq.exec(&mut Context::new(make_query())).await.unwrap();
+        }
+        assert!(weak.upgrade().is_none(), "cache must not form a cycle with its chain");
+    }
+
     #[tokio::test]
     async fn cache_miss_then_hit() {
         let cache = Cache::new(100, Duration::from_secs(30), None);
@@ -929,58 +1202,37 @@ mod tests {
         }
     }
 
+    fn plain_key(qname: &str) -> CacheKey {
+        CacheKey {
+            qname: qname.to_string(),
+            qtype: RecordType::A,
+            qclass: hickory_proto::rr::DNSClass::IN,
+            view: 0,
+            options_hash: 0,
+        }
+    }
+
     #[tokio::test]
     async fn eviction_bounds_capacity() {
         let cache = Cache::new(2, Duration::from_secs(30), None);
 
         // Simulate 4 different cache entries via the store directly.
         {
-            let shard_key = CacheKey {
-                qname: "key".to_string(),
-                qtype: RecordType::A,
-            };
-            let shard = cache.get_shard(&shard_key);
-            let store = shard.lock();
+            let shard_key = plain_key("key");
+            let store = cache.get_shard(&shard_key);
             for i in 0..4 {
-                store.insert(
-                    CacheKey {
-                        qname: format!("key{i}"),
-                        qtype: RecordType::A,
-                    },
-                    empty_entry(300),
-                );
+                store.insert(plain_key(&format!("key{i}")), empty_entry(300));
             }
             // Sharding is disabled for small caches, so capacity stays exact:
             // 4 inserts into a 2-entry cache leave only 2 resident.
             assert_eq!(store.len(), 2);
             // The most recently inserted entry is always resident.
-            assert!(
-                store
-                    .get(&CacheKey {
-                        qname: "key3".to_string(),
-                        qtype: RecordType::A,
-                    })
-                    .is_some()
-            );
+            assert!(store.get(&plain_key("key3")).is_some());
             // key0 was admitted into the hot segment on first insert and is
             // never scanned for eviction by later inserts, so it survives
             // while the cold entries (key1, key2) fall out one by one.
-            assert!(
-                store
-                    .get(&CacheKey {
-                        qname: "key0".to_string(),
-                        qtype: RecordType::A,
-                    })
-                    .is_some()
-            );
-            assert!(
-                store
-                    .get(&CacheKey {
-                        qname: "key1".to_string(),
-                        qtype: RecordType::A,
-                    })
-                    .is_none()
-            );
+            assert!(store.get(&plain_key("key0")).is_some());
+            assert!(store.get(&plain_key("key1")).is_none());
         }
     }
 
@@ -1077,5 +1329,230 @@ mod tests {
     fn enables_sharding_at_threshold() {
         let cache = Cache::new(4096, Duration::from_secs(30), None);
         assert_eq!(cache.inner.shard_count, host_parallelism().min(4096));
+    }
+
+    // ── Request-view partitioning ─────────────────────────────────
+
+    fn query_with_view(cd: bool, dnssec_ok: bool) -> Message {
+        let mut msg = make_query();
+        msg.metadata.checking_disabled = cd;
+        if dnssec_ok {
+            let mut edns = hickory_proto::op::Edns::new();
+            edns.set_dnssec_ok(true);
+            msg.set_edns(edns);
+        }
+        msg
+    }
+
+    /// A CD=1 answer (unchecked at a validating upstream) must never be
+    /// served to a CD=0 client: the two request views get different keys, so
+    /// the CD=0 query cannot adopt the CD=1 entry and fetches separately.
+    #[tokio::test]
+    async fn cache_partitions_cd_and_do_views() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Cache::new(128, Duration::from_secs(30), None);
+        let seq = Sequence::new(vec![
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(cache)),
+            },
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
+                    ttl: 60,
+                    calls: Arc::clone(&calls),
+                    delay: Duration::ZERO,
+                })),
+            },
+        ]);
+
+        // Warm the cache with a CD=1, DO=1 request.
+        let mut ctx_cd = Context::new(query_with_view(true, true));
+        seq.exec(&mut ctx_cd).await.unwrap();
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+
+        // Same qname/qtype but CD=0, DO=0: must NOT hit the CD=1 entry.
+        let mut ctx_plain = Context::new(query_with_view(false, false));
+        seq.exec(&mut ctx_plain).await.unwrap();
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            2,
+            "CD=0 client must not receive the CD=1 answer"
+        );
+
+        // The CD=1, DO=1 view itself still hits its own entry.
+        let mut ctx_cd2 = Context::new(query_with_view(true, true));
+        seq.exec(&mut ctx_cd2).await.unwrap();
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
+        assert!(ctx_cd2.has_mark(MARK_CACHE_HIT));
+    }
+
+    /// Different QCLASS and different EDNS options (e.g. per-client ECS
+    /// injected by `ecs_handler`) must also produce distinct keys.
+    #[tokio::test]
+    async fn cache_partitions_class_and_edns_options() {
+        use hickory_proto::rr::DNSClass;
+
+        let mut q_ch = make_query();
+        q_ch.queries[0].set_query_class(DNSClass::CH);
+
+        let base = Context::new(make_query());
+        let mut with_ecs = Context::new(make_query());
+        {
+            let q = with_ecs.query_mut();
+            q.edns.as_mut().unwrap().options_mut().options.push((
+                hickory_proto::rr::rdata::opt::EdnsCode::Unknown(8),
+                hickory_proto::rr::rdata::opt::EdnsOption::Unknown(8, vec![1, 2, 3, 4]),
+            ));
+        }
+
+        let key_base = cache_key(&base).unwrap();
+        let key_ecs = cache_key(&with_ecs).unwrap();
+        let key_ch = {
+            let ctx = Context::new(q_ch);
+            cache_key(&ctx).unwrap()
+        };
+
+        assert_ne!(key_base, key_ecs, "ECS options must partition the cache");
+        assert_ne!(key_base, key_ch, "QCLASS must partition the cache");
+        assert_eq!(key_base, cache_key(&Context::new(make_query())).unwrap());
+    }
+
+    // ── Shared miss outcomes ──────────────────────────────────────
+
+    /// Followers must adopt a leader's completed outcome even when it is not
+    /// eligible for persistent caching (here: TTL zero). Otherwise every
+    /// follower becomes the next leader and the burst repeats the upstream
+    /// fetch serially.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uncachable_miss_outcome_is_shared_with_followers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Cache::new(128, Duration::ZERO, None);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let calls = Arc::clone(&calls);
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let seq = Sequence::new(vec![
+                    ChainNode {
+                        matchers: vec![],
+                        executor: NodeExecutor::Recursive(Box::new(cache)),
+                    },
+                    ChainNode {
+                        matchers: vec![],
+                        executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
+                            ttl: 0,
+                            calls,
+                            delay: Duration::from_millis(100),
+                        })),
+                    },
+                ]);
+                let mut ctx = Context::new(make_query());
+                seq.exec(&mut ctx).await.unwrap();
+                assert!(ctx.has_response_output());
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            1,
+            "TTL-zero response must be shared, not re-fetched per follower"
+        );
+    }
+
+    /// A leader's chain failure is likewise shared: followers fail fast
+    /// instead of repeating the upstream error one at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn error_outcome_is_shared_with_followers() {
+        struct FailAfterDelay(Duration);
+        #[async_trait]
+        impl Executable for FailAfterDelay {
+            async fn exec(&self, _ctx: &mut Context) -> PluginResult<()> {
+                tokio::time::sleep(self.0).await;
+                Err("upstream broken".into())
+            }
+        }
+
+        let cache = Cache::new(128, Duration::ZERO, None);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let seq = Sequence::new(vec![
+                    ChainNode {
+                        matchers: vec![],
+                        executor: NodeExecutor::Recursive(Box::new(cache)),
+                    },
+                    ChainNode {
+                        matchers: vec![],
+                        executor: NodeExecutor::Simple(Box::new(FailAfterDelay(
+                            Duration::from_millis(100),
+                        ))),
+                    },
+                ]);
+                let mut ctx = Context::new(make_query());
+                assert!(seq.exec(&mut ctx).await.is_err());
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // All eight shared one leader: the counting is implicit — an
+        // assert would need a counter inside the failing executor, so
+        // instead assert via miss_total (only leaders count misses).
+        assert_eq!(cache.inner.miss_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// TC=1 responses are never admitted to the cache: a later query must
+    /// not receive a cached truncated (empty) answer in place of fetching a
+    /// full one.
+    #[tokio::test]
+    async fn truncated_response_is_not_cached() {
+        struct TruncatedResponder(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Executable for TruncatedResponder {
+            async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                let q = ctx.question().unwrap().clone();
+                let mut resp = Message::response(ctx.query().id, OpCode::Query);
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.metadata.truncation = true;
+                resp.add_query(q);
+                ctx.set_response(Some(resp));
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Cache::new(128, Duration::from_secs(30), None);
+        let seq = Sequence::new(vec![
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(cache.clone())),
+            },
+            ChainNode {
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(TruncatedResponder(Arc::clone(&calls)))),
+            },
+        ]);
+
+        let mut first = Context::new(make_query());
+        seq.exec(&mut first).await.unwrap();
+        let mut second = Context::new(make_query());
+        seq.exec(&mut second).await.unwrap();
+
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            2,
+            "TC=1 response must not be cached; second query must re-fetch"
+        );
+
+        let key = cache_key(&Context::new(make_query())).unwrap();
+        assert!(matches!(cache.lookup_and_build(&key, 1), CacheLookup::Miss));
     }
 }

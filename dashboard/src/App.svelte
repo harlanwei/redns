@@ -8,9 +8,9 @@
   import type { TabId } from './lib/types/dashboard';
   import { route, navigate, initRouter } from './lib/utils/router.svelte';
 
+  let displayedTab = $state<TabId>(route.tab);
   const activeTab = $derived(displayedTab);
   const tabs: TabId[] = ['logs', 'clients', 'cache', 'upstreams'];
-  let displayedTab = $state<TabId>(route.tab);
   let contentVisible = $state(false);
   let animatedTab = $state<TabId | null>(null);
   let pendingTab = $state<TabId | null>(null);
@@ -31,7 +31,7 @@
     // Initial content stays completely hidden until Svelte has committed its
     // loaded state and the browser has had a chance to paint it.
     await tick();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     if (id === revealId && displayedTab === tab && pendingTab === null) {
       contentVisible = true;
     }
@@ -56,7 +56,7 @@
     // exposing the panel. The enter animation therefore never runs over a
     // skeleton or partially populated view.
     await tick();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     if (id !== transitionId || (!updateRoute && route.tab !== tab)) return;
 
     displayedTab = tab;

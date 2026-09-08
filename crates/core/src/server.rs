@@ -152,6 +152,7 @@ impl ResponsePayload {
 pub struct EntryHandler {
     entry: Arc<dyn Executable>,
     best_effort: bool,
+    edns_udp_size: u16,
 }
 
 impl EntryHandler {
@@ -160,12 +161,25 @@ impl EntryHandler {
         Self {
             entry,
             best_effort: false,
+            edns_udp_size: crate::context::DEFAULT_EDNS0_SIZE,
         }
     }
 
     /// Creates a new entry handler with best-effort system DNS fallback.
     pub fn with_best_effort(entry: Arc<dyn Executable>, best_effort: bool) -> Self {
-        Self { entry, best_effort }
+        Self {
+            entry,
+            best_effort,
+            edns_udp_size: crate::context::DEFAULT_EDNS0_SIZE,
+        }
+    }
+
+    /// Sets the EDNS0 UDP payload size advertised to upstream servers
+    /// (the `edns_udp_size` config key). Without this, the config value is
+    /// silently ignored and the 1232-byte default applies.
+    pub fn with_edns_udp_size(mut self, edns_udp_size: u16) -> Self {
+        self.edns_udp_size = edns_udp_size;
+        self
     }
 
     async fn handle_payload(
@@ -189,23 +203,13 @@ impl EntryHandler {
         }
 
         let start = std::time::Instant::now();
-        let mut ctx = Context::new(query);
+        let mut ctx = Context::with_edns_size(query, self.edns_udp_size);
         ctx.server_meta.from_udp = meta.from_udp;
         ctx.server_meta.client_addr = meta.client_addr;
         ctx.server_meta.url_path = meta.url_path;
         ctx.server_meta.server_name = meta.server_name;
-        // Cache the *logical* query wire (post EDNS rewrite from Context::new),
-        // never the raw client datagram in `meta.query_wire`. Reusing client
-        // bytes would silently drop EDNS policy and any later Message mutations
-        // (ECS, redirect, …). Ingress may still populate `meta.query_wire` for
-        // other observers, but the forward path must not use it.
-        match ctx.query().to_vec() {
-            Ok(wire) => ctx.set_query_wire(Some(Arc::new(wire))),
-            Err(e) => {
-                debug!(error = %e, "failed to serialize logical query wire");
-                ctx.set_query_wire(None);
-            }
-        }
+        // Forwarders serialize the logical query lazily. Raw ingress wire must
+        // not bypass Context's EDNS policy or later plugin mutations.
         let result = self.entry.exec(&mut ctx).await;
         let elapsed = start.elapsed();
         let selected_upstream = if result.is_ok() && ctx.has_response_output() {
@@ -430,6 +434,28 @@ mod tests {
         async fn exec(&self, _ctx: &mut Context) -> PluginResult<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn local_answers_do_not_serialize_or_replay_ingress_query() {
+        struct LocalAnswer;
+        #[async_trait]
+        impl Executable for LocalAnswer {
+            async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+                assert!(ctx.query_wire().is_none());
+                assert_eq!(ctx.query().edns.as_ref().unwrap().max_payload(), crate::context::DEFAULT_EDNS0_SIZE);
+                ctx.set_response(Some(noerror_response(ctx.query())));
+                Ok(())
+            }
+        }
+        let query = make_query();
+        let meta = QueryMeta {
+            query_wire: Some(Arc::new(query.to_vec().unwrap())),
+            ..Default::default()
+        };
+        let handler = EntryHandler::new(Arc::new(LocalAnswer));
+        let resp = handler.handle(query, meta).await.unwrap();
+        assert_eq!(resp.response_code, ResponseCode::NoError);
     }
 
     struct FailExec;

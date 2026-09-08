@@ -116,122 +116,150 @@ impl Default for LogsQuery {
 
 #[derive(Debug, Clone)]
 pub struct DashboardStore {
-    logs_db_path: Arc<String>,
-    geoip_db_path: Arc<String>,
+    logs_db: Arc<DashboardDatabase>,
+    geoip_db: Arc<DashboardDatabase>,
     log_tx: tokio::sync::mpsc::Sender<NewDnsLogEntry>,
     inflight_geoip: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     http_client: reqwest::Client,
     dhcp_leases: Arc<Vec<String>>,
 }
 
+#[derive(Debug)]
+struct DashboardDatabase {
+    path: String,
+    writer: Mutex<Connection>,
+}
+
+impl DashboardDatabase {
+    fn read<T>(&self, read: impl FnOnce(&Connection) -> Result<T, DynError>) -> Result<T, DynError> {
+        if is_ephemeral_sqlite_path(&self.path) {
+            // A private in-memory database lives for exactly this connection's
+            // lifetime. Opening another :memory: connection would lose its data.
+            read(&self.writer.lock())
+        } else {
+            // WAL readers need not block the log writer on dashboard scans.
+            read(&DashboardStore::open_connection(&self.path)?)
+        }
+    }
+}
+
 impl DashboardStore {
-    pub fn new(
-        clear_on_start: bool,
-        db_path: impl Into<String>,
+    pub fn from_config(
+        config: &redns_core::config::DashboardConfig,
+        config_file: &str,
+    ) -> Result<Option<Arc<Self>>, DynError> {
+        if config.http.is_none() {
+            return Ok(None);
+        }
+        let db_path = config.persist.then(|| {
+            config
+                .sqlite
+                .clone()
+                .unwrap_or_else(|| default_sqlite_path(config_file))
+        });
+        info!(path = db_path.as_deref().unwrap_or(":memory:"), "dashboard logging enabled");
+        Self::new(db_path, config.dhcp_leases.clone()).map(|store| Some(Arc::new(store)))
+    }
+
+    /// With no path, both databases are private, process-local in-memory stores.
+    fn new(
+        db_path: Option<String>,
         dhcp_leases: Vec<String>,
     ) -> Result<Self, DynError> {
         // reqwest is built with the `rustls` feature (aws-lc-rs); install the
         // process default before the HTTP client is constructed (also covers
         // tests that build DashboardStore directly).
         redns_core::install_rustls_crypto_provider();
-        let logs_db_path = db_path.into();
-        ensure_sqlite_file_exists(&logs_db_path)?;
+        let logs_db_path = db_path.unwrap_or_else(|| ":memory:".to_string());
         let geoip_db_path = geoip_db_path(&logs_db_path);
-        ensure_sqlite_file_exists(&geoip_db_path)?;
+        let logs_conn = Self::open_connection(&logs_db_path)?;
+        let mut geoip_conn = Self::open_connection(&geoip_db_path)?;
+        Self::ensure_auto_vacuum(&logs_db_path)?;
+        Self::ensure_auto_vacuum(&geoip_db_path)?;
+        Self::init(&logs_conn, &mut geoip_conn)?;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<NewDnsLogEntry>(10240);
         let store = Self {
-            logs_db_path: Arc::new(logs_db_path.clone()),
-            geoip_db_path: Arc::new(geoip_db_path),
+            logs_db: Arc::new(DashboardDatabase {
+                path: logs_db_path,
+                writer: Mutex::new(logs_conn),
+            }),
+            geoip_db: Arc::new(DashboardDatabase {
+                path: geoip_db_path,
+                writer: Mutex::new(geoip_conn),
+            }),
             log_tx: tx,
             inflight_geoip: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_client: reqwest::Client::new(),
             dhcp_leases: Arc::new(dhcp_leases),
         };
-        store.init()?;
-
-        let path = store.logs_db_path.clone();
+        let db = store.logs_db.clone();
         tokio::spawn(async move {
-            let mut batch = Vec::new();
-            loop {
-                let entry_opt = rx.recv().await;
-                match entry_opt {
-                    Some(e) => {
-                        batch.push(e);
-                        while batch.len() < 100 {
-                            if let Ok(e) = rx.try_recv() {
-                                batch.push(e);
-                            } else {
-                                break;
-                            }
-                        }
+            let mut batch = Vec::with_capacity(100);
+            while let Some(entry) = rx.recv().await {
+                batch.push(entry);
+                while batch.len() < 100 {
+                    if let Ok(entry) = rx.try_recv() {
+                        batch.push(entry);
+                    } else {
+                        break;
                     }
-                    None => break,
                 }
 
-                let entries = std::mem::take(&mut batch);
-                let path_clone = path.clone();
-                let handle = tokio::task::spawn_blocking(move || {
-                    if let Ok(mut conn) = Self::open_connection(&path_clone)
-                        && let Ok(tx) = conn.transaction()
-                    {
-                        let mut upstream_cache = HashMap::new();
-                        for entry in entries {
-                            let upstream_ids = match resolve_upstream_ids(
-                                &tx,
-                                &entry.upstream_names,
-                                &mut upstream_cache,
-                            ) {
-                                Ok(ids) => ids,
-                                Err(e) => {
-                                    warn!(error = %e, "failed to resolve upstream ids");
-                                    continue;
-                                }
-                            };
-                            let upstream_ids_text = upstream_ids_to_text(&upstream_ids);
-                            if let Err(e) = tx.execute(
-                                "INSERT INTO dns_logs (
-                                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
-                                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                                params![
-                                    entry.ts_unix_ms as i64,
-                                    entry.client_ip,
-                                    entry.protocol,
-                                    entry.qname,
-                                    entry.qtype,
-                                    entry.rcode,
-                                    entry.result,
-                                    entry.result_rows_json,
-                                    "[]",
-                                    upstream_ids_text,
-                                    entry.latency_ms as i64,
-                                    entry.answer_ttl as i64,
-                                ],
-                            ) {
-                                warn!(error = %e, "failed to insert dns_log row");
-                            }
-                        }
-                        if let Err(e) = tx.commit() {
-                            warn!(error = %e, "failed to commit dns_logs batch");
-                        }
+                let db = db.clone();
+                batch = match tokio::task::spawn_blocking(move || {
+                    if let Err(e) = Self::write_log_batch(&mut db.writer.lock(), &batch) {
+                        warn!(error = %e, "failed to write dns_logs batch");
                     }
-                });
-                if let Err(e) = handle.await {
-                    warn!(error = %e, "dns_logs batch writer task failed");
-                }
+                    batch.clear();
+                    batch
+                })
+                .await
+                {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        warn!(error = %e, "dns_logs batch writer task failed");
+                        Vec::with_capacity(100)
+                    }
+                };
             }
         });
-
-        if clear_on_start {
-            store.clear_logs_blocking()?;
-        }
 
         Ok(store)
     }
 
-    fn init(&self) -> Result<(), DynError> {
-        // Tune and create the logs database.
-        Self::ensure_auto_vacuum(&self.logs_db_path)?;
-        let logs_conn = Self::open_connection(&self.logs_db_path)?;
+    fn write_log_batch(conn: &mut Connection, entries: &[NewDnsLogEntry]) -> Result<(), DynError> {
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO dns_logs (
+                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10, ?11)",
+            )?;
+            // Keep IDs local to this transaction: clear_logs may delete and
+            // rebuild the lookup table between batches.
+            let mut upstream_cache = HashMap::new();
+            for entry in entries {
+                let upstream_ids = resolve_upstream_ids(&tx, &entry.upstream_names, &mut upstream_cache)?;
+                insert.execute(params![
+                    entry.ts_unix_ms as i64,
+                    entry.client_ip,
+                    entry.protocol,
+                    entry.qname,
+                    entry.qtype,
+                    entry.rcode,
+                    entry.result,
+                    entry.result_rows_json,
+                    upstream_ids_to_text(&upstream_ids),
+                    entry.latency_ms as i64,
+                    entry.answer_ttl as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn init(logs_conn: &Connection, geoip_conn: &mut Connection) -> Result<(), DynError> {
         logs_conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS dns_logs (
@@ -260,13 +288,11 @@ impl DashboardStore {
             );
             ",
         )?;
-        Self::ensure_logs_migrations(&logs_conn)?;
+        Self::ensure_logs_migrations(logs_conn)?;
 
         // Migrate geoip data out of the old combined database, then set up the
         // dedicated geoip database.
-        Self::migrate_geoip_cache(&self.logs_db_path, &self.geoip_db_path)?;
-        Self::ensure_auto_vacuum(&self.geoip_db_path)?;
-        let geoip_conn = Self::open_connection(&self.geoip_db_path)?;
+        Self::migrate_geoip_cache(logs_conn, geoip_conn)?;
         geoip_conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS geoip_cache (
@@ -280,7 +306,7 @@ impl DashboardStore {
             );
             ",
         )?;
-        Self::ensure_geoip_migrations(&geoip_conn)?;
+        Self::ensure_geoip_migrations(geoip_conn)?;
         Ok(())
     }
 
@@ -343,16 +369,23 @@ impl DashboardStore {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(3))?;
         // WAL and relaxed durability only apply to on-disk databases.
-        if !is_ephemeral_sqlite_path(path) {
+        if is_ephemeral_sqlite_path(path) {
+            // Queries and sorts must not spill dashboard data to temp files.
+            conn.pragma_update(None, "temp_store", "MEMORY")?;
+        } else {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
         Ok(conn)
     }
 
-    /// Enable incremental auto-vacuum. For new databases this is a header-only
-    /// change; for existing databases a one-time VACUUM is required to rewrite
-    /// the file with the new setting.
+    /// Enable incremental auto-vacuum.
+    ///
+    /// SQLite accepts `PRAGMA auto_vacuum = INCREMENTAL` on an existing
+    /// database but does not apply the mode until the file is rebuilt with
+    /// VACUUM — so the pragma alone silently leaves existing databases at
+    /// `auto_vacuum = 0` and retention deletes never shrink the file. Verify
+    /// the mode after setting it and run the required one-time VACUUM.
     fn ensure_auto_vacuum(path: &str) -> Result<(), DynError> {
         // auto_vacuum only matters for on-disk databases; skip for process-local
         // in-memory stores used when dashboard.persist is false.
@@ -364,23 +397,25 @@ impl DashboardStore {
         if current == 2 {
             return Ok(());
         }
-        // Try setting incremental on an empty database.
-        if conn
-            .execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
-            .is_ok()
-        {
-            return Ok(());
-        }
-        // Tables already exist: VACUUM to apply the new auto-vacuum mode.
+        // On an empty database the pragma takes effect immediately; on an
+        // existing one it only becomes durable after VACUUM. Run it either
+        // way (it is a no-op on an empty file).
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        let applied: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if applied != 2 {
+            return Err(format!(
+                "failed to enable incremental auto-vacuum on {} (mode is {})",
+                path, applied
+            )
+            .into());
+        }
         Ok(())
     }
 
     /// If the logs database still contains a geoip_cache table from the old
     /// single-file layout, copy its rows into the dedicated geoip database and
     /// drop the migrated table from the logs database.
-    fn migrate_geoip_cache(logs_path: &str, geoip_path: &str) -> Result<(), DynError> {
-        let logs_conn = Self::open_connection(logs_path)?;
+    fn migrate_geoip_cache(logs_conn: &Connection, geoip_conn: &mut Connection) -> Result<(), DynError> {
         let has_geoip_table: bool = logs_conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'geoip_cache')",
             [],
@@ -391,8 +426,6 @@ impl DashboardStore {
         }
 
         info!("migrating geoip_cache from logs database to dedicated geoip database");
-        Self::ensure_auto_vacuum(geoip_path)?;
-        let mut geoip_conn = Self::open_connection(geoip_path)?;
         geoip_conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS geoip_cache (
                 ip TEXT PRIMARY KEY,
@@ -404,7 +437,7 @@ impl DashboardStore {
                 expires_at INTEGER NOT NULL
             );",
         )?;
-        Self::ensure_geoip_migrations(&geoip_conn)?;
+        Self::ensure_geoip_migrations(geoip_conn)?;
 
         let mut select = logs_conn
             .prepare("SELECT ip, city, asn, isp, proxy, hosting, expires_at FROM geoip_cache")?;
@@ -446,9 +479,8 @@ impl DashboardStore {
     }
 
     pub async fn fetch_logs(&self, query: LogsQuery) -> Result<PaginatedLogsResponse, DynError> {
-        let path = self.logs_db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<PaginatedLogsResponse, DynError> {
-            let conn = Self::open_connection(&path)?;
+        let db = self.logs_db.clone();
+        tokio::task::spawn_blocking(move || db.read(|conn| {
             let page_size = query.page_size.clamp(1, 200);
             let page = query.page.max(1);
             let pattern = like_pattern(&query.filter);
@@ -505,7 +537,7 @@ impl DashboardStore {
             )?;
             let rows = stmt.query_map(
                 params![pattern, page_size as i64, bounded_offset as i64],
-                |row| row_to_dns_log_entry(&conn, row),
+                |row| row_to_dns_log_entry(conn, row),
             )?;
 
             let mut items = Vec::new();
@@ -521,7 +553,7 @@ impl DashboardStore {
                 total_pages,
                 summary,
             })
-        })
+        }))
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
     }
@@ -531,31 +563,29 @@ impl DashboardStore {
     /// Backed by `idx_dns_logs_latency`; tie-breaks on `id DESC` for a stable
     /// ordering when many rows share the same latency.
     pub async fn fetch_slow_queries(&self) -> Result<Vec<DnsLogEntry>, DynError> {
-        let path = self.logs_db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<DnsLogEntry>, DynError> {
-            let conn = Self::open_connection(&path)?;
+        let db = self.logs_db.clone();
+        tokio::task::spawn_blocking(move || db.read(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
                  FROM dns_logs
                  ORDER BY latency_ms DESC, id DESC
                  LIMIT 100",
             )?;
-            let rows = stmt.query_map([], |row| row_to_dns_log_entry(&conn, row))?;
+            let rows = stmt.query_map([], |row| row_to_dns_log_entry(conn, row))?;
             let mut items = Vec::new();
             for row in rows {
                 items.push(row?);
             }
             Ok(items)
-        })
+        }))
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
     }
 
     pub async fn fetch_clients(&self) -> Result<ClientStatsResponse, DynError> {
-        let path = self.logs_db_path.clone();
+        let db = self.logs_db.clone();
         let dhcp_leases = self.dhcp_leases.clone();
-        tokio::task::spawn_blocking(move || -> Result<ClientStatsResponse, DynError> {
-            let conn = Self::open_connection(&path)?;
+        tokio::task::spawn_blocking(move || db.read(|conn| {
             let total_queries: i64 =
                 conn.query_row("SELECT COUNT(*) FROM dns_logs", [], |row| row.get(0))?;
             let total_clients: i64 = conn.query_row(
@@ -603,33 +633,27 @@ impl DashboardStore {
                 top_client,
                 top_volume,
             })
-        })
+        }))
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
     }
 
     pub async fn clear_logs(&self) -> Result<(), DynError> {
-        let path = self.logs_db_path.clone();
+        let db = self.logs_db.clone();
         tokio::task::spawn_blocking(move || -> Result<(), DynError> {
-            Self::clear_logs_sync(&path)
+            let mut conn = db.writer.lock();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM dns_logs", [])?;
+            tx.execute("DELETE FROM sqlite_sequence WHERE name='dns_logs'", [])?;
+            tx.execute("DELETE FROM upstream_names", [])?;
+            tx.commit()?;
+            if !is_ephemeral_sqlite_path(&db.path) {
+                conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+            }
+            Ok(())
         })
         .await
         .map_err(|e| -> DynError { format!("dashboard sqlite task join failed: {e}").into() })?
-    }
-
-    /// Synchronous clear for use during store construction, before an async
-    /// runtime context is available.
-    fn clear_logs_blocking(&self) -> Result<(), DynError> {
-        Self::clear_logs_sync(&self.logs_db_path)
-    }
-
-    fn clear_logs_sync(path: &str) -> Result<(), DynError> {
-        let conn = Self::open_connection(path)?;
-        conn.execute("DELETE FROM dns_logs", [])?;
-        conn.execute("DELETE FROM sqlite_sequence WHERE name='dns_logs'", [])?;
-        conn.execute("DELETE FROM upstream_names", [])?;
-        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
-        Ok(())
     }
 
     pub async fn prune_expired_logs(&self) -> Result<u64, DynError> {
@@ -637,15 +661,15 @@ impl DashboardStore {
     }
 
     async fn prune_expired_logs_at(&self, now: SystemTime) -> Result<u64, DynError> {
-        let path = self.logs_db_path.clone();
+        let db = self.logs_db.clone();
         let cutoff_ms = dns_log_retention_cutoff_ms(now);
         tokio::task::spawn_blocking(move || -> Result<u64, DynError> {
-            let conn = Self::open_connection(&path)?;
+            let conn = db.writer.lock();
             let deleted = conn.execute(
                 "DELETE FROM dns_logs WHERE ts_unix_ms < ?1",
                 params![cutoff_ms as i64],
             )? as u64;
-            if deleted > 0 {
+            if deleted > 0 && !is_ephemeral_sqlite_path(&db.path) {
                 // incremental_vacuum returns free pages to the filesystem when
                 // auto_vacuum=INCREMENTAL. Truncate the WAL to keep the -wal
                 // file from growing unbounded.
@@ -661,7 +685,7 @@ impl DashboardStore {
     }
 
     pub async fn get_geoip(&self, ip: &str) -> Result<GeoIpData, DynError> {
-        let path = self.geoip_db_path.clone();
+        let db = self.geoip_db.clone();
 
         // Normalize the IP for caching:
         // Use full path for IPv4, but use the /64 subnet prefix for IPv6.
@@ -682,10 +706,9 @@ impl DashboardStore {
         let ip_owned = normalized_ip.clone();
 
         let cached: Option<GeoIpData> = tokio::task::spawn_blocking({
-            let path = path.clone();
+            let db = db.clone();
             let ip_owned = ip_owned.clone();
-            move || -> Result<Option<GeoIpData>, DynError> {
-                let conn = Self::open_connection(&path)?;
+            move || db.read(|conn| {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -706,7 +729,7 @@ impl DashboardStore {
                     }
                 }
                 Ok(None)
-            }
+            })
         })
         .await
         .map_err(|e| -> DynError { format!("geoip sqlite read join failed: {e}").into() })??;
@@ -736,10 +759,9 @@ impl DashboardStore {
             notify.notified().await;
 
             // Retry reading from cache after another task completed it
-            let path = self.geoip_db_path.clone();
+            let db = self.geoip_db.clone();
             let ip_owned = ip_owned.clone();
-            let retry_cached: Option<GeoIpData> = tokio::task::spawn_blocking(move || -> Result<Option<GeoIpData>, DynError> {
-                let conn = Self::open_connection(&path)?;
+            let retry_cached: Option<GeoIpData> = tokio::task::spawn_blocking(move || db.read(|conn| {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -760,7 +782,7 @@ impl DashboardStore {
                     }
                 }
                 Ok(None)
-            })
+            }))
             .await
             .map_err(|e| -> DynError { format!("geoip sqlite retry join failed: {e}").into() })??;
 
@@ -830,7 +852,7 @@ impl DashboardStore {
             let record = res.clone();
             let ip_owned = normalized_ip.clone();
             tokio::task::spawn_blocking(move || -> Result<(), DynError> {
-                let conn = Self::open_connection(&path)?;
+                let conn = db.writer.lock();
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1118,6 +1140,9 @@ fn is_ephemeral_sqlite_path(path: &str) -> bool {
 /// Derive the dedicated GeoIP SQLite path from the logs database path.
 /// For `.../redns.db` this returns `.../redns.geoip.db`.
 fn geoip_db_path(logs_db_path: &str) -> String {
+    if is_ephemeral_sqlite_path(logs_db_path) {
+        return ":memory:".to_string();
+    }
     let path = Path::new(logs_db_path);
     let stem = path
         .file_stem()
@@ -1721,21 +1746,16 @@ async fn serve_contained_file(target: &Path, base: &Path, out: &mut Vec<u8>) -> 
 /// Read `path` into `out` only if it resolves to a location inside `base_canon`.
 ///
 /// The target path is derived from an attacker-controlled request line, so it
-/// may contain `..` segments the kernel would honor at `open()` time. We
-/// canonicalize the parent directory and re-append the file name (this resolves
-/// any symlinks in the directory portion while tolerating a not-yet-existing
-/// final component), then require the resolved path to live under the base.
+/// may contain `..` segments or a final symlink pointing outside the static
+/// root. We canonicalize the *complete* path — resolving every component,
+/// including the final one — and require the resolved target to live under
+/// the base before opening it. (Canonicalizing requires the target to exist;
+/// a missing file fails here exactly as the subsequent open would.)
 async fn read_contained(path: &Path, base_canon: &Path, out: &mut Vec<u8>) -> bool {
-    let Some(file_name) = path.file_name() else {
-        return false;
-    };
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-
-    let parent_canon = match tokio::fs::canonicalize(parent).await {
+    let resolved = match tokio::fs::canonicalize(path).await {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let resolved = parent_canon.join(file_name);
     if !resolved.starts_with(base_canon) {
         return false;
     }
@@ -1943,15 +1963,11 @@ fn resolve_upstream_ids(
             ids.push(*id);
             continue;
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO upstream_names (name) VALUES (?1)",
-            params![name],
-        )?;
-        let id: i64 = tx.query_row(
-            "SELECT id FROM upstream_names WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )?;
+        tx.prepare_cached("INSERT OR IGNORE INTO upstream_names (name) VALUES (?1)")?
+            .execute(params![name])?;
+        let id: i64 = tx
+            .prepare_cached("SELECT id FROM upstream_names WHERE name = ?1")?
+            .query_row(params![name], |row| row.get(0))?;
         cache.insert(name.clone(), id as u64);
         ids.push(id as u64);
     }
@@ -2048,6 +2064,88 @@ mod tests {
         std::env::temp_dir().join(format!("redns-{name}-{}-{unique}.db", std::process::id()))
     }
 
+    /// An outward-pointing symlink as the final path component must be
+    /// resolved and rejected: the canonical target lives outside the static
+    /// root, so it must not be served. A symlink contained inside the root
+    /// still resolves and serves.
+    #[tokio::test]
+    async fn static_files_reject_symlink_escape() {
+        let dir = std::env::temp_dir().join(format!(
+            "redns-static-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let static_dir = dir.join("static");
+        std::fs::create_dir_all(&static_dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), b"secret").unwrap();
+        std::fs::write(static_dir.join("real.txt"), b"content").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret.txt"), static_dir.join("escape.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(static_dir.join("real.txt"), static_dir.join("alias.txt"))
+            .unwrap();
+
+        let base_canon = tokio::fs::canonicalize(&static_dir).await.unwrap();
+
+        let mut out = Vec::new();
+        assert!(
+            !read_contained(&static_dir.join("escape.txt"), &base_canon, &mut out).await,
+            "symlink pointing outside the static root must not be served"
+        );
+        assert!(out.is_empty());
+
+        let mut out = Vec::new();
+        assert!(
+            read_contained(&static_dir.join("alias.txt"), &base_canon, &mut out).await,
+            "symlink contained in the static root must be served"
+        );
+        assert_eq!(out, b"content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database created before auto-vacuum was enabled (tables already
+    /// present, mode 0) must end up durably in incremental mode: the pragma
+    /// alone does not apply to existing databases, a one-time VACUUM is
+    /// required and the result must be verified on a fresh connection.
+    #[tokio::test]
+    async fn existing_database_is_migrated_to_incremental_autovacuum() {
+        let path = temp_db_path("autovac");
+        let path_str = path.to_string_lossy().into_owned();
+
+        // Legacy database: tables already exist, auto_vacuum off.
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE legacy(x); INSERT INTO legacy VALUES (1);",
+            )
+            .unwrap();
+        }
+        let before: i64 = {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(before, 0, "fixture must start without auto-vacuum");
+
+        {
+            let store = DashboardStore::new(Some(path_str.clone()), vec![])
+                .expect("store setup must migrate auto_vacuum");
+            let _ = store;
+        }
+
+        // Verify durably, on a fresh connection.
+        let conn = Connection::open(&path_str).unwrap();
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            mode, 2,
+            "existing database must be migrated to incremental auto-vacuum"
+        );
+
+        cleanup_db(&path);
+    }
+
     fn sample_entry(ts_unix_ms: u64, qname: &str) -> NewDnsLogEntry {
         NewDnsLogEntry {
             ts_unix_ms,
@@ -2076,15 +2174,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_on_start_wipes_logs_and_stats() {
-        // When clear_on_start is true, the database starts empty even if a
-        // prior session left data behind.
-        let path = temp_db_path("clear-start");
+    async fn logs_persist_across_store_reopen() {
+        // Data written through one store instance must still be visible to a
+        // second store opened on the same database file.
+        let path = temp_db_path("persist-reopen");
         let path_str = path.to_string_lossy().into_owned();
 
         // First session: insert some logs.
         {
-            let store = DashboardStore::new(false, path_str.clone(), vec![])
+            let store = DashboardStore::new(Some(path_str.clone()), vec![])
                 .expect("create store");
             store
                 .record(sample_entry(1_000, "example.com"))
@@ -2098,18 +2196,18 @@ mod tests {
             assert_eq!(logs.total_items, 1, "data should be present in first session");
         }
 
-        // Second session with clear_on_start: logs should be gone.
+        // Second session on the same file: the log must still be there.
         {
-            let store = DashboardStore::new(true, path_str.clone(), vec![])
-                .expect("create store with clear_on_start");
+            let store = DashboardStore::new(Some(path_str.clone()), vec![])
+                .expect("reopen store");
             let logs = store
                 .fetch_logs(LogsQuery::default())
                 .await
                 .expect("fetch logs");
-            assert_eq!(logs.total_items, 0, "logs should be cleared on start");
-            let clients = store.fetch_clients().await.expect("fetch clients");
-            assert_eq!(clients.total_queries, 0, "stats should be cleared on start");
+            assert_eq!(logs.total_items, 1, "logs should persist across reopen");
         }
+
+        cleanup_db(&path);
     }
 
     #[tokio::test]
@@ -2117,7 +2215,7 @@ mod tests {
         let path = temp_db_path("retention");
         let path_str = path.to_string_lossy().into_owned();
         let store =
-            DashboardStore::new(true, path_str.clone(), vec![]).expect("create dashboard store");
+            DashboardStore::new(Some(path_str.clone()), vec![]).expect("create dashboard store");
 
         let now_ms = 3 * DNS_LOG_RETENTION.as_millis() as u64;
         let cutoff_ms = now_ms - DNS_LOG_RETENTION.as_millis() as u64;

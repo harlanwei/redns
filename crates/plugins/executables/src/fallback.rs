@@ -74,6 +74,7 @@ impl Fallback {
     }
 }
 
+#[derive(Default)]
 struct BranchOutcome {
     response: Option<Message>,
     response_wire: Option<Vec<u8>>,
@@ -136,181 +137,88 @@ fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
     false
 }
 
-#[async_trait::async_trait]
-impl Executable for Fallback {
-    async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-        let start = std::time::Instant::now();
-        let qname = ctx
-            .question()
-            .map(|q| q.name().to_ascii())
-            .unwrap_or_default();
-        debug!(threshold = ?self.threshold, always_standby = self.always_standby, "fallback: starting");
-        // Create a fresh context for each branch from the same query.
-        let query = ctx.query().clone();
-        let mut ctx_primary = Context::new(query.clone());
-        ctx_primary.server_meta = ctx.server_meta.clone();
-        let mut ctx_secondary = Context::new(query);
-        ctx_secondary.server_meta = ctx.server_meta.clone();
+/// Own branch tasks so a completed or cancelled fallback never detaches work.
+struct BranchTask {
+    name: &'static str,
+    handle: tokio::task::JoinHandle<BranchOutcome>,
+}
 
-        let primary = self.primary.clone();
-        let secondary = self.secondary.clone();
-        let threshold = self.threshold;
-        let always_standby = self.always_standby;
-
-        // Spawn primary task.
-        let qname_primary = qname.clone();
-        let primary_handle = tokio::spawn(async move {
-            match primary.exec(&mut ctx_primary).await {
-                Ok(()) => branch_outcome_from_ctx(&ctx_primary),
+impl BranchTask {
+    fn spawn(name: &'static str, exec: Arc<dyn Executable>, parent: &Context) -> Self {
+        // Fork, don't rebuild: Context::new would re-run ingress EDNS
+        // normalization and shrink/strip the parent's already-normalized OPT
+        // (advertised payload size, ECS options). fork_from preserves the
+        // logical query and request settings verbatim.
+        let mut ctx = Context::fork_from(parent);
+        let handle = tokio::spawn(async move {
+            match exec.exec(&mut ctx).await {
+                Ok(()) => branch_outcome_from_ctx(&ctx),
                 Err(e) => {
-                    warn!(error = %e, qname = %qname_primary, "fallback: primary failed");
-                    BranchOutcome {
-                        response: None,
-                        response_wire: None,
-                        selected_upstream: None,
-                    }
+                    warn!(branch = name, error = %e, "fallback branch failed");
+                    BranchOutcome::default()
                 }
             }
         });
+        Self { name, handle }
+    }
 
-        if always_standby {
-            // Start secondary immediately in parallel.
-            let qname_secondary = qname.clone();
-            let mut secondary_handle = tokio::spawn(async move {
-                match secondary.exec(&mut ctx_secondary).await {
-                    Ok(()) => branch_outcome_from_ctx(&ctx_secondary),
-                    Err(e) => {
-                        warn!(error = %e, qname = %qname_secondary, "fallback: secondary failed");
-                        BranchOutcome {
-                            response: None,
-                            response_wire: None,
-                            selected_upstream: None,
-                        }
-                    }
-                }
-            });
-
-            // Wait for primary with threshold timeout.
-            let mut primary_handle = primary_handle;
-            match tokio::time::timeout(threshold, &mut primary_handle).await {
-                Ok(Ok(outcome)) => {
-                    // Primary responded within threshold — use it.
-                    if apply_outcome(ctx, outcome) {
-                        debug!(elapsed = ?start.elapsed(), "fallback: primary responded within threshold");
-                        return Ok(());
-                    }
-                    // Primary finished but no response or panicked — use secondary.
-                    debug!(elapsed = ?start.elapsed(), "fallback: primary done but no response, waiting for secondary");
-                    match secondary_handle.await {
-                        Ok(outcome) => {
-                            if apply_outcome(ctx, outcome) {
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, qname = %qname, "fallback: secondary join failed");
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
-                    match secondary_handle.await {
-                        Ok(outcome) => {
-                            if apply_outcome(ctx, outcome) {
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, qname = %qname, "fallback: secondary join failed");
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Primary exceeded threshold — race primary vs secondary.
-                    debug!(elapsed = ?start.elapsed(), "fallback: primary exceeded threshold, racing both");
-                    tokio::select! {
-                        result = &mut primary_handle => {
-                            match result {
-                                Ok(outcome) => {
-                                    if apply_outcome(ctx, outcome) {
-                                        debug!(elapsed = ?start.elapsed(), "fallback: primary won race");
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
-                                }
-                            }
-
-                            match secondary_handle.await {
-                                Ok(outcome) => {
-                                    if apply_outcome(ctx, outcome) {
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, qname = %qname, "fallback: secondary join failed");
-                                }
-                            }
-                        }
-                        result = &mut secondary_handle => {
-                            match result {
-                                Ok(outcome) => {
-                                    if apply_outcome(ctx, outcome) {
-                                        debug!(elapsed = ?start.elapsed(), "fallback: secondary won race");
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, qname = %qname, "fallback: secondary join failed");
-                                }
-                            }
-
-                            match primary_handle.await {
-                                Ok(outcome) => {
-                                    if apply_outcome(ctx, outcome) {
-                                        return Ok(());
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Wait for primary with threshold timeout.
-            let primary_result = tokio::time::timeout(threshold, primary_handle).await;
-            match primary_result {
-                Ok(Ok(outcome)) => {
-                    if apply_outcome(ctx, outcome) {
-                        debug!(elapsed = ?start.elapsed(), "fallback: primary responded within threshold");
-                        return Ok(());
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!(error = %e, qname = %qname, "fallback: primary join failed");
-                }
-                Err(_) => {}
-            }
-
-            // Primary failed or timed out — run secondary.
-            debug!(elapsed = ?start.elapsed(), "fallback: primary timed out or failed, trying secondary");
-            match secondary.exec(&mut ctx_secondary).await {
-                Ok(()) => {
-                    if apply_outcome(ctx, branch_outcome_from_ctx(&ctx_secondary)) {
-                        return Ok(());
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, qname = %qname, "fallback: secondary failed");
-                }
+    async fn join(&mut self) -> BranchOutcome {
+        match (&mut self.handle).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(branch = self.name, error = %e, "fallback branch join failed");
+                BranchOutcome::default()
             }
         }
+    }
+}
 
-        Err("fallback: no valid response from primary or secondary".into())
+impl Drop for BranchTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[async_trait::async_trait]
+impl Executable for Fallback {
+    async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+        debug!(threshold = ?self.threshold, always_standby = self.always_standby, "fallback: starting");
+        let mut primary = BranchTask::spawn("primary", self.primary.clone(), ctx);
+        let mut secondary = self
+            .always_standby
+            .then(|| BranchTask::spawn("secondary", self.secondary.clone(), ctx));
+
+        // Prefer the primary during the threshold window. Borrowing its handle
+        // keeps it available for the race if the threshold expires.
+        if let Ok(outcome) = tokio::time::timeout(self.threshold, primary.join()).await {
+            if apply_outcome(ctx, outcome) {
+                return Ok(());
+            }
+            let secondary = secondary.get_or_insert_with(|| {
+                BranchTask::spawn("secondary", self.secondary.clone(), ctx)
+            });
+            return if apply_outcome(ctx, secondary.join().await) {
+                Ok(())
+            } else {
+                Err("fallback: no valid response from primary or secondary".into())
+            };
+        }
+
+        let mut secondary = secondary
+            .unwrap_or_else(|| BranchTask::spawn("secondary", self.secondary.clone(), ctx));
+        let accepted = tokio::select! {
+            outcome = primary.join() => {
+                apply_outcome(ctx, outcome) || apply_outcome(ctx, secondary.join().await)
+            }
+            outcome = secondary.join() => {
+                apply_outcome(ctx, outcome) || apply_outcome(ctx, primary.join().await)
+            }
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err("fallback: no valid response from primary or secondary".into())
+        }
     }
 }
 
@@ -436,5 +344,112 @@ mod tests {
         );
         let resp = ctx.response().expect("response set");
         assert_eq!(resp.response_code, ResponseCode::NoError);
+    }
+
+    struct DelayedResp {
+        delay: Duration,
+        rcode: ResponseCode,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Executable for DelayedResp {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            struct DropCounter(Arc<AtomicUsize>);
+            impl Drop for DropCounter {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let _guard = DropCounter(self.dropped.clone());
+            tokio::time::sleep(self.delay).await;
+            ctx.set_response(Some(resp_with_rcode(ctx.query(), self.rcode)));
+            Ok(())
+        }
+    }
+
+    fn delayed(ms: u64, rcode: ResponseCode, dropped: Arc<AtomicUsize>) -> Arc<dyn Executable> {
+        Arc::new(DelayedResp {
+            delay: Duration::from_millis(ms),
+            rcode,
+            dropped,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primary_can_win_after_threshold_and_cancels_secondary() {
+        let secondary_dropped = Arc::new(AtomicUsize::new(0));
+        let fb = Fallback::new(
+            delayed(40, ResponseCode::NoError, Arc::new(AtomicUsize::new(0))),
+            delayed(150, ResponseCode::NXDomain, secondary_dropped.clone()),
+            Duration::from_millis(10),
+            false,
+        );
+        let mut ctx = Context::new(make_query());
+        let start = tokio::time::Instant::now();
+        fb.exec(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response().unwrap().response_code, ResponseCode::NoError);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        tokio::task::yield_now().await;
+        assert_eq!(secondary_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn secondary_can_win_race_and_cancels_primary() {
+        let primary_dropped = Arc::new(AtomicUsize::new(0));
+        let fb = Fallback::new(
+            delayed(150, ResponseCode::NoError, primary_dropped.clone()),
+            delayed(10, ResponseCode::NXDomain, Arc::new(AtomicUsize::new(0))),
+            Duration::from_millis(10),
+            false,
+        );
+        let mut ctx = Context::new(make_query());
+        fb.exec(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response().unwrap().response_code, ResponseCode::NXDomain);
+        tokio::task::yield_now().await;
+        assert_eq!(primary_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_race_winner_still_waits_for_other_branch() {
+        let fb = Fallback::new(
+            delayed(40, ResponseCode::NoError, Arc::new(AtomicUsize::new(0))),
+            delayed(10, ResponseCode::Refused, Arc::new(AtomicUsize::new(0))),
+            Duration::from_millis(10),
+            false,
+        );
+        let mut ctx = Context::new(make_query());
+        fb.exec(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response().unwrap().response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn standby_secondary_does_not_override_primary_within_threshold() {
+        let fb = Fallback::new(
+            delayed(40, ResponseCode::ServFail, Arc::new(AtomicUsize::new(0))),
+            delayed(1, ResponseCode::NoError, Arc::new(AtomicUsize::new(0))),
+            Duration::from_millis(100),
+            true,
+        );
+        let mut ctx = Context::new(make_query());
+        fb.exec(&mut ctx).await.unwrap();
+        assert_eq!(ctx.response().unwrap().response_code, ResponseCode::ServFail);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_fallback_cancels_both_branches() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let fb = Fallback::new(
+            delayed(1000, ResponseCode::NoError, dropped.clone()),
+            delayed(1000, ResponseCode::NoError, dropped.clone()),
+            Duration::from_millis(10),
+            false,
+        );
+        let mut ctx = Context::new(make_query());
+        assert!(tokio::time::timeout(Duration::from_millis(50), fb.exec(&mut ctx))
+            .await
+            .is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 }

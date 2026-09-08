@@ -794,8 +794,10 @@ async fn run_server(
             error!(entry = %entry, "forward subprocess: entry sequence not found");
             format!("forward subprocess: entry sequence '{}' not found", entry).into()
         })?;
-        let handler: Arc<dyn DnsHandler> =
-            Arc::new(EntryHandler::with_best_effort(entry_exec, cfg.best_effort));
+        let handler: Arc<dyn DnsHandler> = Arc::new(
+            EntryHandler::with_best_effort(entry_exec, cfg.best_effort)
+                .with_edns_udp_size(cfg.edns_udp_size),
+        );
 
         // Exit when the parent process dies so we never linger as an orphan.
         if let Some(ppid) = subprocess_parent_pid {
@@ -833,23 +835,9 @@ async fn run_server(
         return Err("no servers configured".into());
     }
 
-    let sqlite_path = cfg
-        .dashboard
-        .sqlite
-        .clone()
-        .unwrap_or_else(|| dashboard::default_sqlite_path(&file_used));
-    info!(
-        path = %sqlite_path,
-        persist = cfg.dashboard.persist,
-        "dashboard sqlite path selected"
-    );
-    let dashboard_store = Arc::new(dashboard::DashboardStore::new(
-        !cfg.dashboard.persist,
-        sqlite_path,
-        cfg.dashboard.dhcp_leases.clone(),
-    )?);
-    {
-        let store = dashboard_store.clone();
+    let dashboard_store = dashboard::DashboardStore::from_config(&cfg.dashboard, &file_used)?;
+    if let Some(store) = &dashboard_store {
+        let store = store.clone();
         let c = cancel.clone();
         tokio::spawn(async move {
             dashboard::run_log_retention(store, c).await;
@@ -868,11 +856,15 @@ async fn run_server(
                 return Err(format!("entry sequence '{}' not found", srv.entry).into());
             }
         };
-        let handler: Arc<dyn redns_core::DnsHandler> =
-            Arc::new(EntryHandler::with_best_effort(entry_exec, cfg.best_effort));
         let handler: Arc<dyn redns_core::DnsHandler> = Arc::new(
-            dashboard::DashboardDnsHandler::new(handler, dashboard_store.clone()),
+            EntryHandler::with_best_effort(entry_exec, cfg.best_effort)
+                .with_edns_udp_size(cfg.edns_udp_size),
         );
+        let handler: Arc<dyn redns_core::DnsHandler> = if let Some(store) = &dashboard_store {
+            Arc::new(dashboard::DashboardDnsHandler::new(handler, store.clone()))
+        } else {
+            handler
+        };
 
         let addr = &srv.addr;
         let proto = &srv.protocol;
@@ -999,7 +991,7 @@ async fn run_server(
     }
 
     // ── Phase 5: Start Dashboard HTTP server ────────────────────
-    if let Some(ref dashboard_addr) = cfg.dashboard.http {
+    if let (Some(dashboard_addr), Some(store)) = (&cfg.dashboard.http, &dashboard_store) {
         match bind_tcp_listener(dashboard_addr) {
             Ok(listener) => {
                 info!(addr = %dashboard_addr, "Dashboard HTTP server listening");
@@ -1013,7 +1005,7 @@ async fn run_server(
                 let state = dashboard::DashboardState {
                     api_http: cfg.api.http.clone(),
                     upstreams: all_upstreams.clone(),
-                    store: dashboard_store.clone(),
+                    store: store.clone(),
                     static_dir,
                     version: FULL_VERSION,
                 };

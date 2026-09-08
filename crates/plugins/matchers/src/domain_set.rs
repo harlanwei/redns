@@ -14,7 +14,7 @@
 
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
@@ -179,6 +179,26 @@ impl DomainSet {
         }
 
         if let Some((typ, pattern)) = exp.split_once(':') {
+            if typ == "regexp" {
+                // Regex source must not be domain-normalized: lowercasing
+                // rewrites case-escaping escapes (`\D` → `\d`) and the
+                // dot-stripping pass mangles quantifiers (`.*` → `*`).
+                // The pattern is used verbatim; case handling is done by the
+                // regex builder (names are matched lowercased).
+                let pattern = pattern.trim();
+                if pattern.is_empty() {
+                    return Ok(());
+                }
+                let re = RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("invalid regex '{}': {}", pattern, e).into()
+                    })?;
+                self.regexes.push(re);
+                return Ok(());
+            }
+
             let pattern = Self::normalize(pattern);
             if pattern.is_empty() {
                 return Ok(());
@@ -192,14 +212,6 @@ impl DomainSet {
                 }
                 "keyword" => {
                     self.keywords.push(pattern);
-                }
-                "regexp" => {
-                    let re = Regex::new(&pattern).map_err(
-                        |e| -> Box<dyn std::error::Error + Send + Sync> {
-                            format!("invalid regex '{}': {}", pattern, e).into()
-                        },
-                    )?;
-                    self.regexes.push(re);
                 }
                 _ => {
                     // Unknown type prefix — treat as default (domain/subdomain).
@@ -386,6 +398,29 @@ mod tests {
         ds.add_expression("baidu.com").unwrap();
         assert!(ds.matches_domain("www.baidu.com"));
         assert!(ds.matches_domain("baidu.com"));
+    }
+
+    /// Regex source must be preserved verbatim: `.*google.*` must survive
+    /// normalization (it would otherwise be corrupted into `*google.*` and
+    /// rejected as invalid), and case-escapes like `\D` must keep their
+    /// meaning (lowercasing the source would turn `\D` into `\d`).
+    #[test]
+    fn regexp_source_is_not_normalized() {
+        let mut ds = DomainSet::new();
+        ds.add_expression("regexp:.*google.*").unwrap();
+        assert!(ds.matches_domain("www.google.com"));
+        assert!(ds.matches_domain("notgoogle.cn"));
+
+        let mut ds = DomainSet::new();
+        ds.add_expression(r"regexp:^\D+\.example\.com$").unwrap();
+        assert!(ds.matches_domain("mail.example.com"));
+        assert!(!ds.matches_domain("123.example.com"));
+
+        // Case-insensitive matching is handled by the builder, not by
+        // lowercasing the source.
+        let mut ds = DomainSet::new();
+        ds.add_expression("regexp:^GOOGLE\\.COM$").unwrap();
+        assert!(ds.matches_domain("google.com"));
     }
 
     #[test]

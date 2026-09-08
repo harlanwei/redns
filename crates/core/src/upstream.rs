@@ -252,6 +252,34 @@ fn dns_header_tc(wire: &[u8]) -> bool {
     wire.len() >= 3 && (wire[2] & 0x02) != 0
 }
 
+/// True when `resp_wire` is a DNS response that echoes `query_wire`'s question
+/// (name matched case-insensitively, plus type and class).
+///
+/// Pooled UDP sockets can receive late or duplicate datagrams from earlier
+/// exchanges, so an ID match alone is not proof a datagram answers *this*
+/// question. Parsing both messages keeps the check robust against servers
+/// that re-case or re-encode the echoed question.
+fn response_matches_question(resp_wire: &[u8], query_wire: &[u8]) -> bool {
+    use hickory_proto::op::{Message, MessageType};
+
+    let (Ok(resp), Ok(query)) = (Message::from_vec(resp_wire), Message::from_vec(query_wire))
+    else {
+        return false;
+    };
+    if resp.message_type != MessageType::Response {
+        return false;
+    }
+    match (resp.queries.first(), query.queries.first()) {
+        (Some(rq), Some(qq)) => {
+            // `Name: PartialEq` compares case-insensitively.
+            rq.query_type() == qq.query_type()
+                && rq.query_class() == qq.query_class()
+                && rq.name() == qq.name()
+        }
+        _ => false,
+    }
+}
+
 /// Choose a UDP recv buffer large enough for the EDNS0 payload the query
 /// advertises, clamped to `[MIN_UDP_RECV, MAX_UDP_SIZE]`.
 fn udp_recv_capacity(query: &[u8]) -> usize {
@@ -268,16 +296,22 @@ fn udp_recv_capacity(query: &[u8]) -> usize {
 #[async_trait]
 impl Upstream for UdpUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        // The DNS message ID is the first two bytes of the wire message. Sockets
-        // are pooled and reused, so a late or duplicate datagram from a previous
-        // query can arrive on this socket. Match the response ID against the
-        // query's and discard non-matching datagrams, reading until a matching
-        // response arrives or the overall timeout elapses. Without this, a stale
-        // datagram could be returned as the answer to a different query.
-        let want_id = match query.get(0..2) {
-            Some(id) => [id[0], id[1]],
-            None => return Err("udp exchange: query too short".into()),
-        };
+        // Sockets are pooled and reused, so a late or duplicate datagram from
+        // a previous query can arrive while this exchange is reading. Two
+        // safeguards discard such stale datagrams:
+        //
+        // 1. Transport-owned transaction ID — the query ID is rewritten to a
+        //    fresh random value per exchange, so a datagram left over from a
+        //    previous exchange cannot match (the caller's ID may well repeat).
+        // 2. Question matching — a datagram must also echo this query's
+        //    question before it is adopted.
+        if query.len() < 2 {
+            return Err("udp exchange: query too short".into());
+        }
+        let original_id = [query[0], query[1]];
+        let transport_id = fastrand::u16(..);
+        let mut wire = query.to_vec();
+        wire[0..2].copy_from_slice(&transport_id.to_be_bytes());
 
         let sock = self.get_socket().await?;
 
@@ -286,7 +320,7 @@ impl Upstream for UdpUpstream {
         let deadline = Instant::now() + self.timeout;
 
         let remaining = Self::remaining_until(deadline)?;
-        match tokio::time::timeout(remaining, sock.send(query)).await {
+        match tokio::time::timeout(remaining, sock.send(&wire)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 return Err(format!("udp send: {e}").into());
@@ -300,15 +334,21 @@ impl Upstream for UdpUpstream {
 
             match tokio::time::timeout(remaining, sock.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    // Ignore datagrams that are too short to carry an ID or whose
-                    // ID does not match this query (a stale/duplicate response).
-                    if n < 2 || buf[0..2] != want_id {
+                    // Ignore datagrams whose ID does not match this exchange's
+                    // transport ID (a stale/duplicate response), or that do not
+                    // echo this query's question.
+                    let id_ok = n >= 2 && buf[0..2] == transport_id.to_be_bytes();
+                    if !id_ok || !response_matches_question(&buf[..n], query) {
                         continue;
                     }
                     let mut resp = buf;
                     resp.truncate(n);
                     // Done with the UDP socket whether or not we fall back to TCP.
                     self.put_socket(sock).await;
+
+                    // Restore the caller's original transaction ID.
+                    resp[0] = original_id[0];
+                    resp[1] = original_id[1];
 
                     // Transparent TCP retry on truncation (common resolver
                     // behaviour). Prefer the full TCP answer; if TCP fails,
@@ -593,7 +633,11 @@ enum PipelineMode {
 /// A persistent TLS connection multiplexing multiple in-flight queries by DNS
 /// transaction ID, per RFC 7766 §6.2.1.1.
 struct PipelinedConn {
-    writer: Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
+    /// Fully-assembled length-prefixed frames queued for the writer task. The
+    /// writer task owns the socket's write half, so an exchange cancelled
+    /// after queueing its frame can never leave a partial DNS frame in the
+    /// stream (which would desynchronize framing for every later query).
+    writer_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     pending: StdMutex<HashMap<u16, tokio::sync::oneshot::Sender<PluginResult<Vec<u8>>>>>,
     next_id: AtomicU16,
     alive: AtomicBool,
@@ -611,6 +655,31 @@ impl PipelinedConn {
 
     fn inflight(&self) -> usize {
         self.pending.lock().len()
+    }
+}
+
+/// Frees the connection's pending slot whenever the exchange ends without a
+/// delivered response: dropped futures (forward races, fallback cancellation),
+/// the timeout path, and the channel-closed path all run this guard. Without
+/// it, a cancelled exchange leaks its slot until the connection dies, which
+/// eventually wedges the connection at `PIPELINE_MAX_INFLIGHT`.
+struct PendingSlotGuard {
+    conn: Arc<PipelinedConn>,
+    id: u16,
+    disarmed: bool,
+}
+
+impl PendingSlotGuard {
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for PendingSlotGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.conn.pending.lock().remove(&self.id);
+        }
     }
 }
 
@@ -638,6 +707,34 @@ where
             }
         }
         conn.alive.store(false, Ordering::Release);
+        let drained: Vec<_> = conn.pending.lock().drain().collect();
+        for (_, tx) in drained {
+            let _ = tx.send(Err("pipelined connection closed".into()));
+        }
+    });
+}
+
+/// Own the connection's write half: complete frames are queued on a channel
+/// and written to completion by this dedicated task, so a cancelled exchange
+/// cannot tear a frame in half mid-`write_all`.
+fn spawn_writer<W>(
+    mut writer: W,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    conn: Arc<PipelinedConn>,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let written = writer.write_all(&frame).await.is_ok();
+            if !written || writer.flush().await.is_err() {
+                break;
+            }
+        }
+        conn.alive.store(false, Ordering::Release);
+        // The connection can no longer carry writes; wake every pending
+        // exchange so none waits out its full timeout for a response that
+        // can never arrive.
         let drained: Vec<_> = conn.pending.lock().drain().collect();
         for (_, tx) in drained {
             let _ = tx.send(Err("pipelined connection closed".into()));
@@ -740,12 +837,14 @@ impl PipelinedTlsUpstream {
 
             if seen[0] && seen[1] {
                 // Pipelining works — reuse this connection.
+                let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
                 let conn = Arc::new(PipelinedConn {
-                    writer: Mutex::new(Box::new(writer)),
+                    writer_tx,
                     pending: StdMutex::new(HashMap::new()),
                     next_id: AtomicU16::new(0x0003),
                     alive: AtomicBool::new(true),
                 });
+                spawn_writer(writer, writer_rx, conn.clone());
                 spawn_reader(reader, conn.clone());
                 *self.conn.lock().await = Some(conn);
                 Ok(())
@@ -767,88 +866,100 @@ impl PipelinedTlsUpstream {
     }
 
     async fn get_conn(&self) -> Option<Arc<PipelinedConn>> {
-        let guard = self.conn.lock().await;
+        // Hold the lock across the dial: concurrent callers queue behind this
+        // connect (which is timeout-bounded) instead of each opening a
+        // redundant connection to the same server.
+        let mut guard = self.conn.lock().await;
         if let Some(ref c) = *guard {
             if c.alive.load(Ordering::Acquire) {
                 return Some(c.clone());
             }
+            *guard = None;
         }
-        drop(guard);
 
-        // Reconnect.
         let stream = self.connect_tls().await.ok()?;
         let (reader, writer) = tokio::io::split(stream);
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
         let conn = Arc::new(PipelinedConn {
-            writer: Mutex::new(Box::new(writer)),
+            writer_tx,
             pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU16::new(0),
             alive: AtomicBool::new(true),
         });
+        spawn_writer(writer, writer_rx, conn.clone());
         spawn_reader(reader, conn.clone());
-        *self.conn.lock().await = Some(conn.clone());
+        *guard = Some(conn.clone());
         Some(conn)
     }
 
     async fn pipelined_exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let conn = self
-            .get_conn()
-            .await
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                "pipelined connect failed".into()
-            })?;
+        let conn =
+            self.get_conn()
+                .await
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "pipelined connect failed".into()
+                })?;
+        pipelined_exchange_on(&conn, query, self.timeout).await
+    }
+}
 
-        if conn.inflight() >= PIPELINE_MAX_INFLIGHT {
-            return Err("pipelined connection at capacity".into());
+/// Run one exchange over an established pipelined connection.
+async fn pipelined_exchange_on(
+    conn: &Arc<PipelinedConn>,
+    query: &[u8],
+    timeout: Duration,
+) -> PluginResult<Vec<u8>> {
+    if conn.inflight() >= PIPELINE_MAX_INFLIGHT {
+        return Err("pipelined connection at capacity".into());
+    }
+
+    let original_id = if query.len() >= 2 {
+        u16::from_be_bytes([query[0], query[1]])
+    } else {
+        0
+    };
+
+    let pipe_id = conn.alloc_id();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    conn.pending.lock().insert(pipe_id, tx);
+    let guard = PendingSlotGuard {
+        conn: conn.clone(),
+        id: pipe_id,
+        disarmed: false,
+    };
+
+    // Rewrite the transaction ID and queue the complete frame. Queueing is
+    // synchronous: once `send` returns, the writer task owns the frame and
+    // writes it to completion even if this future is dropped afterwards.
+    let mut wire = query.to_vec();
+    if wire.len() >= 2 {
+        wire[0..2].copy_from_slice(&pipe_id.to_be_bytes());
+    }
+    let mut frame = Vec::with_capacity(2 + wire.len());
+    frame.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&wire);
+    if conn.writer_tx.send(frame).is_err() {
+        // Dropping the guard frees the pending slot.
+        return Err("pipelined connection closed".into());
+    }
+
+    // One deadline covers everything after slot registration — queueing
+    // behind other writers, the write itself, and the response wait.
+    // Bounding only the response wait let a stalled writer escape the
+    // timeout entirely.
+    let deadline = tokio::time::Instant::now() + timeout;
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(Ok(mut resp))) => {
+            guard.disarm();
+            // Restore the caller's original transaction ID.
+            if resp.len() >= 2 {
+                resp[0..2].copy_from_slice(&original_id.to_be_bytes());
+            }
+            Ok(resp)
         }
-
-        let original_id = if query.len() >= 2 {
-            u16::from_be_bytes([query[0], query[1]])
-        } else {
-            0
-        };
-
-        let pipe_id = conn.alloc_id();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        conn.pending.lock().insert(pipe_id, tx);
-
-        // Rewrite the transaction ID and send.
-        let mut wire = query.to_vec();
-        if wire.len() >= 2 {
-            wire[0..2].copy_from_slice(&pipe_id.to_be_bytes());
-        }
-        let len = (wire.len() as u16).to_be_bytes();
-
-        {
-            let mut w = conn.writer.lock().await;
-            if let Err(e) = w.write_all(&len).await {
-                conn.pending.lock().remove(&pipe_id);
-                return Err(format!("pipelined write: {e}").into());
-            }
-            if let Err(e) = w.write_all(&wire).await {
-                conn.pending.lock().remove(&pipe_id);
-                return Err(format!("pipelined write: {e}").into());
-            }
-            let _ = w.flush().await;
-        }
-
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(Ok(mut resp))) => {
-                // Restore the caller's original transaction ID.
-                if resp.len() >= 2 {
-                    resp[0..2].copy_from_slice(&original_id.to_be_bytes());
-                }
-                Ok(resp)
-            }
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => {
-                conn.pending.lock().remove(&pipe_id);
-                Err("pipelined connection closed".into())
-            }
-            Err(_) => {
-                conn.pending.lock().remove(&pipe_id);
-                Err("pipelined exchange timed out".into())
-            }
-        }
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(_)) => Err("pipelined connection closed".into()),
+        Err(_) => Err("pipelined exchange timed out".into()),
     }
 }
 
@@ -1107,7 +1218,7 @@ impl Upstream for DohUpstream {
 
         // Bound the *entire* exchange — send and body read — with one timeout so a
         // slow-drip response body cannot outlive the deadline.
-        let bytes = tokio::time::timeout(self.timeout, async move {
+        let request_build = async move {
             let request = if use_post {
                 self.client
                     .post(&self.endpoint)
@@ -1117,13 +1228,11 @@ impl Upstream for DohUpstream {
                 self.client.get(&url)
             };
 
-            let resp =
-                request
-                    .send()
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("doh request: {e}").into()
-                    })?;
+            let mut resp = request.send().await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("doh request: {e}").into()
+                },
+            )?;
 
             if !resp.status().is_success() {
                 return Err(format!("doh: bad status {}", resp.status()).into());
@@ -1148,26 +1257,39 @@ impl Upstream for DohUpstream {
                 .into());
             }
 
-            // Best-effort guard against an oversized body. A DNS message is at
-            // most 65535 bytes; reject anything whose advertised length exceeds
-            // that. Chunked responses carry no Content-Length so this cannot
-            // bound them, but a well-behaved DoH server always sends a length.
+            // Hard cap on the response body. A DNS message is at most 65535
+            // bytes. Content-Length (when present) is rejected up front, but
+            // chunked/streaming bodies advertise no length — so the body is
+            // read incrementally and aborted the moment accumulated bytes
+            // exceed the cap. This bounds memory against an oversized or
+            // slow-drip response from an upstream or intermediary.
             if let Some(len) = resp.content_length()
                 && len > MAX_DNS_RESPONSE as u64
             {
                 return Err(format!("doh response too large: {len} bytes").into());
             }
 
-            resp.bytes()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("doh read body: {e}").into()
-                })
-        })
-        .await
-        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> { "doh request timed out".into() })??;
+                },
+            )? {
+                if body.len().saturating_add(chunk.len()) > MAX_DNS_RESPONSE {
+                    return Err(
+                        format!("doh response too large (> {MAX_DNS_RESPONSE} bytes)").into()
+                    );
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(body)
+        };
 
-        let mut body = bytes.to_vec();
+        let mut body = tokio::time::timeout(self.timeout, request_build)
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "doh request timed out".into()
+            })??;
 
         // Restore original query ID.
         if body.len() >= 2 && query.len() >= 2 {
@@ -2685,70 +2807,115 @@ mod tests {
         assert_eq!(udp_recv_capacity(&bare.to_vec().unwrap()), DEFAULT_UDP_RECV);
     }
 
-    /// A stale datagram with a mismatched DNS message ID (e.g. a late response
-    /// from a prior query on a reused, pooled socket) must be discarded rather
-    /// than returned as the answer to a different query.
+    /// A stale datagram on a reused socket must be discarded rather than
+    /// returned as the answer to a different query. The fake upstream first
+    /// sends a datagram with a mismatched ID, then one with the right ID but a
+    /// different question, and only then the correct response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_exchange_skips_mismatched_id() {
-        // Fake upstream: on receiving a query, first reply with a wrong-ID
-        // datagram, then the correctly-IDed response.
+    async fn udp_exchange_skips_stale_datagrams() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+
+        fn response_wire(id: u16, qname: &str, tag: u8) -> Vec<u8> {
+            let mut msg = Message::new(id, MessageType::Response, OpCode::Query);
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(Name::from_ascii(qname).unwrap())
+                    .set_query_type(RecordType::A);
+                q
+            });
+            let mut wire = msg.to_vec().unwrap();
+            wire.push(tag);
+            wire
+        }
+
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
 
         tokio::spawn(async move {
             let mut buf = [0u8; MAX_UDP_SIZE];
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let query = &buf[..n];
+            let (_n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let transport_id = u16::from_be_bytes([buf[0], buf[1]]);
 
-            // Stale datagram: copy the query but flip the ID so it cannot match.
-            let mut stale = query.to_vec();
-            stale[0] ^= 0xFF;
-            stale[1] ^= 0xFF;
-            // Tag the body so we can tell the two responses apart.
-            stale.push(0xAA);
+            // Stale datagram 1: wrong ID entirely.
+            let stale = response_wire(transport_id ^ 0xFF, "example.com.", 0xAA);
             server.send_to(&stale, peer).await.unwrap();
 
-            // Correct datagram: keep the query's ID, tag the body differently.
-            let mut good = query.to_vec();
-            good.push(0xBB);
+            // Stale datagram 2: right ID (ID collision), wrong question.
+            let wrong_q = response_wire(transport_id, "other.example.", 0xAA);
+            server.send_to(&wrong_q, peer).await.unwrap();
+
+            // Correct datagram: matching ID and the query's question.
+            let good = response_wire(transport_id, "example.com.", 0xBB);
             server.send_to(&good, peer).await.unwrap();
         });
 
         let upstream = UdpUpstream::new(server_addr).with_timeout(Duration::from_secs(2));
-        // Query wire: 2-byte ID followed by a minimal body.
-        let query = vec![0x12, 0x34, 0x00, 0x00, 0x00, 0x00];
+        let mut query_msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        query_msg.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("example.com.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        let query = query_msg.to_vec().unwrap();
         let resp = upstream.exchange(&query).await.unwrap();
 
-        // We must get the correctly-IDed response (tagged 0xBB), not the stale
-        // one (tagged 0xAA).
-        assert_eq!(&resp[0..2], &query[0..2], "response ID must match query ID");
-        assert_eq!(*resp.last().unwrap(), 0xBB, "must skip the stale datagram");
+        // The caller's original ID must be restored on the returned response.
+        assert_eq!(&resp[0..2], &query[0..2], "original ID must be restored");
+        assert_eq!(
+            *resp.last().unwrap(),
+            0xBB,
+            "must skip both stale datagrams"
+        );
     }
 
     /// When the UDP answer has TC=1, the upstream must transparently re-query
     /// over TCP and return the full answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn udp_exchange_retries_over_tcp_on_tc() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
+
+        // Minimal valid query for example.com A.
+        let query = {
+            let mut msg = Message::new(0xABCD, MessageType::Query, OpCode::Query);
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(Name::from_ascii("example.com.").unwrap())
+                    .set_query_type(RecordType::A);
+                q
+            });
+            msg.to_vec().unwrap()
+        };
 
         let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = udp_server.local_addr().unwrap();
         let tcp_listener = TcpListener::bind(server_addr).await.unwrap();
 
-        let query = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-        // UDP: reply with TC=1, same ID.
+        // UDP: reply with TC=1, echoing whatever wire we received (the upstream
+        // rewrites the ID to a transport-owned value before sending).
         let udp_query = query.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], udp_query.as_slice());
-            // Header: ID + flags with QR=1, TC=1, RA=1; zero counts.
-            let mut truncated = vec![0xAB, 0xCD, 0x82, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            let transport_id = u16::from_be_bytes([buf[0], buf[1]]);
+            assert_eq!(&buf[2..n], &udp_query[2..], "only the ID may change");
+
+            let mut truncated = Message::response(transport_id, OpCode::Query);
+            truncated.metadata.truncation = true;
+            truncated.add_query({
+                let mut q = Query::new();
+                q.set_name(Name::from_ascii("example.com.").unwrap())
+                    .set_query_type(RecordType::A);
+                q
+            });
+            let mut wire = truncated.to_vec().unwrap();
             // Tag so we can tell UDP vs TCP answers apart.
-            truncated.push(0x11);
-            udp_server.send_to(&truncated, peer).await.unwrap();
+            wire.push(0x11);
+            udp_server.send_to(&wire, peer).await.unwrap();
         });
 
         // TCP: reply with a full (non-truncated) answer, length-prefixed.
@@ -2762,7 +2929,9 @@ mod tests {
             stream.read_exact(&mut qbuf).await.unwrap();
             assert_eq!(qbuf, tcp_query);
 
-            let mut full = vec![0xAB, 0xCD, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            let mut full = qbuf.clone();
+            full[2] = 0x80;
+            full[3] = 0x80;
             full.push(0x22); // full-answer tag
             let len = (full.len() as u16).to_be_bytes();
             stream.write_all(&len).await.unwrap();
@@ -2771,9 +2940,79 @@ mod tests {
 
         let upstream = UdpUpstream::new(server_addr).with_timeout(Duration::from_secs(2));
         let resp = upstream.exchange(&query).await.unwrap();
-        assert_eq!(&resp[0..2], &query[0..2]);
+        assert_eq!(&resp[0..2], &query[0..2], "original ID must be restored");
         assert!(!dns_header_tc(&resp), "TCP fallback must clear truncation");
-        assert_eq!(*resp.last().unwrap(), 0x22, "must return the full TCP answer");
+        assert_eq!(
+            *resp.last().unwrap(),
+            0x22,
+            "must return the full TCP answer"
+        );
+    }
+
+    /// An oversized chunked DoH body (no Content-Length) must be rejected
+    /// once accumulated bytes exceed the DNS message cap, instead of being
+    /// buffered in full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doh_rejects_oversized_chunked_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head (read until end of headers).
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 || buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Respond with a chunked body far larger than MAX_DNS_RESPONSE.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let chunk = vec![0u8; 4096];
+            for _ in 0..20 {
+                let head = format!("{:x}\r\n", chunk.len());
+                if sock.write_all(head.as_bytes()).await.is_err()
+                    || sock.write_all(&chunk).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    break; // client aborted after hitting the cap
+                }
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+
+        let upstream = DohUpstream::new(
+            format!("http://{addr}/dns-query"),
+            DohResolution::Ip,
+            4,
+            Duration::from_secs(5),
+        );
+
+        let query = {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::{Name, RecordType};
+            let mut msg = Message::new(1, MessageType::Query, OpCode::Query);
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(Name::from_ascii("example.com.").unwrap())
+                    .set_query_type(RecordType::A);
+                q
+            });
+            msg.to_vec().unwrap()
+        };
+
+        let err = upstream.exchange(&query).await.unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "oversized chunked body must be capped, got: {err}"
+        );
     }
 
     // ── RFC 7766 pipelining tests ─────────────────────────────────
@@ -2797,8 +3036,10 @@ mod tests {
         let (client, mut server) = duplex(4096);
         let (reader, writer) = tokio::io::split(client);
 
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop((writer, writer_rx)); // reader-only test: write half unused
         let conn = Arc::new(PipelinedConn {
-            writer: Mutex::new(Box::new(writer)),
+            writer_tx,
             pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU16::new(0),
             alive: AtomicBool::new(true),
@@ -2840,8 +3081,10 @@ mod tests {
         let (client, server) = duplex(4096);
         let (reader, writer) = tokio::io::split(client);
 
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop((writer, writer_rx));
         let conn = Arc::new(PipelinedConn {
-            writer: Mutex::new(Box::new(writer)),
+            writer_tx,
             pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU16::new(0),
             alive: AtomicBool::new(true),
@@ -2866,8 +3109,10 @@ mod tests {
         let (client, _server) = duplex(4096);
         let (reader, writer) = tokio::io::split(client);
 
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop((writer, writer_rx));
         let conn = Arc::new(PipelinedConn {
-            writer: Mutex::new(Box::new(writer)),
+            writer_tx,
             pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU16::new(0),
             alive: AtomicBool::new(true),
@@ -2885,5 +3130,58 @@ mod tests {
         // next_id starts at 0, so alloc_id should skip 0, 1, 2 and return 3.
         let id = conn.alloc_id();
         assert_eq!(id, 3);
+    }
+
+    fn poll_pending(future: std::pin::Pin<&mut impl std::future::Future>) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut cx).is_pending());
+    }
+
+    /// An exchange future dropped mid-flight (forward race, fallback
+    /// cancellation, timeout) must release its pending slot immediately,
+    /// or repeated cancellations wedge the connection at capacity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_pipelined_exchange_releases_pending_slot() {
+        use tokio::io::duplex;
+
+        let (client, mut server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = Arc::new(PipelinedConn {
+            writer_tx,
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU16::new(0),
+            alive: AtomicBool::new(true),
+        });
+        spawn_reader(reader, conn.clone());
+        spawn_writer(writer, writer_rx, conn.clone());
+
+        let query = vec![0x01, 0x02, 0x03, 0x04];
+        let mut exchange = Box::pin(pipelined_exchange_on(
+            &conn,
+            &query,
+            Duration::from_secs(30),
+        ));
+        poll_pending(exchange.as_mut());
+        assert_eq!(conn.pending.lock().len(), 1, "slot held while in flight");
+
+        // Drop the exchange without a response: the slot must be freed.
+        drop(exchange);
+        assert!(
+            conn.pending.lock().is_empty(),
+            "cancelled exchange must not leak its pending slot"
+        );
+
+        // The queued frame must still be written out *complete* by the writer
+        // task — a cancelled exchange must never tear the stream framing.
+        // The ID is the transport-owned pipe id (0 for the first allocation).
+        let mut len_buf = [0u8; 2];
+        server.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u16::from_be_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; frame_len];
+        server.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame[0..2], 0u16.to_be_bytes(), "ID rewritten to pipe id");
+        assert_eq!(&frame[2..], &query[2..], "frame body intact");
     }
 }

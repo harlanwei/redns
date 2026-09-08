@@ -25,17 +25,18 @@
   let filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
     if (!q) return commands;
+    type Scored = { cmd: PaletteCommand; score: number };
     return commands
-      .map((cmd) => {
+      .map((cmd: PaletteCommand) => {
         const label = cmd.label.toLowerCase();
         const section = (cmd.section ?? '').toLowerCase();
         const idx = label.indexOf(q);
         const sectionHit = section.includes(q);
         return { cmd, score: idx === 0 ? 3 : idx > 0 ? 2 : sectionHit ? 1 : 0 };
       })
-      .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.cmd);
+      .filter((entry: Scored) => entry.score > 0)
+      .sort((a: Scored, b: Scored) => b.score - a.score)
+      .map((entry: Scored) => entry.cmd);
   });
 
   $effect(() => {

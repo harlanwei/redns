@@ -49,6 +49,52 @@ const NUM_BUFFERS: usize = 128;
 /// Provided-buffer group id for multishot mode.
 const BUF_GROUP_ID: u16 = 0;
 
+/// A non-blocking eventfd used as a kernel-visible wakeup source for the
+/// io_uring event loop. The loop blocks inside `io_uring_enter`
+/// (`submit_and_wait`); activity that arrives on Tokio channels — handler
+/// responses — and shutdown requests must interrupt that wait, otherwise
+/// responses are delayed until unrelated network traffic arrives and a
+/// cancelled server never exits. Arming a `PollAdd` on this fd makes the
+/// kernel wake the blocked loop when the Tokio side writes to it.
+struct WakeupFd {
+    fd: std::os::fd::RawFd,
+}
+
+impl WakeupFd {
+    fn new() -> std::io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    /// Wake the event loop. Safe from any thread; `EAGAIN` (counter full)
+    /// still leaves a pending wakeup, so errors are ignorable.
+    fn notify(&self) {
+        let inc: u64 = 1;
+        unsafe {
+            libc::write(self.fd, &inc as *const u64 as *const libc::c_void, 8);
+        }
+    }
+
+    /// Drain the counter so the armed poll can cleanly re-arm. A spurious
+    /// `EAGAIN` (race with another drainer) is harmless — there is only one
+    /// reader (the event loop thread).
+    fn drain(&self) {
+        let mut val: u64 = 0;
+        unsafe {
+            libc::read(self.fd, &mut val as *mut u64 as *mut libc::c_void, 8);
+        }
+    }
+}
+
+impl Drop for WakeupFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 /// Capacity for the handler-to-eventloop response channel.
 const SEND_CHANNEL_CAPACITY: usize = 1024;
 
@@ -67,6 +113,9 @@ const SUBMIT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_mill
 /// - High bit set  = recv completion, low bits = buffer index.
 /// - High bit clear = send completion, value = send_ctxs index.
 const RECV_MARKER: u64 = 1 << 63;
+
+/// User data marker for the eventfd wakeup poll (see [`WakeupFd`]).
+const WAKE_MARKER: u64 = 1 << 62;
 
 fn encode_recv_user_data(buf_idx: usize) -> u64 {
     RECV_MARKER | (buf_idx as u64)
@@ -133,6 +182,8 @@ struct BufRing {
     layout: std::alloc::Layout,
     /// Actual data buffers.
     buffers: Vec<Box<[u8; MAX_UDP_SIZE]>>,
+    /// Tail value published to the kernel at setup (all buffers available).
+    published: u16,
 }
 
 #[cfg(target_os = "linux")]
@@ -166,11 +217,8 @@ impl BufRing {
             entry.set_bid(i as u16);
         }
 
-        // Tail pointer sits just past the last entry (kernel reads it there).
-        let tail_ptr = unsafe { io_uring::types::BufRingEntry::tail(entries.as_ptr()) };
-        unsafe { std::ptr::write_volatile(tail_ptr as *mut u16, 0) };
-
-        // Register with the kernel.
+        // Register with the kernel. The registration syscall doubles as a
+        // memory barrier for the entry stores above.
         let ring_addr = entries.as_ptr() as u64;
         unsafe {
             ring.submitter().register_buf_ring_with_flags(
@@ -181,11 +229,26 @@ impl BufRing {
             )?;
         }
 
+        // Publish every buffer: the kernel consumes buffers from `head` up to
+        // `tail`, so leaving the tail at zero advertises *no* available
+        // buffers and every multishot receive would fail with ENOBUFS. The
+        // store must be volatile (the kernel reads the tail outside any Rust
+        // happens-before relationship).
+        let tail_ptr = unsafe { io_uring::types::BufRingEntry::tail(entries.as_ptr()) };
+        unsafe { std::ptr::write_volatile(tail_ptr as *mut u16, num_entries as u16) };
+
         Ok(Self {
             entries,
             layout,
             buffers,
+            published: num_entries as u16,
         })
+    }
+
+    /// The tail value the server must continue advancing from: every buffer
+    /// recycled by the application is published at the next tail position.
+    fn published(&self) -> u16 {
+        self.published
     }
 
     /// Recycle a buffer by advancing the ring tail.
@@ -201,11 +264,10 @@ impl BufRing {
 #[cfg(target_os = "linux")]
 impl Drop for BufRing {
     fn drop(&mut self) {
-        // Best-effort unregister.  Ignore errors – the kernel cleans up
-        // when the ring fd is closed anyway.
-        if let Ok(r) = IoUring::new(1) {
-            let _ = r.submitter().unregister_buf_ring(BUF_GROUP_ID);
-        }
+        // Only deallocate the ring memory here; unregistering from a freshly
+        // created unrelated ring (as this used to do) is a no-op for our
+        // group id. The owning server unregisters from its own ring, and the
+        // kernel cleans up when the ring fd is closed regardless.
         unsafe {
             std::alloc::dealloc(self.entries.as_ptr().cast::<u8>(), self.layout);
         }
@@ -220,9 +282,10 @@ impl Drop for BufRing {
 /// that the kernel writes into during RecvMsg, including the peer address.
 ///
 /// # Safety
-/// The raw pointers are self-referential (point into the same struct) and
-/// are only accessed from the single io_uring event-loop thread.  The
-/// struct is moved into `spawn_blocking` but never shared.
+/// The raw pointers are self-referential (point into the same heap
+/// allocation) and are only accessed from the single io_uring event-loop
+/// thread. The struct must live behind a stable box for as long as an SQE
+/// references it.
 #[cfg(target_os = "linux")]
 struct RecvCtx {
     addr_storage: libc::sockaddr_storage,
@@ -236,16 +299,23 @@ unsafe impl Send for RecvCtx {}
 
 #[cfg(target_os = "linux")]
 impl RecvCtx {
-    fn new() -> Self {
+    /// Allocates a `RecvCtx` on the heap and wires its self-referential
+    /// `msghdr` pointers to the box's final address.
+    ///
+    /// Wiring must happen *after* the struct reaches its stable address:
+    /// building it on the stack and then moving it into a container leaves
+    /// `msg_name`/`msg_iov` pointing at the abandoned stack location, and the
+    /// kernel then writes the peer address and iovec state into dead memory.
+    fn new_boxed() -> Box<Self> {
         let mut buffer = Box::new([0u8; MAX_UDP_SIZE]);
         let buf_ptr = buffer.as_mut_ptr();
 
-        let mut ctx = Self {
+        let mut ctx = Box::new(Self {
             addr_storage: unsafe { std::mem::zeroed() },
             msghdr: unsafe { std::mem::zeroed() },
             iovec: unsafe { std::mem::zeroed() },
             buffer,
-        };
+        });
 
         ctx.iovec.iov_base = buf_ptr as *mut libc::c_void;
         ctx.iovec.iov_len = MAX_UDP_SIZE;
@@ -466,17 +536,29 @@ fn sockaddr_to_socket_addr(
 // ---------------------------------------------------------------------------
 
 /// io_uring UDP server instance.
+///
+/// # Construction constraint
+/// The server — and therefore the ring — must be constructed on the thread
+/// that will run the event loop. `IORING_SETUP_SINGLE_ISSUER` records the
+/// creating task as the only task allowed to submit; a ring built on a Tokio
+/// worker and then entered from the blocking event-loop thread fails every
+/// `io_uring_enter` with `EEXIST`.
 #[cfg(target_os = "linux")]
 pub struct UringUdpServer {
     ring: IoUring<squeue::Entry, cqueue::Entry>,
     socket_fd: std::os::raw::c_int,
-    /// Single-shot: per-buffer receive contexts.
-    recv_ctxs: Vec<RecvCtx>,
+    /// Single-shot: per-buffer receive contexts. Each lives behind its own
+    /// stable heap allocation for the server's lifetime (the box is
+    /// load-bearing: the kernel writes through self-pointers into it).
+    #[allow(clippy::vec_box)]
+    recv_ctxs: Vec<Box<RecvCtx>>,
     /// Shared send context slab (both modes). Stable-index storage so an
     /// in-flight `SendMsg` SQE's `user_data` always maps back to the same box.
     send_ctxs: SendSlab,
     pending_sends: VecDeque<UringSend>,
     shutdown: Arc<AtomicBool>,
+    /// Kernel-visible wakeup for channel activity and shutdown.
+    wakeup: Option<Arc<WakeupFd>>,
     /// Multishot: provided-buffer ring.
     buf_ring: Option<BufRing>,
     /// Multishot: template msghdr submitted with RecvMsgMulti.
@@ -487,7 +569,8 @@ pub struct UringUdpServer {
     multishot_template: Option<Box<MultishotTemplate>>,
     /// Multishot: whether the multishot SQE is still active (has MORE pending).
     multishot_active: bool,
-    /// Running tail counter for buffer recycling.
+    /// Running tail counter for buffer recycling. Starts at the number of
+    /// published buffers (they are all advertised at setup).
     buf_tail: u16,
     /// Enable multishot RecvMsgMulti (requires kernel ≥ 6.0).
     multishot: bool,
@@ -503,12 +586,29 @@ pub struct UringUdpServer {
 unsafe impl Send for UringUdpServer {}
 
 #[cfg(target_os = "linux")]
+impl Drop for UringUdpServer {
+    fn drop(&mut self) {
+        // Unregister the buffer ring from *this* ring while it is still open.
+        // Field drop order would otherwise tear down the buf ring before the
+        // ring itself, so the explicit unregister must happen here.
+        if self.buf_ring.is_some() {
+            let _ = self.ring.submitter().unregister_buf_ring(BUF_GROUP_ID);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl UringUdpServer {
     /// Create a new io_uring UDP server from an existing UDP socket.
-    pub fn new(
+    ///
+    /// Must be called on the thread that will later run [`UringUdpServer::run`]
+    /// (see the type's construction constraint).
+    fn new(
         socket: &tokio::net::UdpSocket,
         multishot: bool,
         max_inflight_handlers: usize,
+        shutdown: Arc<AtomicBool>,
+        wakeup: Option<Arc<WakeupFd>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let socket_fd = socket.as_raw_fd();
 
@@ -517,10 +617,11 @@ impl UringUdpServer {
         Ok(Self {
             ring,
             socket_fd,
-            recv_ctxs: (0..NUM_BUFFERS).map(|_| RecvCtx::new()).collect(),
+            recv_ctxs: (0..NUM_BUFFERS).map(|_| RecvCtx::new_boxed()).collect(),
             send_ctxs: SendSlab::default(),
             pending_sends: VecDeque::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
+            wakeup,
             buf_ring: None,
             msghdr_template: None,
             multishot_template: None,
@@ -557,11 +658,13 @@ impl UringUdpServer {
         msghdr.msg_iov = &mut template.iovec as *mut _;
         msghdr.msg_iovlen = 1;
 
+        // All buffers were published by BufRing::new; recycling continues the
+        // tail from there.
+        self.buf_tail = buf_ring.published();
         self.buf_ring = Some(buf_ring);
         self.msghdr_template = Some(msghdr);
         self.multishot_template = Some(template);
         self.multishot_active = false;
-        self.buf_tail = 0;
 
         self.submit_multishot_recv()?;
 
@@ -669,18 +772,27 @@ impl UringUdpServer {
 
             let handler = handler.clone();
             let tx = send_tx.clone();
+            let wakeup = self.wakeup.clone();
 
             tokio::runtime::Handle::current().spawn(async move {
                 let _permit = permit;
                 match handler.handle_udp(query, meta).await {
                     Ok(resp_bytes) => {
                         if let Some(peer) = peer {
-                            let _ = tx
+                            let sent = tx
                                 .send(UringSend {
                                     response: resp_bytes,
                                     peer,
                                 })
                                 .await;
+                            if sent.is_ok() {
+                                // The event loop is blocked in the kernel;
+                                // give it a wakeup so the response is sent
+                                // without waiting for other network traffic.
+                                if let Some(w) = &wakeup {
+                                    w.notify();
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -721,6 +833,11 @@ impl UringUdpServer {
             );
         }
 
+        // The eventfd wakeup poll is armed whenever it is not currently in
+        // flight; its completion drains the counter and loops back so channel
+        // activity and shutdown are observed on the next iteration.
+        let mut wake_armed = false;
+
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 debug!("io_uring UDP server: shutdown requested");
@@ -729,14 +846,18 @@ impl UringUdpServer {
 
             self.drain_and_submit_sends(&mut send_rx);
 
+            if !wake_armed {
+                if let Err(e) = self.arm_wakeup() {
+                    warn!(error = %e, "io_uring: failed to arm eventfd wakeup");
+                    std::thread::sleep(SUBMIT_ERROR_BACKOFF);
+                } else {
+                    wake_armed = true;
+                }
+            }
+
             // Submit & wait. A persistently failing submit/submit_and_wait would
             // otherwise spin this loop at 100% CPU; back off briefly so a
             // transient error does not turn into a busy-loop.
-            if let Err(e) = self.ring.submit() {
-                warn!(error = %e, "io_uring submit failed");
-                std::thread::sleep(SUBMIT_ERROR_BACKOFF);
-                continue;
-            }
             match self.ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -755,6 +876,20 @@ impl UringUdpServer {
                 .collect();
 
             for (user_data, result, flags) in completions {
+                // Wakeup poll fired: responses (or shutdown) are pending on
+                // the Tokio side. Drain the eventfd counter and re-arm on the
+                // next iteration; the loop top drains the send channel and
+                // re-checks the shutdown flag.
+                if user_data == WAKE_MARKER {
+                    wake_armed = false;
+                    if result < 0 {
+                        warn!(result = result, "io_uring eventfd wakeup poll failed");
+                    } else if let Some(w) = &self.wakeup {
+                        w.drain();
+                    }
+                    continue;
+                }
+
                 if result < 0 {
                     warn!(result = result, "io_uring operation failed");
                     if self.multishot {
@@ -803,6 +938,21 @@ impl UringUdpServer {
         }
 
         debug!("io_uring UDP server: event loop exiting");
+        Ok(())
+    }
+
+    /// Arm a `PollAdd` on the wakeup eventfd so a blocked
+    /// `submit_and_wait` is interrupted by Tokio-side activity.
+    fn arm_wakeup(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(w) = &self.wakeup else {
+            return Ok(());
+        };
+        let sqe = opcode::PollAdd::new(Fd(w.fd), libc::POLLIN as u32)
+            .build()
+            .user_data(WAKE_MARKER);
+        unsafe {
+            self.ring.submission().push(&sqe)?;
+        }
         Ok(())
     }
 
@@ -965,20 +1115,43 @@ pub async fn serve_udp_uring_with_options(
         .max_inflight_handlers
         .unwrap_or(MAX_INFLIGHT_HANDLERS);
 
-    let server = UringUdpServer::new(&socket, multishot, max_inflight)?;
-    let shutdown = server.shutdown.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // Best-effort: losing the wakeup only delays channel activity until the
+    // next network completion (the pre-existing behaviour).
+    let wakeup = WakeupFd::new().ok().map(Arc::new);
+    if wakeup.is_none() {
+        warn!("io_uring: eventfd unavailable, running without kernel-visible wakeups");
+    }
 
-    let handle = tokio::task::spawn_blocking(move || {
-        if let Err(e) = server.run(handler, send_tx, send_rx) {
-            error!(error = %e, "io_uring UDP server error");
-        }
-    });
+    // The server (and the ring) must be created on the thread that submits:
+    // IORING_SETUP_SINGLE_ISSUER binds submission to the creating task, so
+    // constructing on a Tokio worker and entering from this blocking thread
+    // fails every submit with EEXIST.
+    let handle = {
+        let shutdown = shutdown.clone();
+        let wakeup = wakeup.clone();
+        tokio::task::spawn_blocking(move || {
+            match UringUdpServer::new(&socket, multishot, max_inflight, shutdown, wakeup) {
+                Ok(server) => {
+                    if let Err(e) = server.run(handler, send_tx, send_rx) {
+                        error!(error = %e, "io_uring UDP server error");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "io_uring UDP server failed to start");
+                }
+            }
+        })
+    };
 
     cancel.cancelled().await;
     debug!("io_uring UDP server: cancellation requested");
 
-    // Signal the event loop to stop.
+    // Signal the event loop to stop and wake it out of its kernel wait.
     shutdown.store(true, Ordering::Release);
+    if let Some(w) = &wakeup {
+        w.notify();
+    }
 
     // Wait for the blocking task to finish.
     let _ = handle.await;
@@ -998,5 +1171,93 @@ pub fn is_uring_available() -> bool {
             debug!(error = %e, "io_uring is not available");
             false
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
+
+    struct EchoHandler;
+    #[async_trait::async_trait]
+    impl DnsHandler for EchoHandler {
+        async fn handle(
+            &self,
+            query: Message,
+            _meta: QueryMeta,
+        ) -> crate::plugin::PluginResult<Message> {
+            let mut resp = Message::response(query.id, OpCode::Query);
+            resp.metadata.response_code = hickory_proto::op::ResponseCode::NoError;
+            if let Some(q) = query.queries.first() {
+                resp.add_query(q.clone());
+            }
+            Ok(resp)
+        }
+    }
+
+    /// End-to-end probe over the real kernel interface. Covers the four
+    /// construction defects at once:
+    /// - the ring is created on the submitting (blocking) thread, so
+    ///   SINGLE_ISSUER does not reject every enter with EEXIST;
+    /// - the provided-buffer ring publishes its buffers (multishot mode
+    ///   answers instead of failing with ENOBUFS);
+    /// - single-shot receive contexts sit at stable addresses;
+    /// - the eventfd wakeup makes channel-driven responses and shutdown
+    ///   interrupt the blocked event loop: the response below arrives with no
+    ///   other network activity, and cancellation exits promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_server_answers_query_and_exits_on_shutdown() {
+        if !is_uring_available() {
+            return;
+        }
+
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = socket.local_addr().unwrap();
+
+        let handler: Arc<dyn DnsHandler> = Arc::new(EchoHandler);
+        let cancel = CancellationToken::new();
+
+        let server_task = tokio::spawn(serve_udp_uring(
+            socket.clone(),
+            handler,
+            cancel.clone(),
+        ));
+
+        // Give the blocking thread time to create the ring and arm receives.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut query = Message::new(0x5151, MessageType::Query, OpCode::Query);
+        query.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("uring.test.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        let wire = query.to_vec().unwrap();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&wire, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("server must answer the query")
+        .unwrap();
+        let resp = Message::from_vec(&buf[..n]).unwrap();
+        assert_eq!(resp.id, 0x5151);
+        assert_eq!(resp.message_type, MessageType::Response);
+
+        // Shutdown must interrupt the blocked event loop promptly.
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(3), server_task)
+            .await
+            .expect("server must exit promptly after cancellation")
+            .unwrap()
+            .expect("server task reported no error");
     }
 }

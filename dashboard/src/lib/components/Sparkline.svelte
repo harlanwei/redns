@@ -17,12 +17,14 @@
   const uid = ++uidCounter;
   const PAD = 2;
 
-  let points = $derived.by(() => {
+  type Point = { x: number; y: number };
+
+  let points = $derived.by((): Point[] => {
     if (values.length < 2) return [];
     const min = Math.min(...values);
     const max = Math.max(...values);
     const span = max - min || 1;
-    return values.map((v, i) => {
+    return values.map((v: number, i: number) => {
       const x = (i / (values.length - 1)) * (width - PAD * 2) + PAD;
       const y = height - PAD - ((v - min) / span) * (height - PAD * 2);
       return { x, y };
@@ -30,7 +32,9 @@
   });
 
   let linePath = $derived(
-    points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '),
+    points
+      .map((p: Point, i: number) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+      .join(' '),
   );
   let areaPath = $derived(
     points.length

@@ -81,7 +81,7 @@ pub struct Context {
     /// The original EDNS0 OPT sent by the client (if any).
     client_edns: Option<Edns>,
 
-    /// Optional original query wire bytes as received by the server.
+    /// Lazily serialized logical query, invalidated by `query_mut`.
     query_wire: Option<std::sync::Arc<Vec<u8>>>,
 
     /// The parsed DNS response (may be empty until a plugin sets it or a
@@ -165,6 +165,34 @@ impl Context {
         }
     }
 
+    /// Creates a branch context from `parent`.
+    ///
+    /// Unlike `Context::new(parent.query().clone())`, the already-ingress-
+    /// normalized logical query is carried over verbatim: the OPT record the
+    /// parent built (configured payload size, copied DO bit, options added by
+    /// plugins such as `ecs_handler`) is preserved instead of being rebuilt,
+    /// and the parent's `edns_udp_size` and server metadata carry over. Only
+    /// per-query state (response, KV, marks, step budget) starts fresh.
+    pub fn fork_from(parent: &Context) -> Self {
+        let id = CONTEXT_UID.fetch_add(1, Ordering::Relaxed) + 1;
+        Context {
+            id,
+            start_time: Instant::now(),
+            server_meta: parent.server_meta.clone(),
+            query: parent.query.clone(),
+            client_edns: parent.client_edns.clone(),
+            query_wire: None,
+            response: OnceLock::new(),
+            response_wire: None,
+            selected_upstream: None,
+            kv: None,
+            marks: None,
+            cache_hit: false,
+            steps_remaining: MAX_CHAIN_STEPS,
+            edns_udp_size: parent.edns_udp_size,
+        }
+    }
+
     /// Charges one chain-node execution against this query's step budget.
     ///
     /// Returns `Err` once the budget is exhausted, which aborts the query
@@ -225,14 +253,29 @@ impl Context {
         self.client_edns.as_ref()
     }
 
-    /// Sets optional original query wire bytes captured by the ingress server.
+    /// Sets wire bytes matching the current logical query, never raw ingress bytes.
     pub fn set_query_wire(&mut self, wire: Option<std::sync::Arc<Vec<u8>>>) {
         self.query_wire = wire;
     }
 
-    /// Returns original query wire bytes when available.
+    /// Returns the cached logical query wire when available.
     pub fn query_wire(&self) -> Option<&std::sync::Arc<Vec<u8>>> {
         self.query_wire.as_ref()
+    }
+
+    /// Serialize only when a forwarder needs wire bytes, reusing them until the
+    /// logical query changes. Cache hits and local answers don't need this work.
+    pub fn serialize_query(&mut self) -> PluginResult<Arc<Vec<u8>>> {
+        if let Some(wire) = &self.query_wire {
+            return Ok(wire.clone());
+        }
+        let wire = Arc::new(self.query.to_vec().map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to serialize query: {e}").into()
+            },
+        )?);
+        self.query_wire = Some(wire.clone());
+        Ok(wire)
     }
 
     // ── Response ─────────────────────────────────────────────────
@@ -473,6 +516,23 @@ mod tests {
     }
 
     #[test]
+    fn query_serialization_is_lazy_reused_and_invalidated() {
+        let mut ctx = Context::new(make_query());
+        assert!(ctx.query_wire().is_none());
+        let first = ctx.serialize_query().unwrap();
+        let second = ctx.serialize_query().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let decoded = Message::from_vec(&first).unwrap();
+        assert_eq!(decoded.edns.unwrap().max_payload(), DEFAULT_EDNS0_SIZE);
+
+        ctx.query_mut().queries[0].set_name(Name::from_ascii("rewritten.example.").unwrap());
+        assert!(ctx.query_wire().is_none());
+        let rewritten = ctx.serialize_query().unwrap();
+        assert!(!Arc::ptr_eq(&first, &rewritten));
+        assert_eq!(Message::from_vec(&rewritten).unwrap().queries[0].name().to_ascii(), "rewritten.example.");
+    }
+
+    #[test]
     fn context_response_lifecycle() {
         let mut ctx = Context::new(make_query());
         assert!(ctx.response().is_none());
@@ -530,6 +590,45 @@ mod tests {
 
         ctx.delete_mark(42);
         assert!(!ctx.has_mark(42));
+    }
+
+    #[test]
+    fn fork_preserves_normalized_query_and_settings() {
+        use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+
+        let mut parent = Context::with_edns_size(make_query(), 4096);
+        // Simulate a plugin (e.g. ecs_handler) rewriting the logical EDNS.
+        parent
+            .query_mut()
+            .edns
+            .as_mut()
+            .unwrap()
+            .options_mut()
+            .options
+            .push((EdnsCode::Unknown(8), EdnsOption::Unknown(8, vec![9, 9])));
+        parent.query_mut().queries[0].set_name(Name::from_ascii("rewritten.example.").unwrap());
+        parent.set_response(Some(make_response(60)));
+        parent.set_mark(42);
+
+        let branch = Context::fork_from(&parent);
+        assert_eq!(branch.edns_udp_size(), 4096, "request settings carry over");
+        assert_eq!(
+            branch.query().edns.as_ref().unwrap().max_payload(),
+            4096,
+            "the parent's built OPT must not be rebuilt with the default size"
+        );
+        assert_eq!(
+            branch.query().edns.as_ref().unwrap().options().options.len(),
+            1,
+            "logical EDNS options (e.g. ECS) must be preserved"
+        );
+        assert_eq!(
+            branch.question().unwrap().name().to_ascii(),
+            "rewritten.example."
+        );
+        // Per-query state starts fresh.
+        assert!(!branch.has_response_output());
+        assert!(!branch.has_mark(42));
     }
 
     #[test]

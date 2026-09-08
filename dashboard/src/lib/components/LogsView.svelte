@@ -274,15 +274,16 @@
     </div>
 
     {#if logsResponse && logsResponse.total_pages > 1}
+      {@const totalPages = logsResponse.total_pages}
       <div class="flex items-center justify-between border-t border-line px-4 py-3">
         <div class="flex flex-1 justify-between sm:hidden">
           <button disabled={page === 1} onclick={() => fetchLogs(page - 1, searchQuery)} class="btn btn-secondary disabled:opacity-40">Previous</button>
-          <button disabled={page >= logsResponse.total_pages} onclick={() => fetchLogs(page + 1, searchQuery)} class="btn btn-secondary disabled:opacity-40">Next</button>
+          <button disabled={page >= totalPages} onclick={() => fetchLogs(page + 1, searchQuery)} class="btn btn-secondary disabled:opacity-40">Next</button>
         </div>
         <div class="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
           <p class="text-sm text-muted">
             Page <span class="font-semibold text-ink tabular-nums">{logsResponse.page}</span>
-            of <span class="font-semibold text-ink tabular-nums">{logsResponse.total_pages}</span>
+            of <span class="font-semibold text-ink tabular-nums">{totalPages}</span>
           </p>
           <div class="flex items-center gap-2">
             <nav class="inline-flex -space-x-px rounded-lg shadow-soft" aria-label="Pagination">
@@ -294,29 +295,29 @@
                 <button onclick={() => fetchLogs(page - 1, searchQuery)} class="border border-line bg-surface px-3 py-1.5 text-sm text-muted tabular-nums hover:bg-panel">{page - 1}</button>
               {/if}
               <button class="border border-transparent bg-accent-fill px-3 py-1.5 text-sm font-semibold text-on-accent tabular-nums">{page}</button>
-              {#if page < logsResponse.total_pages}
+              {#if page < totalPages}
                 <button onclick={() => fetchLogs(page + 1, searchQuery)} class="border border-line bg-surface px-3 py-1.5 text-sm text-muted tabular-nums hover:bg-panel">{page + 1}</button>
               {/if}
-              {#if page < logsResponse.total_pages - 1}
+              {#if page < totalPages - 1}
                 <button onclick={() => fetchLogs(page + 2, searchQuery)} class="border border-line bg-surface px-3 py-1.5 text-sm text-muted tabular-nums hover:bg-panel">{page + 2}</button>
               {/if}
-              {#if page < logsResponse.total_pages - 2}
+              {#if page < totalPages - 2}
                 <span class="border border-line bg-surface px-3 py-1.5 text-sm text-faint">…</span>
               {/if}
-              <button onclick={() => fetchLogs(logsResponse.total_pages, searchQuery)} class="rounded-r-lg border border-line bg-surface px-3 py-1.5 text-sm text-muted tabular-nums hover:bg-panel">{logsResponse.total_pages}</button>
+              <button onclick={() => fetchLogs(totalPages, searchQuery)} class="rounded-r-lg border border-line bg-surface px-3 py-1.5 text-sm text-muted tabular-nums hover:bg-panel">{totalPages}</button>
             </nav>
             <form
               onsubmit={(e) => {
                 e.preventDefault();
                 const p = parseInt(pageInput, 10);
-                if (!isNaN(p) && p >= 1 && p <= logsResponse.total_pages) {
+                if (!isNaN(p) && p >= 1 && p <= totalPages) {
                   fetchLogs(p, searchQuery);
                   pageInput = '';
                 }
               }}
               class="flex items-center"
             >
-              <input type="number" min="1" max={logsResponse.total_pages} bind:value={pageInput} placeholder="Page" class="field w-16 rounded-r-none py-1.5 text-sm tabular-nums" />
+              <input type="number" min="1" max={totalPages} bind:value={pageInput} placeholder="Page" class="field w-16 rounded-r-none py-1.5 text-sm tabular-nums" />
               <button type="submit" class="rounded-r-lg border border-l-0 border-line bg-panel px-3 py-1.5 text-sm font-medium text-muted hover:bg-line">Go</button>
             </form>
           </div>

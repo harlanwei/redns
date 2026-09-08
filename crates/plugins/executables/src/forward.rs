@@ -119,6 +119,64 @@ fn dns_header_rcode(resp_wire: &[u8]) -> Option<u16> {
     Some((resp_wire[3] & 0x0f) as u16)
 }
 
+/// Parse an upstream response, recovering messages whose trailing zero bytes
+/// were trimmed by the upstream (see [`repair_trailing_trim`]).
+fn parse_response(resp_bytes: &[u8]) -> Option<Message> {
+    match Message::from_vec(resp_bytes) {
+        Ok(resp) => Some(resp),
+        Err(e) => {
+            let repaired = repair_trailing_trim(resp_bytes)?;
+            match Message::from_vec(&repaired) {
+                Ok(resp) => Some(resp),
+                Err(_) => {
+                    debug!(error = %e, "upstream response unparseable after repair");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Verify an upstream response actually answers `query`: it must be a
+/// response message carrying the same ID and echoing the question (name
+/// matched case-insensitively, plus type and class). A response that fails
+/// this check must not be adopted or cached — on pooled transports a stale
+/// datagram can otherwise be mistaken for this query's answer.
+fn validate_response(resp: &Message, query: &Message) -> PluginResult<()> {
+    use hickory_proto::op::MessageType;
+
+    if resp.id != query.id {
+        return Err(format!(
+            "upstream response ID mismatch (got {}, want {})",
+            resp.id, query.id
+        )
+        .into());
+    }
+    if resp.message_type != MessageType::Response {
+        return Err("upstream reply is not a response message".into());
+    }
+    match (resp.queries.first(), query.queries.first()) {
+        (Some(rq), Some(qq)) => {
+            // `Name: PartialEq` compares case-insensitively.
+            let matches = rq.query_type() == qq.query_type()
+                && rq.query_class() == qq.query_class()
+                && rq.name() == qq.name();
+            if !matches {
+                return Err(format!(
+                    "upstream response question mismatch (got {} {}, want {} {})",
+                    rq.name(),
+                    rq.query_type(),
+                    qq.name(),
+                    qq.query_type()
+                )
+                .into());
+            }
+        }
+        _ => return Err("upstream response has no question".into()),
+    }
+    Ok(())
+}
+
 // ── Configuration ───────────────────────────────────────────────
 
 /// Per-upstream configuration.
@@ -631,20 +689,11 @@ impl Forward {
 
         if selected.len() == 1 {
             let resp_bytes = selected[0].exchange(query_bytes.as_slice()).await?;
-            let resp = match Message::from_vec(&resp_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Some(repaired) = repair_trailing_trim(&resp_bytes) {
-                        if let Ok(r) = Message::from_vec(&repaired) {
-                            r
-                        } else {
-                            return Err(format!("invalid upstream response: {e}").into());
-                        }
-                    } else {
-                        return Err(format!("invalid upstream response: {e}").into());
-                    }
-                }
-            };
+            let resp = parse_response(&resp_bytes).ok_or_else(
+                || -> Box<dyn std::error::Error + Send + Sync> {
+                    "invalid upstream response".into()
+                },
+            )?;
             selected[0].record_adopted();
             return Ok((resp, selected[0].clone()));
         }
@@ -673,6 +722,15 @@ impl Forward {
 
         let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut responses_received = 0;
+        // First valid DNS error response (SERVFAIL, REFUSED, …) received while
+        // still waiting for a preferred NOERROR/NXDOMAIN. If every remaining
+        // upstream then fails at the transport level, this response is returned
+        // instead of an error: an upstream that *answered* beats a transport
+        // failure, and dropping its answer would misreport "no upstream
+        // responded" to the caller — which (under best_effort) would re-resolve
+        // the query through system DNS, defeating upstream policy (a SERVFAIL
+        // may be a validating resolver rejecting a bogus answer).
+        let mut retained: Option<(Message, Arc<UpstreamWrapper>)> = None;
 
         while responses_received < total {
             let join_result = if next_to_launch < total {
@@ -732,25 +790,23 @@ impl Forward {
                         selected[sel_idx].record_rejected_rcode();
                         debug!(plugin = %self.name, upstream = %upstream_name, rcode, "skipping upstream response with non-ideal rcode");
                         last_err = Some(format!("upstream returned rcode {}", rcode).into());
+                        if retained.is_none()
+                            && let Some(resp) = parse_response(&resp_bytes)
+                        {
+                            retained = Some((resp, selected[sel_idx].clone()));
+                        }
                         continue;
                     }
 
-                    match Message::from_vec(&resp_bytes) {
-                        Ok(resp) => {
+                    match parse_response(&resp_bytes) {
+                        Some(resp) => {
                             selected[sel_idx].record_adopted();
                             tasks.abort_all();
                             return Ok((resp, selected[sel_idx].clone()));
                         }
-                        Err(e) => {
-                            if let Some(repaired) = repair_trailing_trim(&resp_bytes) {
-                                if let Ok(resp) = Message::from_vec(&repaired) {
-                                    selected[sel_idx].record_adopted();
-                                    tasks.abort_all();
-                                    return Ok((resp, selected[sel_idx].clone()));
-                                }
-                            }
-                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, error = %e, "invalid upstream response");
-                            last_err = Some(format!("invalid response: {e}").into());
+                        None => {
+                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, "invalid upstream response");
+                            last_err = Some("invalid response".into());
                         }
                     }
                 }
@@ -761,6 +817,10 @@ impl Forward {
             }
         }
 
+        if let Some((resp, upstream)) = retained {
+            upstream.record_adopted();
+            return Ok((resp, upstream));
+        }
         if let Some(e) = last_err {
             return Err(e);
         }
@@ -770,43 +830,30 @@ impl Forward {
     async fn resolve(
         &self,
         query: &Message,
-        // Optional pre-serialized form of `query`. Must reflect the *current*
-        // logical message (including EDNS rewrite / ECS / redirect). Stale
-        // client-capture wire is never safe here — `Context::query_mut` clears
-        // the cache so callers re-serialize after mutation.
-        cached_query_wire: Option<Arc<Vec<u8>>>,
+        query_bytes: Arc<Vec<u8>>,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let qname = query
             .queries
             .first()
             .map(|q| q.name().to_ascii())
             .unwrap_or_default();
-        let query_bytes = if let Some(raw) = cached_query_wire {
-            raw
-        } else {
-            Arc::new(query.to_vec().map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("failed to serialize query: {e}").into()
-                },
-            )?)
-        };
-        self.resolve_once(query_bytes, &qname).await
+        let (resp, upstream) = self.resolve_once(query_bytes, &qname).await?;
+        // A parsed response that doesn't answer *this* question must not be
+        // adopted or cached — reject it before it reaches the caller.
+        validate_response(&resp, query)?;
+        Ok((resp, upstream))
     }
 }
 
 #[async_trait]
 impl Executable for Forward {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-        if ctx.response().is_some() {
+        if ctx.has_response_output() {
             return Ok(());
         }
 
-        // Prefer Context's logical wire cache (set after EDNS rewrite, cleared
-        // by query_mut on any subsequent mutation). Never use the raw client
-        // packet from ingress.
-        let (resp, selected_upstream) = self
-            .resolve(ctx.query(), ctx.query_wire().cloned())
-            .await?;
+        let query_wire = ctx.serialize_query()?;
+        let (resp, selected_upstream) = self.resolve(ctx.query(), query_wire).await?;
         ctx.store_value(KV_SELECTED_UPSTREAM, selected_upstream);
         ctx.set_response(Some(resp));
 
@@ -1048,5 +1095,167 @@ upstreams:
         } else {
             panic!("expected AAAA rdata");
         }
+    }
+
+    // ── Response selection ────────────────────────────────────────
+
+    use hickory_proto::op::{MessageType, OpCode, Query as HQuery};
+    use hickory_proto::rr::{Name as HName, RecordType as HRecordType};
+
+    /// Upstream mock that answers every query with a fixed rcode.
+    struct MockRcode(ResponseCode);
+    #[async_trait]
+    impl upstream::Upstream for MockRcode {
+        async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+            let msg = Message::from_vec(query).unwrap();
+            let mut resp = Message::response(msg.id, OpCode::Query);
+            resp.metadata.response_code = self.0;
+            if let Some(q) = msg.queries.first() {
+                resp.add_query(q.clone());
+            }
+            resp.to_vec()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
+        }
+    }
+
+    /// Upstream mock that always fails at the transport level (no DNS
+    /// response at all).
+    struct MockTransportErr;
+    #[async_trait]
+    impl upstream::Upstream for MockTransportErr {
+        async fn exchange(&self, _query: &[u8]) -> PluginResult<Vec<u8>> {
+            Err("transport failed".into())
+        }
+    }
+
+    fn mock_query() -> Message {
+        let mut msg = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        msg.add_query({
+            let mut q = HQuery::new();
+            q.set_name(HName::from_ascii("example.com.").unwrap())
+                .set_query_type(HRecordType::A);
+            q
+        });
+        msg
+    }
+
+    fn forward_with(upstreams: Vec<Arc<UpstreamWrapper>>) -> Forward {
+        let selector = UpstreamSelector::new(upstreams.clone());
+        Forward {
+            name: "test".into(),
+            upstreams,
+            selector,
+            concurrent: MAX_CONCURRENT_QUERIES,
+            tag_index: HashMap::new(),
+        }
+    }
+
+    /// Audit regression: with two upstreams, an early SERVFAIL used to be
+    /// discarded while waiting for the preferred response; if the remaining
+    /// upstream then failed at the transport level, the forwarder returned an
+    /// error with no DNS response — which EntryHandler classifies as "no
+    /// upstream responded" and (under best_effort) re-resolves through the
+    /// system DNS. The upstream SERVFAIL must be preserved instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_servfail_survives_sibling_transport_failure() {
+        let upstreams = vec![
+            Arc::new(UpstreamWrapper::new(
+                Box::new(MockRcode(ResponseCode::ServFail)),
+                "servfail".into(),
+                "UDP".into(),
+            )),
+            Arc::new(UpstreamWrapper::new(
+                Box::new(MockTransportErr),
+                "broken".into(),
+                "UDP".into(),
+            )),
+        ];
+        let forward = forward_with(upstreams);
+        let query = mock_query();
+        let wire = Arc::new(query.to_vec().unwrap());
+
+        let (resp, selected) = forward.resolve(&query, wire).await.unwrap();
+        assert_eq!(selected.name(), "servfail");
+        assert_eq!(resp.response_code, ResponseCode::ServFail);
+    }
+
+    /// The preference order is unchanged: a later NOERROR still beats an
+    /// earlier SERVFAIL within the hedge window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noerror_still_beats_earlier_servfail() {
+        struct DelayedNoerror;
+        #[async_trait]
+        impl upstream::Upstream for DelayedNoerror {
+            async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+                let msg = Message::from_vec(query).unwrap();
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let mut resp = Message::response(msg.id, OpCode::Query);
+                resp.metadata.response_code = ResponseCode::NoError;
+                if let Some(q) = msg.queries.first() {
+                    resp.add_query(q.clone());
+                }
+                resp.to_vec()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        e.to_string().into()
+                    })
+            }
+        }
+
+        let upstreams = vec![
+            Arc::new(UpstreamWrapper::new(
+                Box::new(MockRcode(ResponseCode::ServFail)),
+                "servfail".into(),
+                "UDP".into(),
+            )),
+            Arc::new(UpstreamWrapper::new(
+                Box::new(DelayedNoerror),
+                "good".into(),
+                "UDP".into(),
+            )),
+        ];
+        let forward = forward_with(upstreams);
+        let query = mock_query();
+        let wire = Arc::new(query.to_vec().unwrap());
+
+        let (resp, selected) = forward.resolve(&query, wire).await.unwrap();
+        assert_eq!(selected.name(), "good");
+        assert_eq!(resp.response_code, ResponseCode::NoError);
+    }
+
+    /// A response that does not echo the request's question must be rejected
+    /// instead of adopted or cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mismatched_question_is_rejected() {
+        struct WrongQuestion;
+        #[async_trait]
+        impl upstream::Upstream for WrongQuestion {
+            async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
+                let msg = Message::from_vec(query).unwrap();
+                let mut resp = Message::response(msg.id, OpCode::Query);
+                resp.metadata.response_code = ResponseCode::NoError;
+                let mut q = HQuery::new();
+                q.set_name(HName::from_ascii("other.example.").unwrap())
+                    .set_query_type(HRecordType::A);
+                resp.add_query(q);
+                resp.to_vec()
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        e.to_string().into()
+                    })
+            }
+        }
+
+        let upstreams = vec![Arc::new(UpstreamWrapper::new(
+            Box::new(WrongQuestion),
+            "liar".into(),
+            "UDP".into(),
+        ))];
+        let forward = forward_with(upstreams);
+        let query = mock_query();
+        let wire = Arc::new(query.to_vec().unwrap());
+
+        assert!(
+            forward.resolve(&query, wire).await.is_err(),
+            "a response for a different question must not be adopted"
+        );
     }
 }
