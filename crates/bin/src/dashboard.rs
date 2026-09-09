@@ -1391,6 +1391,10 @@ pub async fn serve_dashboard(
                     }
                     Err(e) => {
                         warn!(error = %e, "dashboard accept error");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(crate::ACCEPT_ERROR_BACKOFF) => {}
+                        }
                     }
                 }
             }

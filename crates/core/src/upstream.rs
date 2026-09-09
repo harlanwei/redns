@@ -86,6 +86,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 /// Absolute maximum DNS UDP payload we will attempt to receive (EDNS upper bound).
@@ -641,9 +642,37 @@ struct PipelinedConn {
     pending: StdMutex<HashMap<u16, tokio::sync::oneshot::Sender<PluginResult<Vec<u8>>>>>,
     next_id: AtomicU16,
     alive: AtomicBool,
+    cancel: CancellationToken,
 }
 
 impl PipelinedConn {
+    fn new<R, W>(reader: R, writer: W, next_id: u16) -> Arc<Self>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = Arc::new(Self {
+            writer_tx,
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU16::new(next_id),
+            alive: AtomicBool::new(true),
+            cancel: CancellationToken::new(),
+        });
+        spawn_writer(writer, writer_rx, &conn);
+        spawn_reader(reader, &conn);
+        conn
+    }
+
+    fn close(&self) {
+        self.alive.store(false, Ordering::Release);
+        self.cancel.cancel();
+        let drained: Vec<_> = self.pending.lock().drain().collect();
+        for (_, tx) in drained {
+            let _ = tx.send(Err("pipelined connection closed".into()));
+        }
+    }
+
     fn alloc_id(&self) -> u16 {
         loop {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -655,6 +684,12 @@ impl PipelinedConn {
 
     fn inflight(&self) -> usize {
         self.pending.lock().len()
+    }
+}
+
+impl Drop for PipelinedConn {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -683,33 +718,40 @@ impl Drop for PendingSlotGuard {
     }
 }
 
-fn spawn_reader<R>(mut reader: R, conn: Arc<PipelinedConn>)
+fn spawn_reader<R>(mut reader: R, conn: &Arc<PipelinedConn>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let cancel = conn.cancel.clone();
+    let conn = Arc::downgrade(conn);
     tokio::spawn(async move {
-        loop {
-            let mut len_buf = [0u8; 2];
-            if reader.read_exact(&mut len_buf).await.is_err() {
-                break;
-            }
-            let resp_len = u16::from_be_bytes(len_buf) as usize;
-            let mut resp_buf = vec![0u8; resp_len];
-            if reader.read_exact(&mut resp_buf).await.is_err() {
-                break;
-            }
-            if resp_buf.len() < 2 {
-                continue;
-            }
-            let id = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
-            if let Some(tx) = conn.pending.lock().remove(&id) {
-                let _ = tx.send(Ok(resp_buf));
-            }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = async {
+                loop {
+                    let mut len_buf = [0u8; 2];
+                    if reader.read_exact(&mut len_buf).await.is_err() {
+                        break;
+                    }
+                    let resp_len = u16::from_be_bytes(len_buf) as usize;
+                    let mut resp_buf = vec![0u8; resp_len];
+                    if reader.read_exact(&mut resp_buf).await.is_err() {
+                        break;
+                    }
+                    if resp_buf.len() < 2 {
+                        continue;
+                    }
+                    let Some(conn) = conn.upgrade() else { break };
+                    let id = u16::from_be_bytes([resp_buf[0], resp_buf[1]]);
+                    if let Some(tx) = conn.pending.lock().remove(&id) {
+                        let _ = tx.send(Ok(resp_buf));
+                    }
+                }
+            } => {}
         }
-        conn.alive.store(false, Ordering::Release);
-        let drained: Vec<_> = conn.pending.lock().drain().collect();
-        for (_, tx) in drained {
-            let _ = tx.send(Err("pipelined connection closed".into()));
+        if let Some(conn) = conn.upgrade() {
+            conn.close();
         }
     });
 }
@@ -720,24 +762,31 @@ where
 fn spawn_writer<W>(
     mut writer: W,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    conn: Arc<PipelinedConn>,
+    conn: &Arc<PipelinedConn>,
 ) where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let cancel = conn.cancel.clone();
+    // A strong reference would retain writer_tx and keep our own rx.recv()
+    // alive forever, even after the reader exits and the upstream reconnects.
+    let conn = Arc::downgrade(conn);
     tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            let written = writer.write_all(&frame).await.is_ok();
-            if !written || writer.flush().await.is_err() {
-                break;
-            }
+        // Only connection shutdown may interrupt a partial frame. Dropping an
+        // individual exchange still lets the writer finish the queued frame.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = async {
+                while let Some(frame) = rx.recv().await {
+                    let written = writer.write_all(&frame).await.is_ok();
+                    if !written || writer.flush().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
         }
-        conn.alive.store(false, Ordering::Release);
-        // The connection can no longer carry writes; wake every pending
-        // exchange so none waits out its full timeout for a response that
-        // can never arrive.
-        let drained: Vec<_> = conn.pending.lock().drain().collect();
-        for (_, tx) in drained {
-            let _ = tx.send(Err("pipelined connection closed".into()));
+        if let Some(conn) = conn.upgrade() {
+            conn.close();
         }
     });
 }
@@ -837,15 +886,7 @@ impl PipelinedTlsUpstream {
 
             if seen[0] && seen[1] {
                 // Pipelining works — reuse this connection.
-                let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-                let conn = Arc::new(PipelinedConn {
-                    writer_tx,
-                    pending: StdMutex::new(HashMap::new()),
-                    next_id: AtomicU16::new(0x0003),
-                    alive: AtomicBool::new(true),
-                });
-                spawn_writer(writer, writer_rx, conn.clone());
-                spawn_reader(reader, conn.clone());
+                let conn = PipelinedConn::new(reader, writer, 0x0003);
                 *self.conn.lock().await = Some(conn);
                 Ok(())
             } else {
@@ -879,15 +920,7 @@ impl PipelinedTlsUpstream {
 
         let stream = self.connect_tls().await.ok()?;
         let (reader, writer) = tokio::io::split(stream);
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let conn = Arc::new(PipelinedConn {
-            writer_tx,
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU16::new(0),
-            alive: AtomicBool::new(true),
-        });
-        spawn_writer(writer, writer_rx, conn.clone());
-        spawn_reader(reader, conn.clone());
+        let conn = PipelinedConn::new(reader, writer, 0);
         *guard = Some(conn.clone());
         Some(conn)
     }
@@ -921,7 +954,15 @@ async fn pipelined_exchange_on(
 
     let pipe_id = conn.alloc_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    conn.pending.lock().insert(pipe_id, tx);
+    {
+        let mut pending = conn.pending.lock();
+        // Serialize registration with close's drain so a query cannot be
+        // stranded after the reader and writer have already shut down.
+        if !conn.alive.load(Ordering::Acquire) {
+            return Err("pipelined connection closed".into());
+        }
+        pending.insert(pipe_id, tx);
+    }
     let guard = PendingSlotGuard {
         conn: conn.clone(),
         id: pipe_id,
@@ -3035,16 +3076,7 @@ mod tests {
 
         let (client, mut server) = duplex(4096);
         let (reader, writer) = tokio::io::split(client);
-
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        drop((writer, writer_rx)); // reader-only test: write half unused
-        let conn = Arc::new(PipelinedConn {
-            writer_tx,
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU16::new(0),
-            alive: AtomicBool::new(true),
-        });
-        spawn_reader(reader, conn.clone());
+        let conn = PipelinedConn::new(reader, writer, 0);
 
         // Register two pending queries with IDs 10 and 20.
         let (tx1, rx1) = tokio::sync::oneshot::channel();
@@ -3080,16 +3112,7 @@ mod tests {
 
         let (client, server) = duplex(4096);
         let (reader, writer) = tokio::io::split(client);
-
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        drop((writer, writer_rx));
-        let conn = Arc::new(PipelinedConn {
-            writer_tx,
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU16::new(0),
-            alive: AtomicBool::new(true),
-        });
-        spawn_reader(reader, conn.clone());
+        let conn = PipelinedConn::new(reader, writer, 0);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         conn.pending.lock().insert(42, tx);
@@ -3102,22 +3125,141 @@ mod tests {
         assert!(!conn.alive.load(Ordering::Acquire));
     }
 
+    async fn assert_pipeline_peer_closed(peer: &mut (impl tokio::io::AsyncRead + Unpin)) {
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut buf))
+            .await
+            .expect("pipeline tasks must release both halves of the transport")
+            .unwrap();
+        assert_eq!(n, 0, "peer must see EOF");
+    }
+
+    #[tokio::test]
+    async fn pipelined_peer_close_releases_sockets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        // Repeat the idle-close/reconnect lifecycle that previously leaked one
+        // socket per connection. Keep the cached owner until after EOF so this
+        // also checks cleanup before the next query replaces the dead connection.
+        for _ in 0..32 {
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            #[cfg(target_os = "linux")]
+            let (fd_path, socket_inode) = {
+                use std::os::fd::AsRawFd;
+                let path = format!("/proc/self/fd/{}", client.as_raw_fd());
+                let inode = std::fs::read_link(&path).unwrap();
+                (path, inode)
+            };
+            let (mut server, _) = listener.accept().await.unwrap();
+            let (reader, writer) = tokio::io::split(client);
+            let conn = PipelinedConn::new(reader, writer, 0);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            conn.pending.lock().insert(42, tx);
+
+            server.shutdown().await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_err());
+            assert!(!conn.alive.load(Ordering::Acquire));
+            assert_pipeline_peer_closed(&mut server).await;
+
+            // Compare socket identities, not process-wide descriptor counts or
+            // fd numbers: other tests can open/reuse descriptors concurrently.
+            #[cfg(target_os = "linux")]
+            assert_ne!(std::fs::read_link(fd_path).ok(), Some(socket_inode));
+
+            let weak = Arc::downgrade(&conn);
+            drop(conn);
+            assert!(
+                weak.upgrade().is_none(),
+                "tasks must not retain the connection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipelined_drop_stops_tasks() {
+        let (client, mut server) = tokio::io::duplex(16);
+        let (reader, writer) = tokio::io::split(client);
+        let conn = PipelinedConn::new(reader, writer, 0);
+        let weak = Arc::downgrade(&conn);
+
+        drop(conn);
+
+        assert_pipeline_peer_closed(&mut server).await;
+        assert!(
+            weak.upgrade().is_none(),
+            "tasks must not retain the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_writer_failure_stops_reader() {
+        // Make only the writer fail; the reader's peer stays open and idle.
+        let (reader, mut peer) = tokio::io::duplex(16);
+        let (writer, closed_peer) = tokio::io::duplex(16);
+        drop(closed_peer);
+        let conn = PipelinedConn::new(reader, writer, 0);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            pipelined_exchange_on(&conn, &[0, 1, 2, 3], Duration::from_secs(30)),
+        )
+        .await
+        .expect("writer failure must wake pending exchanges immediately");
+        assert!(result.unwrap_err().to_string().contains("closed"));
+        assert!(conn.pending.lock().is_empty());
+        assert!(!conn.alive.load(Ordering::Acquire));
+        assert_pipeline_peer_closed(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn pipelined_peer_close_interrupts_blocked_write() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(client);
+        let conn = PipelinedConn::new(reader, writer, 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        conn.pending.lock().insert(42, tx);
+        conn.writer_tx.send(vec![1; 1024]).unwrap();
+
+        // Observe the start of the frame, then stop reading. The one-byte
+        // buffer forces the writer to wait inside write_all, not rx.recv.
+        let mut first = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), server.read_exact(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        server.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+
+        let mut remaining = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), server.read_to_end(&mut remaining))
+            .await
+            .expect("peer closure must interrupt a blocked write")
+            .unwrap();
+        assert!(
+            remaining.len() < 1023,
+            "a dead connection must abandon its frame"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipelined_conn_alloc_id_skips_inflight() {
         use tokio::io::duplex;
 
         let (client, _server) = duplex(4096);
         let (reader, writer) = tokio::io::split(client);
-
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        drop((writer, writer_rx));
-        let conn = Arc::new(PipelinedConn {
-            writer_tx,
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU16::new(0),
-            alive: AtomicBool::new(true),
-        });
-        spawn_reader(reader, conn.clone());
+        let conn = PipelinedConn::new(reader, writer, 0);
 
         // Occupy IDs 0, 1, 2.
         let (tx0, _rx0) = tokio::sync::oneshot::channel();
@@ -3144,18 +3286,9 @@ mod tests {
     async fn cancelled_pipelined_exchange_releases_pending_slot() {
         use tokio::io::duplex;
 
-        let (client, mut server) = duplex(4096);
+        let (client, mut server) = duplex(1);
         let (reader, writer) = tokio::io::split(client);
-
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let conn = Arc::new(PipelinedConn {
-            writer_tx,
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU16::new(0),
-            alive: AtomicBool::new(true),
-        });
-        spawn_reader(reader, conn.clone());
-        spawn_writer(writer, writer_rx, conn.clone());
+        let conn = PipelinedConn::new(reader, writer, 0);
 
         let query = vec![0x01, 0x02, 0x03, 0x04];
         let mut exchange = Box::pin(pipelined_exchange_on(
@@ -3166,7 +3299,13 @@ mod tests {
         poll_pending(exchange.as_mut());
         assert_eq!(conn.pending.lock().len(), 1, "slot held while in flight");
 
-        // Drop the exchange without a response: the slot must be freed.
+        // Wait for a partial length prefix before cancelling, so the writer
+        // must complete an already-started frame despite the dropped exchange.
+        let mut len_buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(2), server.read_exact(&mut len_buf[..1]))
+            .await
+            .unwrap()
+            .unwrap();
         drop(exchange);
         assert!(
             conn.pending.lock().is_empty(),
@@ -3176,12 +3315,17 @@ mod tests {
         // The queued frame must still be written out *complete* by the writer
         // task — a cancelled exchange must never tear the stream framing.
         // The ID is the transport-owned pipe id (0 for the first allocation).
-        let mut len_buf = [0u8; 2];
-        server.read_exact(&mut len_buf).await.unwrap();
-        let frame_len = u16::from_be_bytes(len_buf) as usize;
-        let mut frame = vec![0u8; frame_len];
-        server.read_exact(&mut frame).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), async {
+            server.read_exact(&mut len_buf[1..]).await.unwrap();
+            let frame_len = u16::from_be_bytes(len_buf) as usize;
+            let mut frame = vec![0u8; frame_len];
+            server.read_exact(&mut frame).await.unwrap();
+            frame
+        })
+        .await
+        .expect("query cancellation must not interrupt the writer");
         assert_eq!(frame[0..2], 0u16.to_be_bytes(), "ID rewritten to pipe id");
         assert_eq!(&frame[2..], &query[2..], "frame body intact");
+        assert!(conn.alive.load(Ordering::Acquire));
     }
 }

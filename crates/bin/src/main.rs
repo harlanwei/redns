@@ -37,7 +37,16 @@ use tracing_subscriber::EnvFilter;
 /// `"<version> (<short-commit>)"` — shown by `--version`, the `version`
 /// subcommand, and the dashboard. Assembled at compile time from the package
 /// version and the short git commit hash captured by `build.rs`.
-const FULL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_SHORT"), ")");
+const FULL_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("GIT_COMMIT_SHORT"),
+    ")"
+);
+
+/// Persistent accept errors (especially EMFILE/ENFILE) must yield so other
+/// tasks can release sockets instead of spinning and flooding the log.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheBuildConfig {
@@ -1174,6 +1183,10 @@ async fn serve_forward_subprocess(
                     Ok(v) => v,
                     Err(e) => {
                         warn!(error = %e, "forward subprocess: accept failed");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                        }
                         continue;
                     }
                 };
@@ -1274,6 +1287,10 @@ async fn serve_api(
                     }
                     Err(e) => {
                         warn!(error = %e, "API accept error");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                        }
                     }
                 }
             }
