@@ -253,7 +253,17 @@ impl ChainBuilder {
                 .map(|mc| self.resolve_matcher(mc))
                 .collect::<PluginResult<Vec<_>>>()?;
             let executor = self.resolve_executor(rule)?;
-            chain.push(ChainNode { matchers, executor });
+            // A rule's tag names the node; without one the plugin type does.
+            let label: Arc<str> = if rule.tag.is_empty() {
+                Arc::from(rule.plugin_type.as_str())
+            } else {
+                Arc::from(rule.tag.as_str())
+            };
+            chain.push(ChainNode {
+                label,
+                matchers,
+                executor,
+            });
         }
         Ok(chain)
     }

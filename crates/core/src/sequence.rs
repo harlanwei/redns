@@ -43,6 +43,10 @@ pub enum NodeExecutor {
 /// Each node has zero or more matchers (all must match for the node to fire)
 /// and exactly one executor.
 pub struct ChainNode {
+    /// Display label of this node: the rule's tag when it has one, otherwise
+    /// its plugin type. Recorded in the query's resolution path so the
+    /// dashboard can show which rules handled (or failed) a query.
+    pub label: Arc<str>,
     /// Matchers that gate this node. If empty, the node always fires.
     pub matchers: Vec<Box<dyn Matcher>>,
     /// The executor to run when all matchers pass.
@@ -107,27 +111,50 @@ impl ChainWalker {
                     continue;
                 }
 
-                // Execute.
+                // Execute. Every executed node is appended to the query's
+                // resolution path (a no-op unless an observer enabled tracing),
+                // which is what makes a failure visible in the dashboard.
                 match &node.executor {
                     NodeExecutor::Simple(exec) => {
                         debug!(node = idx, kind = "simple", "executing node");
-                        if tracing::enabled!(tracing::Level::DEBUG) {
+                        let label = Arc::clone(&node.label);
+                        // Record before running so the node precedes any steps
+                        // its executor contributes (e.g. a forward's upstream
+                        // attempts), then attribute a failure to it.
+                        let step = ctx.path_len();
+                        ctx.record_path_step(&*label, false);
+                        let result = if tracing::enabled!(tracing::Level::DEBUG) {
                             let start = std::time::Instant::now();
-                            exec.exec(ctx).await?;
+                            let result = exec.exec(ctx).await;
                             debug!(node = idx, elapsed = ?start.elapsed(), "node completed");
+                            result
                         } else {
-                            exec.exec(ctx).await?;
+                            exec.exec(ctx).await
+                        };
+                        if result.is_err() {
+                            ctx.mark_path_step_failed(step);
                         }
+                        result?;
                         self.pos += 1;
                     }
                     NodeExecutor::Recursive(re) => {
                         debug!(node = idx, kind = "recursive", "executing node");
+                        let label = Arc::clone(&node.label);
+                        let step = ctx.path_len();
+                        ctx.record_path_step(&*label, false);
                         let next = ChainWalker {
                             pos: self.pos + 1,
                             chain: Arc::clone(&self.chain),
                             jump_back: self.jump_back.take(),
                         };
-                        return re.exec_recursive(ctx, next).await;
+                        let result = re.exec_recursive(ctx, next).await;
+                        if result.is_err() && ctx.path_len() == step + 1 {
+                            // No nested node recorded a step, so the error
+                            // originated here rather than being propagated by
+                            // an outer wrapper (e.g. `cache` around `forward`).
+                            ctx.mark_path_step_failed(step);
+                        }
+                        return result;
                     }
                 }
             }
@@ -178,7 +205,7 @@ impl Executable for Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Context;
+    use crate::context::{Context, QueryPathStep};
     use async_trait::async_trait;
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
@@ -225,10 +252,12 @@ mod tests {
     async fn simple_chain_executes_all_nodes() {
         let chain = vec![
             ChainNode {
+                label: "first".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(MarkSetter(1))),
             },
             ChainNode {
+                label: "second".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(MarkSetter(2))),
             },
@@ -244,10 +273,12 @@ mod tests {
     async fn matcher_skips_non_matching_node() {
         let chain = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![Box::new(AlwaysFalse)],
                 executor: NodeExecutor::Simple(Box::new(MarkSetter(1))),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(MarkSetter(2))),
             },
@@ -263,10 +294,12 @@ mod tests {
     async fn recursive_exec_stops_chain() {
         let chain = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(StopExec)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(MarkSetter(99))),
             },
@@ -282,5 +315,103 @@ mod tests {
         let seq = Sequence::new(vec![]);
         let mut ctx = Context::new(make_query());
         assert!(seq.exec(&mut ctx).await.is_ok());
+    }
+
+    /// Helper: an Executable that always fails.
+    struct FailingExec;
+    #[async_trait]
+    impl Executable for FailingExec {
+        async fn exec(&self, _ctx: &mut Context) -> PluginResult<()> {
+            Err("boom".into())
+        }
+    }
+
+    /// Helper: a RecursiveExecutable that runs the rest of the chain first,
+    /// mimicking a wrapper (e.g. `cache`) around a nested node.
+    struct WrapperExec;
+    #[async_trait]
+    impl RecursiveExecutable for WrapperExec {
+        async fn exec_recursive(
+            &self,
+            ctx: &mut Context,
+            mut next: ChainWalker,
+        ) -> PluginResult<()> {
+            next.exec_next(ctx).await
+        }
+    }
+
+    #[tokio::test]
+    async fn path_records_only_executed_nodes() {
+        let chain = vec![
+            ChainNode {
+                label: "skipped".into(),
+                matchers: vec![Box::new(AlwaysFalse)],
+                executor: NodeExecutor::Simple(Box::new(MarkSetter(1))),
+            },
+            ChainNode {
+                label: "cache".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(MarkSetter(2))),
+            },
+        ];
+        let seq = Sequence::new(chain);
+        let mut ctx = Context::new(make_query());
+        ctx.enable_path_trace();
+        seq.exec(&mut ctx).await.unwrap();
+        assert_eq!(ctx.path_steps(), &[QueryPathStep::new("cache", false)]);
+    }
+
+    #[tokio::test]
+    async fn path_marks_the_node_that_failed() {
+        let chain = vec![
+            ChainNode {
+                label: "cache".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(MarkSetter(1))),
+            },
+            ChainNode {
+                label: "forward".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(FailingExec)),
+            },
+        ];
+        let seq = Sequence::new(chain);
+        let mut ctx = Context::new(make_query());
+        ctx.enable_path_trace();
+        assert!(seq.exec(&mut ctx).await.is_err());
+        assert_eq!(
+            ctx.path_steps(),
+            &[
+                QueryPathStep::new("cache", false),
+                QueryPathStep::new("forward", true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapper_nodes_do_not_take_the_blame_for_nested_failures() {
+        let chain = vec![
+            ChainNode {
+                label: "cache".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(WrapperExec)),
+            },
+            ChainNode {
+                label: "forward".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(FailingExec)),
+            },
+        ];
+        let seq = Sequence::new(chain);
+        let mut ctx = Context::new(make_query());
+        ctx.enable_path_trace();
+        assert!(seq.exec(&mut ctx).await.is_err());
+        assert_eq!(
+            ctx.path_steps(),
+            &[
+                QueryPathStep::new("cache", false),
+                QueryPathStep::new("forward", true),
+            ]
+        );
     }
 }

@@ -57,3 +57,11 @@ export function formatUpstream(name: string): string {
   if (name === '__C__') return 'System Cache';
   return name;
 }
+
+/** Human-readable label for a step of a query's recorded resolution path. */
+export function formatPathStep(label: string): string {
+  if (label === 'system-dns') return 'System DNS';
+  const branch = label.match(/^fallback:(primary|secondary)$/);
+  if (branch) return `fallback (${branch[1]})`;
+  return label;
+}

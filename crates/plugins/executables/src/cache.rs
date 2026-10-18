@@ -1077,10 +1077,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let seq = Sequence::new(vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(cache.clone())),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(PendingFirstResponder(calls.clone()))),
             },
@@ -1141,6 +1143,7 @@ mod tests {
         let mut ctx = Context::new(make_query());
         let key = cache_key(&ctx).unwrap();
         let next = ChainWalker::new(vec![ChainNode {
+            label: "test".into(),
             matchers: vec![],
             executor: NodeExecutor::Simple(Box::new(FailAfterResponse)),
         }].into(), None);
@@ -1157,10 +1160,12 @@ mod tests {
             weak = Arc::downgrade(&cache.inner);
             let seq = Sequence::new(vec![
                 ChainNode {
+                    label: "test".into(),
                     matchers: vec![],
                     executor: NodeExecutor::Recursive(Box::new(cache)),
                 },
                 ChainNode {
+                    label: "test".into(),
                     matchers: vec![],
                     executor: NodeExecutor::Simple(Box::new(RespondWithTtl(60))),
                 },
@@ -1175,10 +1180,12 @@ mod tests {
         let cache = Cache::new(100, Duration::from_secs(30), None);
         let chain: Vec<ChainNode> = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(cache)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(RespondWithTtl(300))),
             },
@@ -1242,10 +1249,12 @@ mod tests {
         let cache = Cache::new(128, Duration::from_secs(30), None);
         let chain: Vec<ChainNode> = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(cache)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
                     ttl: 1,
@@ -1293,10 +1302,12 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let chain: Vec<ChainNode> = vec![
                     ChainNode {
+                        label: "test".into(),
                         matchers: vec![],
                         executor: NodeExecutor::Recursive(Box::new(cache)),
                     },
                     ChainNode {
+                        label: "test".into(),
                         matchers: vec![],
                         executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
                             ttl: 60,
@@ -1353,10 +1364,12 @@ mod tests {
         let cache = Cache::new(128, Duration::from_secs(30), None);
         let seq = Sequence::new(vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(cache)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
                     ttl: 60,
@@ -1436,10 +1449,12 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let seq = Sequence::new(vec![
                     ChainNode {
+                        label: "test".into(),
                         matchers: vec![],
                         executor: NodeExecutor::Recursive(Box::new(cache)),
                     },
                     ChainNode {
+                        label: "test".into(),
                         matchers: vec![],
                         executor: NodeExecutor::Simple(Box::new(CountingDelayedResponder {
                             ttl: 0,
@@ -1484,10 +1499,12 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let seq = Sequence::new(vec![
                     ChainNode {
+                        label: "test".into(),
                         matchers: vec![],
                         executor: NodeExecutor::Recursive(Box::new(cache)),
                     },
                     ChainNode {
+                        label: "test".into(),
                         matchers: vec![],
                         executor: NodeExecutor::Simple(Box::new(FailAfterDelay(
                             Duration::from_millis(100),
@@ -1532,10 +1549,12 @@ mod tests {
         let cache = Cache::new(128, Duration::from_secs(30), None);
         let seq = Sequence::new(vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(cache.clone())),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(TruncatedResponder(Arc::clone(&calls)))),
             },

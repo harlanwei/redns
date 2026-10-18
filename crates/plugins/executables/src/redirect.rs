@@ -141,10 +141,12 @@ mod tests {
 
         let chain = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(redirect)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(ResponderExec)),
             },
@@ -173,10 +175,12 @@ mod tests {
         let redirect = Redirect::new();
         let chain = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(redirect)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(ResponderExec)),
             },

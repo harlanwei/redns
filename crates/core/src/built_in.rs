@@ -159,10 +159,12 @@ mod tests {
     async fn accept_stops_chain() {
         let chain = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(ActionAccept)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(MarkSetter(1))),
             },
@@ -176,6 +178,7 @@ mod tests {
     #[tokio::test]
     async fn reject_sets_response() {
         let chain = vec![ChainNode {
+            label: "test".into(),
             matchers: vec![],
             executor: NodeExecutor::Recursive(Box::new(ActionReject::from_str_args("").unwrap())),
         }];
@@ -189,6 +192,7 @@ mod tests {
     #[tokio::test]
     async fn reject_uses_explicit_rcode() {
         let chain = vec![ChainNode {
+            label: "test".into(),
             matchers: vec![],
             executor: NodeExecutor::Recursive(Box::new(ActionReject::from_str_args("3").unwrap())),
         }];

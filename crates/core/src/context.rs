@@ -49,6 +49,31 @@ static CONTEXT_UID: AtomicU32 = AtomicU32::new(0);
 /// caps that work. The limit is generous relative to any sane config.
 pub const MAX_CHAIN_STEPS: u32 = 10_000;
 
+/// A single step of the resolution path a query took through the pipeline.
+///
+/// The path is recorded only when a query observer asks for it (the dashboard
+/// enables it per query), so plugins record steps unconditionally — the calls
+/// are a single branch when tracing is off.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueryPathStep {
+    /// Display label: a chain node's tag or plugin type (`cache`, `forward`,
+    /// `reject`, …), or an upstream name for a resolution attempt.
+    pub label: String,
+    /// True when this is where the query failed: a chain node that returned an
+    /// error, or an upstream attempt that produced no usable response.
+    pub failed: bool,
+}
+
+impl QueryPathStep {
+    /// Creates a step with an explicit failure flag.
+    pub fn new(label: impl Into<String>, failed: bool) -> Self {
+        Self {
+            label: label.into(),
+            failed,
+        }
+    }
+}
+
 /// Metadata from the server that received the query.
 /// Read-only once set.
 #[derive(Debug, Clone, Default)]
@@ -108,6 +133,10 @@ pub struct Context {
     /// [`MAX_CHAIN_STEPS`]). Decremented as the chain walker visits nodes.
     steps_remaining: u32,
 
+    /// The resolution path taken by this query, recorded only when an observer
+    /// enabled it (see [`Context::enable_path_trace`]).
+    path: Option<Vec<QueryPathStep>>,
+
     /// EDNS0 UDP payload size to use when sending queries to upstreams.
     edns_udp_size: u16,
 }
@@ -161,6 +190,7 @@ impl Context {
             marks: None,
             cache_hit: false,
             steps_remaining: MAX_CHAIN_STEPS,
+            path: None,
             edns_udp_size,
         }
     }
@@ -189,6 +219,9 @@ impl Context {
             marks: None,
             cache_hit: false,
             steps_remaining: MAX_CHAIN_STEPS,
+            // Branches trace their own steps; the fallback merges the winning
+            // branch's steps back into the parent context.
+            path: parent.path.as_ref().map(|_| Vec::new()),
             edns_udp_size: parent.edns_udp_size,
         }
     }
@@ -208,6 +241,57 @@ impl Context {
                 "chain execution exceeded {MAX_CHAIN_STEPS} steps (possible jump/goto cycle)"
             )
             .into()),
+        }
+    }
+
+    // ── Resolution Path ──────────────────────────────────────────
+
+    /// Starts recording the resolution path for this query.
+    ///
+    /// Recording is opt-in per query so the hot path pays only a branch when no
+    /// observer (e.g. the dashboard) asked for the path.
+    pub fn enable_path_trace(&mut self) {
+        self.path.get_or_insert_with(Vec::new);
+    }
+
+    /// Returns `true` when this context records its resolution path.
+    pub fn path_trace_enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// Appends one step to the resolution path. No-op when tracing is off.
+    pub fn record_path_step(&mut self, label: impl Into<String>, failed: bool) {
+        if let Some(path) = self.path.as_mut() {
+            path.push(QueryPathStep::new(label, failed));
+        }
+    }
+
+    /// Appends pre-built steps (e.g. a `fallback` branch's own path).
+    pub fn record_path_steps(&mut self, steps: impl IntoIterator<Item = QueryPathStep>) {
+        if let Some(path) = self.path.as_mut() {
+            path.extend(steps);
+        }
+    }
+
+    /// Returns the recorded resolution path (empty when tracing was off).
+    pub fn path_steps(&self) -> &[QueryPathStep] {
+        self.path.as_deref().unwrap_or(&[])
+    }
+
+    /// Number of steps recorded so far, `0` when tracing is off.
+    pub fn path_len(&self) -> usize {
+        self.path.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Marks the most recently recorded step as the one that failed.
+    ///
+    /// The chain walker uses this to attribute a failure to the node that
+    /// raised it rather than to an outer node that merely propagated it; when
+    /// the error came from a nested node (which recorded its own steps), the
+    /// last step is left untouched.
+    pub fn mark_path_step_failed(&mut self, index: usize) {
+        if let Some(step) = self.path.as_mut().and_then(|p| p.get_mut(index)) {
+            step.failed = true;
         }
     }
 
@@ -443,6 +527,7 @@ impl std::fmt::Debug for Context {
             .field("marks_len", &self.marks.as_ref().map_or(0, HashSet::len))
             .field("cache_hit", &self.cache_hit)
             .field("steps_remaining", &self.steps_remaining)
+            .field("path", &self.path)
             .field("edns_udp_size", &self.edns_udp_size)
             .finish()
     }
@@ -643,5 +728,66 @@ mod tests {
         assert!(ctx.charge_step().is_err());
         // Remains exhausted on subsequent calls (no wraparound).
         assert!(ctx.charge_step().is_err());
+    }
+
+    #[test]
+    fn path_steps_are_ignored_until_tracing_is_enabled() {
+        let mut ctx = Context::new(make_query());
+        assert!(!ctx.path_trace_enabled());
+        ctx.record_path_step("forward", false);
+        assert!(ctx.path_steps().is_empty());
+
+        ctx.enable_path_trace();
+        assert!(ctx.path_trace_enabled());
+        ctx.record_path_step("cache", false);
+        ctx.record_path_step("forward", false);
+        ctx.record_path_step("cloudflare", true);
+        ctx.mark_path_step_failed(1);
+        assert_eq!(
+            ctx.path_steps(),
+            &[
+                QueryPathStep::new("cache", false),
+                QueryPathStep::new("forward", true),
+                QueryPathStep::new("cloudflare", true),
+            ]
+        );
+        assert_eq!(ctx.path_len(), 3);
+
+        // Out-of-range indices are ignored rather than panicking.
+        ctx.mark_path_step_failed(99);
+        assert_eq!(ctx.path_len(), 3);
+    }
+
+    #[test]
+    fn forked_context_traces_its_own_steps_only() {
+        let mut parent = Context::new(make_query());
+        parent.enable_path_trace();
+        parent.record_path_step("fallback", false);
+
+        let mut branch = Context::fork_from(&parent);
+        assert!(branch.path_trace_enabled());
+        assert!(branch.path_steps().is_empty());
+        branch.record_path_step("forward", false);
+
+        // The parent keeps only its own step until the branch's path is merged.
+        assert_eq!(
+            parent.path_steps(),
+            &[QueryPathStep::new("fallback", false)]
+        );
+        parent.record_path_steps(branch.path_steps().to_vec());
+        assert_eq!(
+            parent.path_steps(),
+            &[
+                QueryPathStep::new("fallback", false),
+                QueryPathStep::new("forward", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_without_tracing_does_not_enable_it() {
+        let parent = Context::new(make_query());
+        let branch = Context::fork_from(&parent);
+        assert!(!branch.path_trace_enabled());
     }
 }

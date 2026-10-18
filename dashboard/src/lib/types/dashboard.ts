@@ -9,6 +9,14 @@ export type ToastKind = 'success' | 'danger' | 'info';
 /** Columns of the log table that can be toggled. */
 export type LogColumnId = 'age' | 'client' | 'query' | 'rcode' | 'ttl' | 'latency';
 
+/** One step of the resolution path recorded for a query. */
+export type QueryPathStep = {
+  /** Chain node label (rule tag or plugin type) or an upstream name. */
+  label: string;
+  /** True when the query failed here (node errored or upstream came up empty). */
+  failed: boolean;
+};
+
 export type DnsLogEntry = {
   id: number;
   ts_unix_ms: number;
@@ -20,6 +28,7 @@ export type DnsLogEntry = {
   upstreams: string[];
   result: string;
   result_rows: string[];
+  path: QueryPathStep[];
   latency_ms: number;
   answer_ttl: number;
 };

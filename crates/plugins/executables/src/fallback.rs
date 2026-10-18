@@ -17,7 +17,7 @@
 //!   Only `Refused` (and a missing response) fall through to the other branch.
 
 use hickory_proto::op::{Message, ResponseCode};
-use redns_core::context::{Context, KV_SELECTED_UPSTREAM};
+use redns_core::context::{Context, KV_SELECTED_UPSTREAM, QueryPathStep};
 use redns_core::plugin::{Executable, PluginResult};
 use redns_core::upstream::UpstreamWrapper;
 use std::sync::Arc;
@@ -79,6 +79,8 @@ struct BranchOutcome {
     response: Option<Message>,
     response_wire: Option<Vec<u8>>,
     selected_upstream: Option<Arc<UpstreamWrapper>>,
+    /// The branch's own resolution path, merged into the parent on evaluation.
+    path: Vec<QueryPathStep>,
 }
 
 fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
@@ -93,6 +95,7 @@ fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
         selected_upstream: ctx
             .get_value::<Arc<UpstreamWrapper>>(KV_SELECTED_UPSTREAM)
             .cloned(),
+        path: ctx.path_steps().to_vec(),
     }
 }
 
@@ -112,10 +115,21 @@ fn wire_rcode(resp_wire: &[u8]) -> Option<u16> {
 /// system-DNS fallback) would serve a record the upstream refused to vouch for,
 /// defeating DNSSEC and leaking the qname. Only `Refused` (and a missing
 /// response) fall through to the other branch.
-fn apply_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
+///
+/// Whichever way the branch resolves, its own steps are merged into the
+/// parent's query path, so a fallback's failed branch stays visible.
+fn apply_outcome(ctx: &mut Context, branch: &str, mut outcome: BranchOutcome) -> bool {
+    let path = std::mem::take(&mut outcome.path);
+    let accepted = write_outcome(ctx, outcome);
+    ctx.record_path_step(format!("fallback:{branch}"), !accepted);
+    ctx.record_path_steps(path);
+    accepted
+}
+
+/// Writes an accepted branch outcome into `ctx`; returns whether it was usable.
+fn write_outcome(ctx: &mut Context, outcome: BranchOutcome) -> bool {
     if let Some(resp) = outcome.response {
-        let rcode = resp.response_code;
-        if rcode == ResponseCode::Refused {
+        if resp.response_code == ResponseCode::Refused {
             return false;
         }
         ctx.set_response(Some(resp));
@@ -155,7 +169,12 @@ impl BranchTask {
                 Ok(()) => branch_outcome_from_ctx(&ctx),
                 Err(e) => {
                     warn!(branch = name, error = %e, "fallback branch failed");
-                    BranchOutcome::default()
+                    // Keep whatever the branch recorded before failing: a
+                    // failed branch's path is exactly what a fallback is for.
+                    BranchOutcome {
+                        path: ctx.path_steps().to_vec(),
+                        ..BranchOutcome::default()
+                    }
                 }
             }
         });
@@ -191,13 +210,12 @@ impl Executable for Fallback {
         // Prefer the primary during the threshold window. Borrowing its handle
         // keeps it available for the race if the threshold expires.
         if let Ok(outcome) = tokio::time::timeout(self.threshold, primary.join()).await {
-            if apply_outcome(ctx, outcome) {
+            if apply_outcome(ctx, "primary", outcome) {
                 return Ok(());
             }
-            let secondary = secondary.get_or_insert_with(|| {
-                BranchTask::spawn("secondary", self.secondary.clone(), ctx)
-            });
-            return if apply_outcome(ctx, secondary.join().await) {
+            let secondary = secondary
+                .get_or_insert_with(|| BranchTask::spawn("secondary", self.secondary.clone(), ctx));
+            return if apply_outcome(ctx, "secondary", secondary.join().await) {
                 Ok(())
             } else {
                 Err("fallback: no valid response from primary or secondary".into())
@@ -208,10 +226,12 @@ impl Executable for Fallback {
             .unwrap_or_else(|| BranchTask::spawn("secondary", self.secondary.clone(), ctx));
         let accepted = tokio::select! {
             outcome = primary.join() => {
-                apply_outcome(ctx, outcome) || apply_outcome(ctx, secondary.join().await)
+                apply_outcome(ctx, "primary", outcome)
+                    || apply_outcome(ctx, "secondary", secondary.join().await)
             }
             outcome = secondary.join() => {
-                apply_outcome(ctx, outcome) || apply_outcome(ctx, primary.join().await)
+                apply_outcome(ctx, "secondary", outcome)
+                    || apply_outcome(ctx, "primary", primary.join().await)
             }
         };
         if accepted {
@@ -316,6 +336,55 @@ mod tests {
         );
         let resp = ctx.response().expect("response set");
         assert_eq!(resp.response_code, ResponseCode::ServFail);
+    }
+
+    /// Helper: an Executable that records one step and then fails.
+    struct FailingStep(&'static str);
+    #[async_trait::async_trait]
+    impl Executable for FailingStep {
+        async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
+            ctx.record_path_step(self.0, true);
+            Err("branch failed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_branches_keep_their_steps_in_the_query_path() {
+        let q = make_query();
+        let fb = Fallback::new(
+            Arc::new(FailingStep("primary-upstream")),
+            Arc::new(FailingStep("secondary-upstream")),
+            Duration::from_millis(0),
+            false,
+        );
+
+        let mut ctx = Context::new(q);
+        ctx.enable_path_trace();
+        assert!(fb.exec(&mut ctx).await.is_err());
+
+        // Both branches ran and failed; each contributes its own steps under a
+        // marker naming the branch they belong to.
+        let path: Vec<(String, bool)> = ctx
+            .path_steps()
+            .iter()
+            .map(|step| (step.label.clone(), step.failed))
+            .collect();
+        assert!(
+            path.contains(&("fallback:primary".to_string(), true)),
+            "{path:?}"
+        );
+        assert!(
+            path.contains(&("fallback:secondary".to_string(), true)),
+            "{path:?}"
+        );
+        assert!(
+            path.contains(&("primary-upstream".to_string(), true)),
+            "a failed branch's own steps must survive: {path:?}"
+        );
+        assert!(
+            path.contains(&("secondary-upstream".to_string(), true)),
+            "a failed branch's own steps must survive: {path:?}"
+        );
     }
 
     /// A REFUSED from the primary is NOT terminal — the secondary is

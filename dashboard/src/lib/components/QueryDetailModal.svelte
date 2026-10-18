@@ -1,7 +1,7 @@
 <script lang="ts">
   import { fade, fly } from 'svelte/transition';
   import type { DnsLogEntry } from '../types/dashboard';
-  import { formatProtocol, parseAnswer, formatUpstream } from '../utils/dashboard';
+  import { formatProtocol, formatPathStep, formatUpstream, parseAnswer } from '../utils/dashboard';
 
   let { log, onClose } = $props<{
     log: DnsLogEntry | null;
@@ -130,6 +130,30 @@
                   {/if}
                 {/each}
               </dd>
+            </div>
+          {/if}
+          {#if (log.path?.length ?? 0) > 0}
+            <div class="rounded-lg bg-panel/70 px-3 py-2.5 sm:col-span-2">
+              <dt class="text-xs text-muted">Path</dt>
+              <dd class="mt-1.5 flex flex-wrap items-center gap-1.5">
+                {#each log.path ?? [] as step, i (i)}
+                  <span class="inline-flex items-center gap-1.5">
+                    {#if i > 0}
+                      <span class="text-xs text-faint" aria-hidden="true">→</span>
+                    {/if}
+                    <span class="chip {step.failed ? 'chip-danger' : 'chip-neutral'}" title={step.failed ? 'Failed here' : undefined}>
+                      {formatPathStep(step.label)}
+                      {#if step.failed}<span aria-hidden="true">✗</span>{/if}
+                    </span>
+                  </span>
+                {/each}
+              </dd>
+            </div>
+          {/if}
+          {#if log.result}
+            <div class="rounded-lg bg-panel/70 px-3 py-2.5 sm:col-span-2">
+              <dt class="text-xs text-muted">Error</dt>
+              <dd class="mt-0.5 break-words font-mono text-sm text-danger-text">{log.result}</dd>
             </div>
           {/if}
         </dl>

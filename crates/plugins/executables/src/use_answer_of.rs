@@ -163,10 +163,12 @@ mod tests {
     fn chain_with(uao: UseAnswerOf) -> Sequence {
         Sequence::new(vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(uao)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(ResponderExec)),
             },
@@ -211,6 +213,7 @@ mod tests {
         // so the pre-existing response must pass through unmodified.
         let uao = UseAnswerOf::from_str_args("www.example.com").unwrap();
         let seq = Sequence::new(vec![ChainNode {
+            label: "test".into(),
             matchers: vec![],
             executor: NodeExecutor::Recursive(Box::new(uao)),
         }]);

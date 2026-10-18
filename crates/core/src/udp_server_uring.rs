@@ -756,6 +756,7 @@ impl UringUdpServer {
                 url_path: None,
                 server_name: None,
                 selected_upstreams: None,
+                path: None,
                 query_wire: Some(Arc::new(query_data)),
             };
 

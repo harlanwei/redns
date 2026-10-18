@@ -1,5 +1,6 @@
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::Message;
 use parking_lot::Mutex;
+use redns_core::context::QueryPathStep;
 use redns_core::{DnsHandler, PluginResult, QueryMeta, UpstreamMetrics, UpstreamWrapper};
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -38,6 +39,9 @@ pub struct DnsLogEntry {
     pub upstreams: Vec<String>,
     pub result: String,
     pub result_rows: Vec<String>,
+    /// Resolution path taken by the query: the chain nodes it executed and the
+    /// upstreams it tried, in order, with the failing ones flagged.
+    pub path: Vec<QueryPathStep>,
     pub latency_ms: u64,
     pub answer_ttl: u32,
 }
@@ -93,6 +97,7 @@ struct NewDnsLogEntry {
     upstream_names: Vec<String>,
     result: String,
     result_rows_json: String,
+    path_json: String,
     latency_ms: u64,
     answer_ttl: u32,
 }
@@ -232,8 +237,8 @@ impl DashboardStore {
         {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO dns_logs (
-                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10, ?11)",
+                    ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl, path_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', ?9, ?10, ?11, ?12)",
             )?;
             // Keep IDs local to this transaction: clear_logs may delete and
             // rebuild the lookup table between batches.
@@ -252,6 +257,7 @@ impl DashboardStore {
                     upstream_ids_to_text(&upstream_ids),
                     entry.latency_ms as i64,
                     entry.answer_ttl as i64,
+                    entry.path_json,
                 ])?;
             }
         }
@@ -275,7 +281,8 @@ impl DashboardStore {
                 upstreams_json TEXT NOT NULL DEFAULT '[]',
                 upstream_ids_text TEXT NOT NULL DEFAULT '',
                 latency_ms INTEGER NOT NULL,
-                answer_ttl INTEGER NOT NULL DEFAULT 0
+                answer_ttl INTEGER NOT NULL DEFAULT 0,
+                path_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_dns_logs_ts ON dns_logs(ts_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_dns_logs_client ON dns_logs(client_ip);
@@ -332,6 +339,12 @@ impl DashboardStore {
         if !Self::has_column(conn, "dns_logs", "answer_ttl")? {
             conn.execute(
                 "ALTER TABLE dns_logs ADD COLUMN answer_ttl INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !Self::has_column(conn, "dns_logs", "path_json")? {
+            conn.execute(
+                "ALTER TABLE dns_logs ADD COLUMN path_json TEXT NOT NULL DEFAULT '[]'",
                 [],
             )?;
         }
@@ -487,7 +500,7 @@ impl DashboardStore {
 
             // The filter matches literal text columns and also upstream names
             // that have been normalized to ids in upstream_ids_text.
-            let filter_sql = "client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1
+            let filter_sql = "client_ip LIKE ?1 OR protocol LIKE ?1 OR qname LIKE ?1 OR qtype LIKE ?1 OR rcode LIKE ?1 OR result LIKE ?1 OR upstreams_json LIKE ?1 OR path_json LIKE ?1
                  OR EXISTS (
                      SELECT 1 FROM upstream_names u
                      WHERE u.name LIKE ?1
@@ -527,7 +540,7 @@ impl DashboardStore {
 
             let mut stmt = conn.prepare(
                 &format!(
-                    "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
+                    "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl, path_json
                      FROM dns_logs
                      WHERE {}
                      ORDER BY id DESC
@@ -566,7 +579,7 @@ impl DashboardStore {
         let db = self.logs_db.clone();
         tokio::task::spawn_blocking(move || db.read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl
+                "SELECT id, ts_unix_ms, client_ip, protocol, qname, qtype, rcode, result, result_rows_json, upstreams_json, upstream_ids_text, latency_ms, answer_ttl, path_json
                  FROM dns_logs
                  ORDER BY latency_ms DESC, id DESC
                  LIMIT 100",
@@ -1200,13 +1213,9 @@ fn summarize_dashboard_result(resp: &Message, qname: &str) -> (String, String, V
 }
 
 fn summarize_dashboard_error(err: impl Into<String>) -> (String, String, Vec<String>, u32) {
-    let err = err.into();
-    (
-        "ERROR".to_string(),
-        err.clone(),
-        vec![format!("error: {err}")],
-        0u32,
-    )
+    // The failure reason is shown on its own in the dashboard; recording it as
+    // a fake answer row only produced noise in the query's answer table.
+    ("ERROR".to_string(), err.into(), Vec::new(), 0u32)
 }
 
 type DashboardLogSummary = (String, String, Vec<String>, u32);
@@ -1217,6 +1226,7 @@ struct DashboardLogInput {
     client_ip: String,
     protocol: String,
     selected_upstreams: Arc<Mutex<Vec<String>>>,
+    path: Arc<Mutex<Vec<QueryPathStep>>>,
     elapsed: Duration,
     summary: DashboardLogSummary,
 }
@@ -1232,6 +1242,7 @@ async fn persist_dashboard_log(store: &DashboardStore, input: DashboardLogInput)
     }
     let (rcode, result_summary, result_rows, answer_ttl) = input.summary;
     let upstream_names = dedupe_keep_order(input.selected_upstreams.lock().clone());
+    let path = input.path.lock().clone();
 
     let entry = NewDnsLogEntry {
         ts_unix_ms: SystemTime::now()
@@ -1246,6 +1257,7 @@ async fn persist_dashboard_log(store: &DashboardStore, input: DashboardLogInput)
         upstream_names,
         result: result_summary,
         result_rows_json: serde_json::to_string(&result_rows).unwrap_or_else(|_| "[]".to_string()),
+        path_json: serde_json::to_string(&path).unwrap_or_else(|_| "[]".to_string()),
         latency_ms: latency_ms_ceil(input.elapsed),
         answer_ttl,
     };
@@ -1260,8 +1272,10 @@ impl DnsHandler for DashboardDnsHandler {
         let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
 
         let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
+        let path = Arc::new(Mutex::new(Vec::<QueryPathStep>::new()));
         let mut meta = meta;
         meta.selected_upstreams = Some(selected_upstreams.clone());
+        meta.path = Some(path.clone());
 
         let start = Instant::now();
         let result = self.inner.handle(query, meta).await;
@@ -1278,6 +1292,7 @@ impl DnsHandler for DashboardDnsHandler {
                 client_ip,
                 protocol,
                 selected_upstreams,
+                path,
                 elapsed,
                 summary,
             },
@@ -1291,8 +1306,10 @@ impl DnsHandler for DashboardDnsHandler {
         let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
 
         let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
+        let path = Arc::new(Mutex::new(Vec::<QueryPathStep>::new()));
         let mut meta = meta;
         meta.selected_upstreams = Some(selected_upstreams.clone());
+        meta.path = Some(path.clone());
 
         let start = Instant::now();
         let result = self.inner.handle_udp(query, meta).await;
@@ -1314,6 +1331,7 @@ impl DnsHandler for DashboardDnsHandler {
                 client_ip,
                 protocol,
                 selected_upstreams,
+                path,
                 elapsed,
                 summary,
             },
@@ -1327,8 +1345,10 @@ impl DnsHandler for DashboardDnsHandler {
         let (qname, qtype, client_ip, protocol) = dashboard_query_details(&query, &meta);
 
         let selected_upstreams = Arc::new(Mutex::new(Vec::<String>::new()));
+        let path = Arc::new(Mutex::new(Vec::<QueryPathStep>::new()));
         let mut meta = meta;
         meta.selected_upstreams = Some(selected_upstreams.clone());
+        meta.path = Some(path.clone());
 
         let start = Instant::now();
         let result = self.inner.handle_tcp(query, meta).await;
@@ -1350,6 +1370,7 @@ impl DnsHandler for DashboardDnsHandler {
                 client_ip,
                 protocol,
                 selected_upstreams,
+                path,
                 elapsed,
                 summary,
             },
@@ -1772,9 +1793,6 @@ async fn read_contained(path: &Path, base_canon: &Path, out: &mut Vec<u8>) -> bo
 
 fn summarize_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
     let answers = &resp.answers;
-    if answers.is_empty() {
-        return (String::new(), vec![]);
-    }
 
     let mut rows = Vec::new();
     for answer in answers {
@@ -1802,21 +1820,17 @@ fn min_answer_ttl(resp: &Message) -> u32 {
     resp.answers.iter().map(|rr| rr.ttl).min().unwrap_or(0)
 }
 
+/// Extracts the rows worth persisting for a response.
+///
+/// Responses without records are elided to save disk: NXDOMAIN and an empty
+/// NOERROR are normal non-results, and for an error rcode (SERVFAIL, REFUSED,
+/// …) the `rcode` column already says everything a text row such as
+/// `rcode=ServFail, answers=0` would.
 fn persisted_dns_result(resp: &Message, qname: &str) -> (String, Vec<String>) {
-    let rcode = resp.response_code;
-    if rcode == ResponseCode::NXDomain
-        || (rcode == ResponseCode::NoError && resp.answers.is_empty())
-    {
-        // Normal non-results (NXDOMAIN, empty NOERROR) are elided to save disk.
-        (String::new(), Vec::new())
-    } else if resp.answers.is_empty() {
-        // An error rcode (e.g. SERVFAIL) with no answers carries no records to
-        // summarize, but the failure itself is worth keeping in the logs — emit
-        // a compact diagnostic row so it stays visible in the dashboard.
-        (String::new(), vec![format!("rcode={:?}, answers=0", rcode)])
-    } else {
-        summarize_dns_result(resp, qname)
+    if resp.answers.is_empty() {
+        return (String::new(), Vec::new());
     }
+    summarize_dns_result(resp, qname)
 }
 
 fn latency_ms_ceil(elapsed: Duration) -> u64 {
@@ -2002,7 +2016,13 @@ fn row_to_dns_log_entry(
             .unwrap_or_default(),
         latency_ms: row.get::<_, i64>(11)? as u64,
         answer_ttl: row.get::<_, i64>(12)? as u32,
+        path: parse_json_path_steps(&row.get::<_, String>(13)?),
     })
+}
+
+/// Decode the stored resolution path, tolerating rows written by older builds.
+fn parse_json_path_steps(text: &str) -> Vec<QueryPathStep> {
+    serde_json::from_str(text).unwrap_or_default()
 }
 
 /// Decode a space-separated upstream id list back to display names. Falls back
@@ -2058,7 +2078,7 @@ fn resolve_ids_to_upstream_names(conn: &Connection, ids: &[u64]) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::OpCode;
+    use hickory_proto::op::{OpCode, ResponseCode};
 
     fn temp_db_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -2161,6 +2181,8 @@ mod tests {
             upstream_names: vec!["upstream-a".to_string()],
             result: "ok".to_string(),
             result_rows_json: "[]".to_string(),
+            path_json: serde_json::to_string(&[QueryPathStep::new("forward", false)])
+                .expect("path steps serialize"),
             latency_ms: 12,
             answer_ttl: 300,
         }
@@ -2209,6 +2231,12 @@ mod tests {
                 .await
                 .expect("fetch logs");
             assert_eq!(logs.total_items, 1, "logs should persist across reopen");
+            let entry = logs.items.first().expect("one entry");
+            assert_eq!(
+                entry.path,
+                vec![QueryPathStep::new("forward", false)],
+                "the query path must survive the database round-trip"
+            );
         }
 
         cleanup_db(&path);
@@ -2260,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_dns_result_elides_nxdomain_and_empty_noerror_only() {
+    fn persisted_dns_result_elides_answers_less_responses() {
         let qname = "example.com.";
         let mut noerror = Message::response(0, OpCode::Query);
         noerror.metadata.response_code = ResponseCode::NoError;
@@ -2271,8 +2299,8 @@ mod tests {
         let mut servfail = Message::response(0, OpCode::Query);
         servfail.metadata.response_code = ResponseCode::ServFail;
         let (summary, rows) = persisted_dns_result(&servfail, qname);
-        assert_eq!(summary, ""); // We are no longer returning summary text
-        assert_eq!(rows, vec!["rcode=ServFail, answers=0".to_string()]);
+        assert!(summary.is_empty());
+        assert!(rows.is_empty());
 
         let mut nxdomain = Message::response(0, OpCode::Query);
         nxdomain.metadata.response_code = ResponseCode::NXDomain;

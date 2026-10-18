@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use hickory_proto::op::{Message, ResponseCode};
 use parking_lot::RwLock;
-use redns_core::context::KV_SELECTED_UPSTREAM;
+use redns_core::context::{KV_SELECTED_UPSTREAM, QueryPathStep};
 use redns_core::plugin::PluginResult;
 use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
@@ -34,6 +34,29 @@ const DEFAULT_LATENCY: f64 = 10.0;
 const HEDGE_DELAY_MULT: f64 = 1.5;
 const HEDGE_DELAY_MIN_MS: u64 = 15;
 const HEDGE_DELAY_MAX_MS: u64 = 120;
+
+/// Upstream attempts made for one query, recorded for the dashboard's query
+/// path. `None` when the path is not being traced, so a query without an
+/// observer allocates nothing.
+type AttemptRecorder = Option<Vec<QueryPathStep>>;
+
+/// Records one upstream attempt: `failed` when the upstream produced no usable
+/// response (transport error, rejected rcode, unparseable or mismatched reply).
+///
+/// An upstream is attempted at most once per query, so a later verdict for the
+/// same name supersedes the earlier one instead of leaving both in the path
+/// (e.g. a reply that was first skipped for its rcode and later retained).
+fn record_attempt(attempts: &mut AttemptRecorder, name: &str, failed: bool) {
+    if let Some(attempts) = attempts.as_mut() {
+        if let Some(last) = attempts.last_mut()
+            && last.label == name
+        {
+            last.failed = failed;
+            return;
+        }
+        attempts.push(QueryPathStep::new(name, failed));
+    }
+}
 
 fn hedge_delay_for(uw: &UpstreamWrapper) -> Duration {
     let base_ms = uw.ema_latency() as f64;
@@ -674,6 +697,7 @@ impl Forward {
         &self,
         query_bytes: Arc<Vec<u8>>,
         qname: &str,
+        attempts: &mut AttemptRecorder,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let selected_indices = self.selector.select(self.concurrent);
         let selected: Vec<Arc<UpstreamWrapper>> = selected_indices
@@ -688,12 +712,19 @@ impl Forward {
         );
 
         if selected.len() == 1 {
-            let resp_bytes = selected[0].exchange(query_bytes.as_slice()).await?;
-            let resp = parse_response(&resp_bytes).ok_or_else(
-                || -> Box<dyn std::error::Error + Send + Sync> {
-                    "invalid upstream response".into()
-                },
-            )?;
+            let name = selected[0].name().to_string();
+            let resp_bytes = match selected[0].exchange(query_bytes.as_slice()).await {
+                Ok(resp_bytes) => resp_bytes,
+                Err(e) => {
+                    record_attempt(attempts, &name, true);
+                    return Err(e);
+                }
+            };
+            let Some(resp) = parse_response(&resp_bytes) else {
+                record_attempt(attempts, &name, true);
+                return Err("invalid upstream response".into());
+            };
+            record_attempt(attempts, &name, false);
             selected[0].record_adopted();
             return Ok((resp, selected[0].clone()));
         }
@@ -777,6 +808,7 @@ impl Forward {
                         Some(rcode) => rcode,
                         None => {
                             warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, "invalid upstream response (too short)");
+                            record_attempt(attempts, upstream_name, true);
                             last_err = Some("invalid response: short dns header".into());
                             continue;
                         }
@@ -789,6 +821,7 @@ impl Forward {
                     if !adopt {
                         selected[sel_idx].record_rejected_rcode();
                         debug!(plugin = %self.name, upstream = %upstream_name, rcode, "skipping upstream response with non-ideal rcode");
+                        record_attempt(attempts, upstream_name, true);
                         last_err = Some(format!("upstream returned rcode {}", rcode).into());
                         if retained.is_none()
                             && let Some(resp) = parse_response(&resp_bytes)
@@ -801,17 +834,20 @@ impl Forward {
                     match parse_response(&resp_bytes) {
                         Some(resp) => {
                             selected[sel_idx].record_adopted();
+                            record_attempt(attempts, upstream_name, false);
                             tasks.abort_all();
                             return Ok((resp, selected[sel_idx].clone()));
                         }
                         None => {
                             warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, "invalid upstream response");
+                            record_attempt(attempts, upstream_name, true);
                             last_err = Some("invalid response".into());
                         }
                     }
                 }
                 Err(e) => {
                     debug!(plugin = %self.name, upstream = %upstream_name, error = %e, "upstream exchange failed");
+                    record_attempt(attempts, upstream_name, true);
                     last_err = Some(e);
                 }
             }
@@ -819,6 +855,7 @@ impl Forward {
 
         if let Some((resp, upstream)) = retained {
             upstream.record_adopted();
+            record_attempt(attempts, upstream.name(), false);
             return Ok((resp, upstream));
         }
         if let Some(e) = last_err {
@@ -831,16 +868,20 @@ impl Forward {
         &self,
         query: &Message,
         query_bytes: Arc<Vec<u8>>,
+        attempts: &mut AttemptRecorder,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let qname = query
             .queries
             .first()
             .map(|q| q.name().to_ascii())
             .unwrap_or_default();
-        let (resp, upstream) = self.resolve_once(query_bytes, &qname).await?;
+        let (resp, upstream) = self.resolve_once(query_bytes, &qname, attempts).await?;
         // A parsed response that doesn't answer *this* question must not be
         // adopted or cached — reject it before it reaches the caller.
-        validate_response(&resp, query)?;
+        if let Err(e) = validate_response(&resp, query) {
+            record_attempt(attempts, upstream.name(), true);
+            return Err(e);
+        }
         Ok((resp, upstream))
     }
 }
@@ -853,7 +894,15 @@ impl Executable for Forward {
         }
 
         let query_wire = ctx.serialize_query()?;
-        let (resp, selected_upstream) = self.resolve(ctx.query(), query_wire).await?;
+        let mut attempts: AttemptRecorder = ctx.path_trace_enabled().then(Vec::new);
+        let outcome = self.resolve(ctx.query(), query_wire, &mut attempts).await;
+        // Record the attempts even when resolution failed: which upstreams were
+        // tried, and which of them came back empty, is exactly the "fail path"
+        // the dashboard logs for an unanswered query.
+        if let Some(attempts) = attempts {
+            ctx.record_path_steps(attempts);
+        }
+        let (resp, selected_upstream) = outcome?;
         ctx.store_value(KV_SELECTED_UPSTREAM, selected_upstream);
         ctx.set_response(Some(resp));
 
@@ -1174,7 +1223,7 @@ upstreams:
         let query = mock_query();
         let wire = Arc::new(query.to_vec().unwrap());
 
-        let (resp, selected) = forward.resolve(&query, wire).await.unwrap();
+        let (resp, selected) = forward.resolve(&query, wire, &mut None).await.unwrap();
         assert_eq!(selected.name(), "servfail");
         assert_eq!(resp.response_code, ResponseCode::ServFail);
     }
@@ -1217,7 +1266,7 @@ upstreams:
         let query = mock_query();
         let wire = Arc::new(query.to_vec().unwrap());
 
-        let (resp, selected) = forward.resolve(&query, wire).await.unwrap();
+        let (resp, selected) = forward.resolve(&query, wire, &mut None).await.unwrap();
         assert_eq!(selected.name(), "good");
         assert_eq!(resp.response_code, ResponseCode::NoError);
     }
@@ -1254,7 +1303,7 @@ upstreams:
         let wire = Arc::new(query.to_vec().unwrap());
 
         assert!(
-            forward.resolve(&query, wire).await.is_err(),
+            forward.resolve(&query, wire, &mut None).await.is_err(),
             "a response for a different question must not be adopted"
         );
     }

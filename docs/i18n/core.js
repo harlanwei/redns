@@ -206,6 +206,7 @@ rednsI18nAdd({
       "s.enable.p3": "在浏览器中打开 <code>http://127.0.0.1:9090</code>。",
       "s.features.t": "功能",
       "feat.li1": "<strong>查询日志</strong>——实时查看每条查询的 rcode、延迟、上游和 GeoIP 信息；默认从日志和统计中隐藏 arpa 查询。",
+      "feat.li7": "<strong>失败路径</strong>——详情对话框展示查询所走的解析路径：执行过的每条链规则与尝试过的每个上游，并标出失败的步骤；对于始终没有响应的查询，还会显示链错误信息。",
       "feat.li2": "<strong>客户端</strong>——按客户端统计；可通过可选的 DHCP 租约文件解析主机名。",
       "feat.li3": "<strong>缓存查看器</strong>——检查缓存条目、命中/未命中率和淘汰情况。",
       "feat.li4": "<strong>上游</strong>——每个上游的实时健康、延迟和错误状态。",

@@ -174,10 +174,12 @@ mod tests {
         let handler = EcsHandler::new(cfg);
         let chain = vec![
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Recursive(Box::new(handler)),
             },
             ChainNode {
+                label: "test".into(),
                 matchers: vec![],
                 executor: NodeExecutor::Simple(Box::new(NopExec)),
             },

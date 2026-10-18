@@ -64,6 +64,7 @@ fn build_udp_query(
         url_path: None,
         server_name: None,
         selected_upstreams: None,
+        path: None,
         query_wire: Some(query_wire),
     };
     Ok((query, meta))

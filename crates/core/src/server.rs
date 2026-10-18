@@ -17,7 +17,7 @@
 
 //! DNS server handler trait and entry handler.
 
-use crate::context::{Context, KV_SELECTED_UPSTREAM, MARK_CACHE_HIT};
+use crate::context::{Context, KV_SELECTED_UPSTREAM, MARK_CACHE_HIT, QueryPathStep};
 use crate::plugin::{Executable, PluginResult};
 use crate::system_dns::system_fallback_resolve;
 use crate::upstream::UpstreamWrapper;
@@ -47,6 +47,9 @@ pub struct QueryMeta {
     pub server_name: Option<String>,
     /// Optional selected upstream collector for query observers.
     pub selected_upstreams: Option<Arc<Mutex<Vec<String>>>>,
+    /// Optional resolution-path collector for query observers. When set, the
+    /// chain records which plugins and upstreams handled (or failed) the query.
+    pub path: Option<Arc<Mutex<Vec<QueryPathStep>>>>,
     /// Optional original DNS query wire bytes.
     pub query_wire: Option<Arc<Vec<u8>>>,
 }
@@ -208,6 +211,10 @@ impl EntryHandler {
         ctx.server_meta.client_addr = meta.client_addr;
         ctx.server_meta.url_path = meta.url_path;
         ctx.server_meta.server_name = meta.server_name;
+        // The path is only traced when an observer (the dashboard) asked for it.
+        if meta.path.is_some() {
+            ctx.enable_path_trace();
+        }
         // Forwarders serialize the logical query lazily. Raw ingress wire must
         // not bypass Context's EDNS policy or later plugin mutations.
         let result = self.entry.exec(&mut ctx).await;
@@ -264,6 +271,7 @@ impl EntryHandler {
             {
                 Ok(Ok(Some(system_resp))) => {
                     debug!(qname = %qname, "using system DNS fallback response");
+                    ctx.record_path_step("system-dns", false);
                     payload = ResponsePayload::Message(system_resp);
                 }
                 Ok(Ok(None)) => {
@@ -276,6 +284,16 @@ impl EntryHandler {
                     debug!(qname = %qname, "system DNS fallback timed out");
                 }
             }
+        }
+
+        // Hand the recorded path to the observer. This happens after the
+        // best-effort fallback so a system-DNS answer shows up in the path, and
+        // it runs even when the chain errored — the path up to the failure is
+        // what the dashboard needs.
+        if let Some(collector) = meta.path.as_ref()
+            && !ctx.path_steps().is_empty()
+        {
+            collector.lock().extend_from_slice(ctx.path_steps());
         }
 
         if let Some(upstream) = selected_upstream {
@@ -399,6 +417,8 @@ fn servfail_response(query: &Message) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RecursiveExecutable;
+    use crate::sequence::{ChainNode, NodeExecutor, Sequence};
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
 
@@ -511,6 +531,62 @@ mod tests {
             .unwrap();
         assert_eq!(resp.response_code, ResponseCode::ServFail);
         assert!(resp.recursion_available);
+    }
+
+    #[tokio::test]
+    async fn observer_receives_the_query_path_even_on_failure() {
+        // A chain that records a step and then fails: the observer (dashboard)
+        // must see the path up to the failure.
+        struct StepThenFail;
+        #[async_trait]
+        impl RecursiveExecutable for StepThenFail {
+            async fn exec_recursive(
+                &self,
+                _ctx: &mut Context,
+                _next: crate::sequence::ChainWalker,
+            ) -> PluginResult<()> {
+                Err("chain failed".into())
+            }
+        }
+        let chain = Sequence::new(vec![
+            ChainNode {
+                label: "cache".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(StepThenFail)),
+            },
+            ChainNode {
+                label: "unreached".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(NopExec)),
+            },
+        ]);
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let meta = QueryMeta {
+            path: Some(Arc::clone(&collected)),
+            ..Default::default()
+        };
+        let handler = EntryHandler::new(Arc::new(chain));
+        let resp = handler.handle(make_query(), meta).await.unwrap();
+
+        assert_eq!(resp.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            *collected.lock(),
+            vec![QueryPathStep::new("cache", true)],
+            "the path must stop at the node that failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_observer_means_no_path_recording() {
+        let handler = EntryHandler::new(Arc::new(SetResponseExec));
+        // Without a collector, tracing stays off; nothing to assert beyond the
+        // query succeeding, and no allocation happens on the hot path.
+        let resp = handler
+            .handle(make_query(), QueryMeta::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.response_code, ResponseCode::NoError);
     }
 
     #[tokio::test]

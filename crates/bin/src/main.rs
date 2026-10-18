@@ -183,6 +183,48 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
     default
 }
 
+/// Parses a `udp_server`/`tcp_server` plugin entry into a [`ServerConfig`].
+///
+/// `cli_udp_backend` is the `--udp-backend` default: a per-listener
+/// `udp_backend` in the plugin args overrides it.
+fn parse_server_plugin_args(
+    plugin_type: &str,
+    args: &str,
+    cli_udp_backend: Option<String>,
+) -> redns_core::config::ServerConfig {
+    #[derive(serde::Deserialize, Default)]
+    struct ServerPluginArgs {
+        #[serde(default)]
+        entry: String,
+        #[serde(default = "default_listen")]
+        listen: String,
+        #[serde(default)]
+        udp_backend: Option<String>,
+        #[serde(default)]
+        udp_workers: Option<usize>,
+        #[serde(default)]
+        udp_max_inflight: Option<usize>,
+    }
+    fn default_listen() -> String {
+        "127.0.0.1:53".into()
+    }
+
+    let args: ServerPluginArgs = serde_saphyr::from_str(args).unwrap_or_default();
+    let protocol = if plugin_type == "udp_server" {
+        "udp"
+    } else {
+        "tcp"
+    };
+    redns_core::config::ServerConfig {
+        protocol: protocol.into(),
+        addr: args.listen,
+        entry: args.entry,
+        udp_backend: args.udp_backend.or(cli_udp_backend),
+        udp_workers: args.udp_workers,
+        udp_max_inflight: args.udp_max_inflight,
+    }
+}
+
 /// URL of the default ASN database used when the config references the `asn`
 /// matcher without an explicit `asn_db`. A MaxMind DB of origin ASNs
 /// published by sapics/ip-location-db (~10 MB).
@@ -751,36 +793,11 @@ async fn run_server(
     for plugin in &cfg.plugins {
         match plugin.plugin_type.as_str() {
             "udp_server" | "tcp_server" => {
-                #[derive(serde::Deserialize, Default)]
-                struct ServerPluginArgs {
-                    #[serde(default)]
-                    entry: String,
-                    #[serde(default = "default_listen")]
-                    listen: String,
-                    #[serde(default)]
-                    udp_workers: Option<usize>,
-                    #[serde(default)]
-                    udp_max_inflight: Option<usize>,
-                }
-                fn default_listen() -> String {
-                    "127.0.0.1:53".into()
-                }
-
-                let args: ServerPluginArgs =
-                    serde_saphyr::from_str(&plugin.args).unwrap_or_default();
-                let proto = if plugin.plugin_type == "udp_server" {
-                    "udp"
-                } else {
-                    "tcp"
-                };
-                servers.push(redns_core::config::ServerConfig {
-                    protocol: proto.into(),
-                    addr: args.listen,
-                    entry: args.entry,
-                    udp_backend: cli_udp_backend.clone(),
-                    udp_workers: args.udp_workers,
-                    udp_max_inflight: args.udp_max_inflight,
-                });
+                servers.push(parse_server_plugin_args(
+                    &plugin.plugin_type,
+                    &plugin.args,
+                    cli_udp_backend.clone(),
+                ));
             }
             _ => {}
         }
@@ -890,8 +907,21 @@ async fn run_server(
                     let s = Arc::new(socket);
                     let c = cancel.clone();
 
-                    // Determine which UDP backend to use
-                    let use_io_uring = srv.udp_backend.as_deref() == Some("io-uring");
+                    // Determine which UDP backend to use. Unknown values are
+                    // almost certainly typos; warn rather than silently
+                    // running the default backend.
+                    let use_io_uring = match srv.udp_backend.as_deref() {
+                        None | Some("epoll") => false,
+                        Some("io-uring") => true,
+                        Some(other) => {
+                            warn!(
+                                addr = %addr,
+                                backend = other,
+                                "unknown udp_backend, expected \"epoll\" or \"io-uring\"; using epoll"
+                            );
+                            false
+                        }
+                    };
 
                     #[cfg(all(target_os = "linux", feature = "io-uring"))]
                     if use_io_uring {
@@ -1256,6 +1286,7 @@ async fn handle_forward_subprocess_conn(
             url_path: None,
             server_name: None,
             selected_upstreams: None,
+            path: None,
             query_wire: Some(Arc::new(msg_buf)),
         };
 
@@ -1354,7 +1385,7 @@ async fn handle_api_request(
 mod tests {
     use super::{
         CacheBuildConfig, asn_db_cache_path, bind_tcp_listener, bind_udp_socket, config_uses_asn,
-        parse_cache_args,
+        parse_cache_args, parse_server_plugin_args,
     };
     use std::path::PathBuf;
 
@@ -1392,6 +1423,49 @@ mod tests {
                 dump_interval_secs: 300,
             }
         );
+    }
+
+    #[test]
+    fn server_plugin_args_parse_udp_backend() {
+        let srv = parse_server_plugin_args(
+            "udp_server",
+            "entry: default\nlisten: \"0.0.0.0:53\"\nudp_backend: io-uring\n",
+            None,
+        );
+        assert_eq!(srv.protocol, "udp");
+        assert_eq!(srv.addr, "0.0.0.0:53");
+        assert_eq!(srv.entry, "default");
+        assert_eq!(srv.udp_backend.as_deref(), Some("io-uring"));
+    }
+
+    #[test]
+    fn server_plugin_args_udp_backend_overrides_cli_default() {
+        let srv = parse_server_plugin_args(
+            "udp_server",
+            "listen: \"0.0.0.0:53\"\nudp_backend: epoll\n",
+            Some("io-uring".to_string()),
+        );
+        assert_eq!(srv.udp_backend.as_deref(), Some("epoll"));
+    }
+
+    #[test]
+    fn server_plugin_args_fall_back_to_cli_udp_backend() {
+        let srv = parse_server_plugin_args(
+            "udp_server",
+            "listen: \"0.0.0.0:53\"\n",
+            Some("io-uring".to_string()),
+        );
+        assert_eq!(srv.udp_backend.as_deref(), Some("io-uring"));
+    }
+
+    #[test]
+    fn tcp_server_plugin_args_default_to_localhost_tcp() {
+        let srv = parse_server_plugin_args("tcp_server", "", None);
+        assert_eq!(srv.protocol, "tcp");
+        assert_eq!(srv.addr, "127.0.0.1:53");
+        assert_eq!(srv.udp_backend, None);
+        assert_eq!(srv.udp_workers, None);
+        assert_eq!(srv.udp_max_inflight, None);
     }
 
     #[tokio::test]
