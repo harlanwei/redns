@@ -14,8 +14,8 @@ quick_cache = "0.7"
 ahash = "0.8"
 fastrand = "2"
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = { version = "1", default-features = false, features = ["serialize", "deserialize"] }
-parking_lot = "0.12"
+serde-saphyr = { version = "2", default-features = false, features = ["serialize", "deserialize"] }
+parking_lot = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
