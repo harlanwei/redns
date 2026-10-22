@@ -41,10 +41,9 @@ pub const MAX_OPTIMISTIC_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 ///
 /// Optimistic DNS is defined for stub resolvers with an asynchronous API that
 /// can deliver the fresh answer later. A DNS forwarder has no such callback,
-/// so it uses the RFC 8767 recommendation for recursive resolvers: expired
-/// data is returned with a 30-second TTL, prompting the client to ask again
-/// shortly after the background refresh completes.
-const OPTIMISTIC_REPLY_TTL: u32 = 30;
+/// so the stale answer carries a one-second TTL: the client re-queries almost
+/// immediately and picks up the completed background refresh.
+const OPTIMISTIC_REPLY_TTL: u32 = 1;
 
 /// Default interval between periodic cache dumps to disk.
 pub const DEFAULT_DUMP_INTERVAL: Duration = Duration::from_secs(300);
@@ -649,9 +648,8 @@ impl Cache {
                     // Optimistic DNS: return the expired positive answer
                     // immediately while a background refresh runs. There is no
                     // async callback in the DNS protocol, so the response
-                    // carries a short TTL; the client asks again after the
-                    // refresh has had time to complete (RFC 8767 uses 30
-                    // seconds).
+                    // carries a one-second TTL; the client re-queries and picks
+                    // up the refreshed answer.
                     Some((
                         entry.resp_wire,
                         entry.ttl_offsets,
@@ -1382,10 +1380,14 @@ mod tests {
 
         let cache = Cache::new(128, Duration::from_secs(10), None);
         cache.get_shard(&key).insert(key.clone(), entry.clone());
-        assert!(matches!(
-            cache.lookup_and_build(&key, 1),
-            CacheLookup::Stale(_)
-        ));
+        let CacheLookup::Stale(wire) = cache.lookup_and_build(&key, 1) else {
+            panic!("expired positive entry must be served optimistically");
+        };
+        let response = Message::from_vec(&wire).expect("optimistic response must parse");
+        assert_eq!(
+            response.answers[0].ttl, 1,
+            "optimistic answers must carry a one-second TTL"
+        );
 
         let cache = Cache::new(128, Duration::from_secs(3), None);
         cache.get_shard(&key).insert(key.clone(), entry);

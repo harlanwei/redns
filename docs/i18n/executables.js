@@ -31,7 +31,7 @@ rednsI18nAdd({
       "p.dump_interval.d": "设置 <code>cache_file</code> 时两次自动转储之间的间隔。",
       "p.optimistic_ttl.d": "记录 TTL 过期后仍可立即返回过期<em>肯定</em>应答的最长时间（秒）；返回的同时后台刷新（<a href=\"https://www.ietf.org/archive/id/draft-gakiwate-dnsop-optimistic-dns-00.html\">Optimistic DNS</a>）。过期的 NXDOMAIN/NODATA 应答会重新查询。最大 604800 秒（一周），<code>0</code> 表示禁用。DNS 协议没有应用层 opt-in 信号，因此设置后对所有客户端生效。",
       "s.details.li1": "<strong>分片 LRU</strong>——内存有界、锁竞争低；条目按 TTL 过期。",
-      "s.details.li2": "<strong>乐观缓存</strong>——TTL 过期但在 <code>optimistic_ttl</code> 窗口内的<em>肯定</em>应答立即返回（应答 TTL 30 秒），同时后台刷新；后续查询使用新结果。过期否定应答会重新向上游确认，过期条目超过一周后不再返回。",
+      "s.details.li2": "<strong>乐观缓存</strong>——TTL 过期但在 <code>optimistic_ttl</code> 窗口内的<em>肯定</em>应答立即返回（应答 TTL 1 秒），同时后台刷新；客户端重新查询即可获得刷新后的结果。过期否定应答会重新向上游确认，过期条目超过一周后不再返回。",
       "s.details.li3": "<strong>请求合并</strong>——同一键的并发未命中只触发一次上游查询。",
       "s.details.li4": "缓存键包含 qname、qtype、QCLASS、查询标志和 EDNS 选项；响应以归一化 TTL 存储，命中时原地修补。",
       "s.details.li5": "命中时插件设置响应——之后用 <code>matches: has_resp</code> + <code>accept</code> 终止链。",
