@@ -30,8 +30,11 @@ pub struct ActionAccept;
 
 #[async_trait]
 impl RecursiveExecutable for ActionAccept {
-    async fn exec_recursive(&self, _ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
-        Ok(()) // drop `next`
+    async fn exec_recursive(&self, ctx: &mut Context, _next: ChainWalker) -> PluginResult<()> {
+        // Mark the context so an enclosing sequence stops as well; dropping
+        // `next` alone only stops the current chain.
+        ctx.accept();
+        Ok(())
     }
 }
 
@@ -63,6 +66,9 @@ impl RecursiveExecutable for ActionReject {
         let mut resp = Message::response(ctx.query().id, OpCode::Query);
         resp.metadata.response_code = self.rcode;
         ctx.set_response(Some(resp));
+        // `reject` also terminates the whole query, including enclosing
+        // named sequences.
+        ctx.accept();
         Ok(())
     }
 }
@@ -173,6 +179,43 @@ mod tests {
         let mut ctx = Context::new(make_query());
         seq.exec(&mut ctx).await.unwrap();
         assert!(!ctx.has_mark(1)); // never reached
+        assert!(ctx.is_accepted());
+    }
+
+    #[tokio::test]
+    async fn accept_inside_named_sequence_stops_the_outer_chain() {
+        let inner = Sequence::new(vec![
+            ChainNode {
+                label: "accept".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Recursive(Box::new(ActionAccept)),
+            },
+            ChainNode {
+                label: "inner-after-accept".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(MarkSetter(1))),
+            },
+        ]);
+        let outer = Sequence::new(vec![
+            ChainNode {
+                label: "inner-sequence".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(inner)),
+            },
+            ChainNode {
+                label: "outer-after-accept".into(),
+                matchers: vec![],
+                executor: NodeExecutor::Simple(Box::new(MarkSetter(2))),
+            },
+        ]);
+
+        let mut ctx = Context::new(make_query());
+        outer.exec(&mut ctx).await.unwrap();
+        assert!(!ctx.has_mark(1), "inner sequence continued after accept");
+        assert!(
+            !ctx.has_mark(2),
+            "outer sequence continued after nested accept"
+        );
     }
 
     #[tokio::test]

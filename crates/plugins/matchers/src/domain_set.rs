@@ -270,16 +270,23 @@ impl DomainSet {
         Ok(ds)
     }
 
-    /// Create from a string (space-separated or newline-separated expressions).
+    /// Create from a string (YAML args, or space-separated expressions).
     ///
     /// Supports `&path` to load domain lists from files.
+    ///
+    /// A YAML `files:` entry that cannot be read is a hard error: silently
+    /// producing an empty domain set would make routing rules fail open.
     pub fn from_str_args(s: &str) -> PluginResult<Self> {
         let trimmed = s.trim();
 
-        // Try YAML struct deserialization first.
-        if let Ok(ds) = Self::from_yaml_str(s) {
-            // `&path` can be interpreted by YAML as an anchor token and deserialize
-            // into an empty struct; preserve quick-arg file loading for that case.
+        // Try YAML struct deserialization first. If it parses, file-loading
+        // errors must propagate; do not fall back to treating the YAML text as
+        // a quick-form expression list.
+        if let Ok(args) = serde_saphyr::from_str::<DomainSetArgs>(s) {
+            let ds = Self::from_args(&args)?;
+            // `&path` can be interpreted by YAML as an anchor token and
+            // deserialize into an empty struct; preserve quick-arg file
+            // loading for that case.
             if !(trimmed.starts_with('&') && ds.is_empty()) {
                 return Ok(ds);
             }
@@ -288,9 +295,7 @@ impl DomainSet {
         let mut ds = Self::new();
         for part in trimmed.split_whitespace() {
             if let Some(path) = part.strip_prefix('&') {
-                if let Err(e) = ds.load_file(path) {
-                    warn!(error = %e, file = path, "failed to load domain file");
-                }
+                ds.load_file(path)?;
             } else if let Err(e) = ds.add_expression(part) {
                 warn!(error = %e, exp = part, "skipping invalid domain expression");
             }
@@ -429,6 +434,29 @@ mod tests {
         ds.add_expression("example.com").unwrap();
         assert!(ds.match_ctx(&make_ctx("sub.example.com.")).unwrap());
         assert!(!ds.match_ctx(&make_ctx("other.com.")).unwrap());
+    }
+
+    #[test]
+    fn missing_yaml_file_is_an_error() {
+        let path = format!("/nonexistent/redns-domain-list-{}.txt", std::process::id());
+        let args = format!("files:\n  - {path}\n");
+        let err = match DomainSet::from_str_args(&args) {
+            Ok(_) => panic!("missing file must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("failed to read domain file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_quick_form_file_is_an_error() {
+        let path = format!(
+            "/nonexistent/redns-domain-list-quick-{}.txt",
+            std::process::id()
+        );
+        assert!(DomainSet::from_str_args(&format!("&{path}")).is_err());
     }
 
     #[test]

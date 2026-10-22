@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title data-i18n="meta.title">cache — ReDNS documentation</title>
-<meta name="description" content="cache executable: sharded LRU DNS response cache with persistence and lazy refresh." />
+<meta name="description" content="cache executable: sharded LRU DNS response cache with persistence and optimistic stale-while-refresh." />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='3' fill='white'/%3E%3C/svg%3E" />
 <link rel="stylesheet" href="style.css" />
 </head>
@@ -113,6 +113,13 @@
               <td><code>300</code></td>
               <td data-i18n="p.dump_interval.d">Period between automatic disk dumps when <code>cache_file</code> is set.</td>
             </tr>
+            <tr>
+              <td><code>optimistic_ttl</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.sec">integer (seconds)</td>
+              <td><code>30</code></td>
+              <td data-i18n="p.optimistic_ttl.d">Maximum time after a record's TTL expires during which an expired <em>positive</em> answer may still be served immediately while a background refresh runs (<a href="https://www.ietf.org/archive/id/draft-gakiwate-dnsop-optimistic-dns-00.html">Optimistic DNS</a>). Expired NXDOMAIN/NODATA answers are re-queried instead. Capped at 604800 seconds (one week); <code>0</code> disables stale serving. DNS has no application opt-in signal, so this applies to all clients.</td>
+            </tr>
           </tbody>
         </table>
       </div>
@@ -122,9 +129,9 @@
       <h2 data-i18n="s.details.t">Details</h2>
       <ul>
         <li data-i18n="s.details.li1"><strong>Sharded LRU</strong> — bounded memory and low lock contention; entries expire by TTL.</li>
-        <li data-i18n="s.details.li2"><strong>Lazy refresh</strong> — a stale entry is served immediately while a background refresh fetches a fresh copy (up to 30 s of staleness tolerated).</li>
+        <li data-i18n="s.details.li2"><strong>Optimistic DNS</strong> — an expired positive entry inside <code>optimistic_ttl</code> is served immediately with a 30-second TTL while a background refresh fetches a fresh copy; later queries use the refreshed answer. Expired negative answers are confirmed upstream, and expired entries are never served after one week.</li>
         <li data-i18n="s.details.li3"><strong>Coalescing</strong> — concurrent misses for the same key trigger a single upstream query.</li>
-        <li data-i18n="s.details.li4">Cache keys are lowercased qname + qtype; responses are stored with normalized TTLs and patched in place on hits.</li>
+        <li data-i18n="s.details.li4">Cache keys include qname, qtype, QCLASS, query flags and EDNS options; responses are stored with normalized TTLs and patched in place on hits.</li>
         <li data-i18n="s.details.li5">On a hit the plugin sets the response — follow it with <code>matches: has_resp</code> + <code>accept</code> to stop the chain.</li>
       </ul>
     </section>

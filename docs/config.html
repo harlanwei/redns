@@ -349,6 +349,8 @@
       <span class="tok-key">size</span>: 65536
       <span class="tok-key">cache_file</span>: /var/lib/redns/cache.bin
       <span class="tok-key">dump_interval</span>: 300
+      <span class="tok-comment"># Serve expired answers for up to 30s while refreshing (Optimistic DNS)</span>
+      <span class="tok-key">optimistic_ttl</span>: 30
 
   <span class="tok-comment"># Fallback: primary Google, switch to Cloudflare after 800 ms</span>
   <span class="tok-punct">-</span> <span class="tok-key">tag</span>: resolver

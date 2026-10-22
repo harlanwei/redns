@@ -87,6 +87,12 @@ impl ChainWalker {
     ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'b>> {
         Box::pin(async move {
             while self.pos < self.chain.len() {
+                // An `accept`/`reject` inside a nested sequence sets this flag;
+                // stop the enclosing chain as well.
+                if ctx.is_accepted() {
+                    return Ok(());
+                }
+
                 // Charge this node visit against the query's step budget. This
                 // is the runtime backstop against cyclic jump/goto configs that
                 // would otherwise recurse forever (stack overflow + unbounded
@@ -157,6 +163,10 @@ impl ChainWalker {
                         return result;
                     }
                 }
+            }
+
+            if ctx.is_accepted() {
+                return Ok(());
             }
 
             // End of chain — jump back if there is a saved walker.

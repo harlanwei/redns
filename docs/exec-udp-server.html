@@ -99,6 +99,13 @@
               <td data-i18n="p.listen.d">Address to bind, e.g. <code>"0.0.0.0:53"</code>.</td>
             </tr>
             <tr>
+              <td><code>udp_backend</code></td>
+              <td data-i18n="common.no">No</td>
+              <td data-i18n="type.string">string</td>
+              <td data-i18n="dflt.cli-or-epoll"><code>--udp-backend</code> value, else <code>epoll</code></td>
+              <td data-i18n="p.udp_backend.d"><code>epoll</code> or <code>io-uring</code> (Linux + feature). Overrides the CLI default for this listener.</td>
+            </tr>
+            <tr>
               <td><code>udp_workers</code></td>
               <td data-i18n="common.no">No</td>
               <td data-i18n="type.int">integer</td>
@@ -120,7 +127,7 @@
     <section>
       <h2 data-i18n="s.details.t">Details</h2>
       <ul>
-        <li data-i18n="s.details.li1">The UDP backend (<code>epoll</code> / <code>io-uring</code>) is selected with the <code>--udp-backend</code> CLI flag, not per plugin.</li>
+        <li data-i18n="s.details.li1">The UDP backend can be set per listener with <code>udp_backend</code>; it falls back to the <code>--udp-backend</code> CLI value and then <code>epoll</code>.</li>
         <li data-i18n="s.details.li2">Several listeners can be declared; each can use a different entry sequence.</li>
         <li data-i18n="s.details.li3">Equivalent to a <code>servers</code> entry with <code>protocol: udp</code>.</li>
       </ul>

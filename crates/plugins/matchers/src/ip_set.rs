@@ -106,10 +106,14 @@ impl IpSet {
     }
 
     /// Create from a string (YAML or space-separated).
+    ///
+    /// A YAML `files:` entry that cannot be read is a hard error rather than
+    /// an empty set.
     pub fn from_str_args(s: &str) -> PluginResult<Self> {
-        // Try YAML struct deserialization first.
-        if let Ok(set) = Self::from_yaml_str(s) {
-            return Ok(set);
+        // Try YAML struct deserialization first. If it parses, file-loading
+        // errors must propagate instead of falling back to the quick form.
+        if let Ok(args) = serde_saphyr::from_str::<IpSetArgs>(s) {
+            return Self::from_args(&args);
         }
         let mut set = Self::new();
         for part in s.split_whitespace() {
@@ -154,6 +158,20 @@ impl Matcher for IpSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_yaml_file_is_an_error() {
+        let path = format!("/nonexistent/redns-ip-list-{}.txt", std::process::id());
+        let args = format!("files:\n  - {path}\n");
+        let err = match IpSet::from_str_args(&args) {
+            Ok(_) => panic!("missing file must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("failed to read IP file"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn matches_cidr() {

@@ -89,6 +89,7 @@
       "dflt.system-resolver": "缺省（系统解析器）",
       "dflt.pool-idle": "缺省（UDP 16 / 连接 4）",
       "dflt.memory-only": "缺省（仅内存）",
+      "dflt.cli-or-epoll": "<code>--udp-backend</code> 值，否则 <code>epoll</code>",
       "dflt.set-check": "任意值（仅检查变量已设置）",
       "dflt.required-except-zl": "无（除 zl 外必填）",
       "dflt.empty": "空",

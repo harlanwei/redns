@@ -129,6 +129,11 @@ pub struct Context {
     /// Hot-path storage for cache-hit marking.
     cache_hit: bool,
 
+    /// Set when an `accept`/`reject` action has terminated processing for
+    /// this query. Unlike dropping a single chain walker, this stops all
+    /// enclosing sequences as well.
+    accepted: bool,
+
     /// Remaining chain-node execution budget for this query (see
     /// [`MAX_CHAIN_STEPS`]). Decremented as the chain walker visits nodes.
     steps_remaining: u32,
@@ -189,6 +194,7 @@ impl Context {
             kv: None,
             marks: None,
             cache_hit: false,
+            accepted: false,
             steps_remaining: MAX_CHAIN_STEPS,
             path: None,
             edns_udp_size,
@@ -218,6 +224,7 @@ impl Context {
             kv: None,
             marks: None,
             cache_hit: false,
+            accepted: false,
             steps_remaining: MAX_CHAIN_STEPS,
             // Branches trace their own steps; the fallback merges the winning
             // branch's steps back into the parent context.
@@ -470,6 +477,20 @@ impl Context {
         }
     }
 
+    // ── Flow control ─────────────────────────────────────────────
+
+    /// Marks processing as accepted/terminated for this query. Chain walkers
+    /// check this before every node and before jumping back, so an action
+    /// inside a nested sequence stops the outer sequence too.
+    pub fn accept(&mut self) {
+        self.accepted = true;
+    }
+
+    /// Returns true once [`Self::accept`] has been called.
+    pub fn is_accepted(&self) -> bool {
+        self.accepted
+    }
+
     // ── Marks ────────────────────────────────────────────────────
 
     /// Sets a boolean mark `m` on this context.
@@ -526,6 +547,7 @@ impl std::fmt::Debug for Context {
             .field("kv_len", &self.kv.as_ref().map_or(0, HashMap::len))
             .field("marks_len", &self.marks.as_ref().map_or(0, HashSet::len))
             .field("cache_hit", &self.cache_hit)
+            .field("accepted", &self.accepted)
             .field("steps_remaining", &self.steps_remaining)
             .field("path", &self.path)
             .field("edns_udp_size", &self.edns_udp_size)

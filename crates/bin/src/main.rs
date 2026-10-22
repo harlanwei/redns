@@ -53,6 +53,9 @@ struct CacheBuildConfig {
     size: usize,
     cache_file: Option<String>,
     dump_interval_secs: u64,
+    /// Seconds after a record's TTL expires during which it may still be
+    /// served optimistically while a background refresh runs.
+    optimistic_ttl_secs: u64,
 }
 
 #[derive(Parser)]
@@ -155,12 +158,16 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
         cache_file: Option<String>,
         #[serde(default)]
         dump_interval: Option<u64>,
+        /// Optimistic DNS window, in seconds after TTL expiry.
+        #[serde(default)]
+        optimistic_ttl: Option<u64>,
     }
 
     let default = CacheBuildConfig {
         size: 0,
         cache_file: None,
         dump_interval_secs: 300,
+        optimistic_ttl_secs: redns_executables::cache::DEFAULT_OPTIMISTIC_TTL.as_secs(),
     };
 
     let args = args.trim();
@@ -177,6 +184,7 @@ fn parse_cache_args(args: &str) -> CacheBuildConfig {
             size: cfg.size.unwrap_or(default.size),
             cache_file: cfg.cache_file,
             dump_interval_secs: cfg.dump_interval.unwrap_or(default.dump_interval_secs),
+            optimistic_ttl_secs: cfg.optimistic_ttl.unwrap_or(default.optimistic_ttl_secs),
         };
     }
 
@@ -430,7 +438,7 @@ fn register_builtins(builder: &mut ChainBuilder, asn_db: Option<Arc<redns_matche
                     });
             Ok(Box::new(Cache::new(
                 cfg.size,
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(cfg.optimistic_ttl_secs),
                 persist,
             )) as Box<dyn RecursiveExecutable>)
         }),
@@ -666,7 +674,11 @@ async fn run_server(
     let mut deferred_fallbacks = Vec::new();
 
     for plugin in &cfg.plugins {
-        if plugin.plugin_type == "sequence" || plugin.tag.is_empty() {
+        if matches!(
+            plugin.plugin_type.as_str(),
+            "sequence" | "udp_server" | "tcp_server"
+        ) || plugin.tag.is_empty()
+        {
             continue;
         }
 
@@ -678,14 +690,16 @@ async fn run_server(
 
         let args_str: String = plugin.args.clone();
 
-        match builder.build_and_register(&plugin.tag, &plugin.plugin_type, &args_str) {
-            Ok(()) => {
-                info!(tag = %plugin.tag, plugin_type = %plugin.plugin_type, "registered named plugin")
-            }
-            Err(e) => {
-                warn!(tag = %plugin.tag, plugin_type = %plugin.plugin_type, error = %e, "failed to build plugin")
-            }
-        }
+        builder
+            .build_and_register(&plugin.tag, &plugin.plugin_type, &args_str)
+            .map_err(|e| -> redns_core::PluginError {
+                format!(
+                    "failed to build plugin '{}' ({}): {e}",
+                    plugin.tag, plugin.plugin_type
+                )
+                .into()
+            })?;
+        info!(tag = %plugin.tag, plugin_type = %plugin.plugin_type, "registered named plugin");
     }
 
     // ── Phase 1.5: Build sequence plugins (first pass) ───────────
@@ -725,28 +739,31 @@ async fn run_server(
     for plugin in &deferred_fallbacks {
         use redns_executables::fallback::{Fallback, FallbackArgs};
 
-        let args: FallbackArgs = match serde_saphyr::from_str(&plugin.args) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(tag = %plugin.tag, error = %e, "fallback: invalid args");
-                continue;
-            }
-        };
+        let args: FallbackArgs =
+            serde_saphyr::from_str(&plugin.args).map_err(|e| -> redns_core::PluginError {
+                format!("fallback '{}': invalid args: {e}", plugin.tag).into()
+            })?;
 
-        let primary = match builder.get_named_exec(&args.primary) {
-            Some(e) => e,
-            None => {
-                warn!(tag = %plugin.tag, primary = %args.primary, "fallback: primary exec not found");
-                continue;
-            }
-        };
-        let secondary = match builder.get_named_exec(&args.secondary) {
-            Some(e) => e,
-            None => {
-                warn!(tag = %plugin.tag, secondary = %args.secondary, "fallback: secondary exec not found");
-                continue;
-            }
-        };
+        let primary =
+            builder
+                .get_named_exec(&args.primary)
+                .ok_or_else(|| -> redns_core::PluginError {
+                    format!(
+                        "fallback '{}': primary exec '{}' not found",
+                        plugin.tag, args.primary
+                    )
+                    .into()
+                })?;
+        let secondary =
+            builder
+                .get_named_exec(&args.secondary)
+                .ok_or_else(|| -> redns_core::PluginError {
+                    format!(
+                        "fallback '{}': secondary exec '{}' not found",
+                        plugin.tag, args.secondary
+                    )
+                    .into()
+                })?;
 
         let threshold = if args.threshold > 0 {
             std::time::Duration::from_millis(args.threshold)
@@ -779,7 +796,11 @@ async fn run_server(
                 }
             }
             Err(e) => {
-                warn!(tag = %plugin.tag, error = %e, "failed to build sequence, skipping");
+                return Err(format!(
+                    "failed to build sequence '{}' ({}): {e}",
+                    plugin.tag, plugin.plugin_type
+                )
+                .into());
             }
         }
     }
@@ -982,7 +1003,9 @@ async fn run_server(
                         });
                     }
                 }
-                Err(e) => warn!(error = %e, addr = %addr, "failed to bind UDP"),
+                Err(e) => {
+                    return Err(format!("failed to bind UDP listener {addr}: {e}").into());
+                }
             }
         }
 
@@ -998,7 +1021,9 @@ async fn run_server(
                         }
                     });
                 }
-                Err(e) => warn!(error = %e, addr = %addr, "failed to bind TCP"),
+                Err(e) => {
+                    return Err(format!("failed to bind TCP listener {addr}: {e}").into());
+                }
             }
         }
     }
@@ -1025,7 +1050,9 @@ async fn run_server(
                     serve_api(listener, upstreams, c).await;
                 });
             }
-            Err(e) => warn!(error = %e, addr = %api_addr, "failed to bind API HTTP"),
+            Err(e) => {
+                return Err(format!("failed to bind API HTTP listener {api_addr}: {e}").into());
+            }
         }
     }
 
@@ -1053,7 +1080,12 @@ async fn run_server(
                     dashboard::serve_dashboard(listener, state, c).await;
                 });
             }
-            Err(e) => warn!(error = %e, addr = %dashboard_addr, "failed to bind Dashboard HTTP"),
+            Err(e) => {
+                return Err(format!(
+                    "failed to bind Dashboard HTTP listener {dashboard_addr}: {e}"
+                )
+                .into());
+            }
         }
     }
 
@@ -1075,6 +1107,12 @@ async fn finish_shutdown(cancel: CancellationToken) -> Result<(), redns_core::Pl
     cancel.cancel();
     // Give servers time to clean up.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Flush cache files before the runtime is torn down. Periodic dumps can
+    // be up to dump_interval behind, and docs promise a graceful-shutdown dump.
+    let entries = redns_executables::cache::dump_all_caches().await;
+    if entries > 0 {
+        info!(entries, "cache persisted on shutdown");
+    }
     info!("redns stopped");
     Ok(())
 }
@@ -1397,6 +1435,7 @@ mod tests {
                 size: 16384,
                 cache_file: None,
                 dump_interval_secs: 300,
+                optimistic_ttl_secs: 30,
             }
         );
     }
@@ -1409,6 +1448,20 @@ mod tests {
                 size: 16384,
                 cache_file: None,
                 dump_interval_secs: 300,
+                optimistic_ttl_secs: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_parses_optimistic_ttl() {
+        assert_eq!(
+            parse_cache_args("size: 16384\noptimistic_ttl: 86400\n"),
+            CacheBuildConfig {
+                size: 16384,
+                cache_file: None,
+                dump_interval_secs: 300,
+                optimistic_ttl_secs: 86400,
             }
         );
     }
@@ -1421,6 +1474,7 @@ mod tests {
                 size: 0,
                 cache_file: None,
                 dump_interval_secs: 300,
+                optimistic_ttl_secs: 30,
             }
         );
     }

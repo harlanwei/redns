@@ -2,7 +2,8 @@
 //
 // This file is part of redns.
 
-//! In-memory LRU DNS cache with lazy TTL refresh and optional file persistence.
+//! In-memory LRU DNS cache with optimistic (stale-while-refresh) serving and
+//! optional file persistence.
 
 use async_trait::async_trait;
 use hickory_proto::op::Message;
@@ -27,8 +28,23 @@ use tokio::sync::watch;
 /// Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
 
-/// Default lazy cache TTL (serve stale for this long while refreshing).
-const DEFAULT_LAZY_TTL: Duration = Duration::from_secs(30);
+/// Default optimistic cache TTL: how long an expired record may still be
+/// served while a background refresh is in flight.
+pub const DEFAULT_OPTIMISTIC_TTL: Duration = Duration::from_secs(30);
+
+/// Upper bound on how long expired records may be retained, per Optimistic
+/// DNS (draft-gakiwate-dnsop-optimistic-dns-00, Section 7.4): SHOULD NOT store
+/// records for more than one week after the TTL has expired.
+pub const MAX_OPTIMISTIC_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// TTL reported on an optimistic (expired) answer.
+///
+/// Optimistic DNS is defined for stub resolvers with an asynchronous API that
+/// can deliver the fresh answer later. A DNS forwarder has no such callback,
+/// so it uses the RFC 8767 recommendation for recursive resolvers: expired
+/// data is returned with a 30-second TTL, prompting the client to ask again
+/// shortly after the background refresh completes.
+const OPTIMISTIC_REPLY_TTL: u32 = 30;
 
 /// Default interval between periodic cache dumps to disk.
 pub const DEFAULT_DUMP_INTERVAL: Duration = Duration::from_secs(300);
@@ -39,11 +55,12 @@ const SHARDING_MIN_CAPACITY: usize = 4096;
 /// File persistence magic header and version.
 ///
 /// Version 2 extends each entry with the full [`CacheKey`] view fields
-/// (QCLASS, RD/CD/AD/DO bits, EDNS-options hash). Version 1 files are
-/// rejected: their keys cannot be reconstructed safely, so entries from an
-/// older version must not be served under a version-2 key.
+/// (QCLASS, RD/CD/AD/DO bits, EDNS-options hash). Version 3 stores the
+/// entry's original TTL and age instead of its remaining TTL so expired
+/// records inside the optimistic window survive a restart. Older files are
+/// rejected: their keys/ages cannot be reconstructed safely.
 const FILE_MAGIC: &[u8; 10] = b"REDNSCACHE";
-const FILE_VERSION: u8 = 2;
+const FILE_VERSION: u8 = 3;
 
 /// Configuration for cache file persistence.
 #[derive(Debug, Clone)]
@@ -77,6 +94,11 @@ struct CachedEntry {
     stored_at: Instant,
     /// Original minimum TTL of the response records.
     original_ttl: u32,
+    /// Whether this is an Optimistic Positive Answer. The Optimistic DNS
+    /// draft says expired negative answers SHOULD NOT be used to generate
+    /// user-facing errors; without an async application API we therefore
+    /// fetch those again instead of serving them stale.
+    optimistic_eligible: bool,
 }
 
 /// Query-view bits packed into [`CacheKey`]. Answers can differ on all of
@@ -124,10 +146,10 @@ impl CachedEntry {
         self.remaining_ttl() == 0
     }
 
-    fn is_within_lazy_window(&self, lazy_ttl: Duration) -> bool {
+    fn is_within_optimistic_window(&self, optimistic_ttl: Duration) -> bool {
         let elapsed = self.stored_at.elapsed();
         let expire_at = Duration::from_secs(self.original_ttl as u64);
-        elapsed < expire_at + lazy_ttl
+        elapsed < expire_at + optimistic_ttl
     }
 }
 
@@ -293,11 +315,17 @@ struct CacheInner {
     shard_count: usize,
     shards: Vec<QuickCache<CacheKey, CachedEntry>>,
     shard_hasher: ahash::RandomState,
-    /// Deduplicates background lazy refreshes for the same key.
+    /// Deduplicates background optimistic refreshes for the same key.
     inflight_refreshes: Mutex<HashSet<CacheKey>>,
     /// Coalesces concurrent cache misses so only one query fetches upstream.
     inflight_misses: Mutex<ahash::HashMap<CacheKey, Arc<MissState>>>,
-    lazy_ttl: Duration,
+    /// How long expired records may still be served while refreshing.
+    optimistic_ttl: Duration,
+    /// Path to dump this cache to on shutdown, if persistence is enabled.
+    persist_path: Option<String>,
+    /// Serializes periodic and shutdown dumps so they don't race on the
+    /// temporary file.
+    dump_lock: tokio::sync::Mutex<()>,
     /// Total cache hits (fresh + stale).
     hit_total: AtomicU64,
     /// Total cache misses.
@@ -388,7 +416,7 @@ pub struct CacheSnapshot {
 impl Cache {
     pub fn new(
         max_size: usize,
-        lazy_ttl: Duration,
+        optimistic_ttl: Duration,
         persist_config: Option<CachePersistConfig>,
     ) -> Self {
         let cap = if max_size == 0 {
@@ -396,6 +424,19 @@ impl Cache {
         } else {
             max_size
         };
+        let optimistic_ttl = if optimistic_ttl > MAX_OPTIMISTIC_TTL {
+            tracing::warn!(
+                requested_secs = optimistic_ttl.as_secs(),
+                capped_secs = MAX_OPTIMISTIC_TTL.as_secs(),
+                "optimistic_ttl exceeds the one-week limit from Optimistic DNS; capping"
+            );
+            MAX_OPTIMISTIC_TTL
+        } else {
+            optimistic_ttl
+        };
+        let persist_path = persist_config
+            .as_ref()
+            .map(|persist| persist.file_path.clone());
 
         let shard_count = if cap < SHARDING_MIN_CAPACITY {
             1
@@ -417,7 +458,9 @@ impl Cache {
             shard_hasher: ahash::RandomState::new(),
             inflight_refreshes: Mutex::new(HashSet::new()),
             inflight_misses: Mutex::new(ahash::HashMap::default()),
-            lazy_ttl,
+            optimistic_ttl,
+            persist_path,
+            dump_lock: tokio::sync::Mutex::new(()),
             hit_total: AtomicU64::new(0),
             miss_total: AtomicU64::new(0),
         });
@@ -467,7 +510,7 @@ impl Cache {
     }
 
     pub fn default_cache() -> Self {
-        Self::new(DEFAULT_CACHE_SIZE, DEFAULT_LAZY_TTL, None)
+        Self::new(DEFAULT_CACHE_SIZE, DEFAULT_OPTIMISTIC_TTL, None)
     }
 
     fn get_shard(&self, key: &CacheKey) -> &QuickCache<CacheKey, CachedEntry> {
@@ -509,6 +552,36 @@ fn register_cache(inner: &Arc<CacheInner>) {
     guard.push(Arc::downgrade(inner));
 }
 
+/// Flushes every cache with file persistence to disk.
+///
+/// Called during graceful shutdown so entries accumulated since the last
+/// periodic dump are not lost. Returns the total number of entries written.
+pub async fn dump_all_caches() -> usize {
+    let caches: Vec<Arc<CacheInner>> = {
+        let registry = cache_registry();
+        let mut guard = registry.lock();
+        guard.retain(|cache| cache.upgrade().is_some());
+        guard.iter().filter_map(|cache| cache.upgrade()).collect()
+    };
+
+    let mut total = 0usize;
+    for inner in caches {
+        let Some(path) = inner.persist_path.clone() else {
+            continue;
+        };
+        let cache = Cache {
+            inner: inner.clone(),
+        };
+        match cache.dump_to_file(Path::new(&path)).await {
+            Ok(n) => total += n,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path, "cache shutdown dump failed");
+            }
+        }
+    }
+    total
+}
+
 pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
     let caches: Vec<Arc<CacheInner>> = {
         let registry = cache_registry();
@@ -548,8 +621,9 @@ pub async fn cache_registry_snapshot() -> Vec<CacheSnapshot> {
     snapshots
 }
 
-/// Result of a cache lookup: a fresh hit, a stale hit eligible for lazy
-/// refresh, or a miss that should be fetched upstream.
+/// Result of a cache lookup: a fresh hit, an optimistic (expired but still
+/// within the optimistic window) hit eligible for refresh, or a miss that
+/// should be fetched upstream.
 enum CacheLookup {
     Hit(Vec<u8>),
     Stale(Vec<u8>),
@@ -568,12 +642,31 @@ impl Cache {
                     let ttl = entry.remaining_ttl();
                     Some((entry.resp_wire, entry.ttl_offsets, ttl, false))
                 }
-                Some(entry) if entry.is_within_lazy_window(self.inner.lazy_ttl) => {
-                    // Stale-while-refresh: serve with a 1-second TTL while a
-                    // background refresh runs.
-                    Some((entry.resp_wire, entry.ttl_offsets, 1, true))
+                Some(entry)
+                    if entry.optimistic_eligible
+                        && entry.is_within_optimistic_window(self.inner.optimistic_ttl) =>
+                {
+                    // Optimistic DNS: return the expired positive answer
+                    // immediately while a background refresh runs. There is no
+                    // async callback in the DNS protocol, so the response
+                    // carries a short TTL; the client asks again after the
+                    // refresh has had time to complete (RFC 8767 uses 30
+                    // seconds).
+                    Some((
+                        entry.resp_wire,
+                        entry.ttl_offsets,
+                        OPTIMISTIC_REPLY_TTL,
+                        true,
+                    ))
                 }
-                _ => None,
+                Some(_) => {
+                    // Expired and not eligible for optimistic serving (a
+                    // negative answer, or past the one-week window). Drop it
+                    // and let the query go upstream.
+                    self.get_shard(key).remove(key);
+                    None
+                }
+                None => None,
             }
         };
 
@@ -718,6 +811,8 @@ impl Cache {
         }
 
         let cacheable = rcode != ResponseCode::Refused && !resp.metadata.truncation && ttl != 0;
+        // Optimistic Positive Answers only: see `CachedEntry::optimistic_eligible`.
+        let optimistic_eligible = rcode == ResponseCode::NoError && !resp.answers.is_empty();
 
         let (wire, offsets) = build_stored_wire(resp, ttl)?;
 
@@ -729,6 +824,7 @@ impl Cache {
                     ttl_offsets: offsets.clone().into(),
                     stored_at: Instant::now(),
                     original_ttl: ttl,
+                    optimistic_eligible,
                 },
             );
         }
@@ -766,15 +862,21 @@ impl Cache {
         });
     }
 
-    /// Dump all non-expired cache entries to a binary file.
+    /// Dump all cache entries that are still fresh or within the optimistic
+    /// window to a binary file.
     ///
     /// The file is written atomically via a temp file + rename.
     /// Returns the number of entries dumped.
     async fn dump_to_file(&self, path: &Path) -> io::Result<usize> {
+        // Periodic and shutdown dumps can overlap; serialize them so they
+        // never write the same temporary file at once.
+        let _dump_guard = self.inner.dump_lock.lock().await;
+
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let optimistic_secs = self.inner.optimistic_ttl.as_secs().min(u32::MAX as u64) as u32;
 
         let mut entries_buf = Vec::new();
         let mut count: usize = 0;
@@ -783,8 +885,8 @@ impl Cache {
             // `quick_cache::iter` yields owned clones, so `key`/`entry` can be
             // used without holding references into the shard.
             for (key, entry) in shard.iter() {
-                let remaining = entry.remaining_ttl();
-                if remaining == 0 {
+                let age = entry.stored_at.elapsed().as_secs().min(u32::MAX as u64) as u32;
+                if age > entry.original_ttl.saturating_add(optimistic_secs) {
                     continue;
                 }
 
@@ -798,7 +900,11 @@ impl Cache {
                 entries_buf.write_all(&u16::from(key.qclass).to_be_bytes())?;
                 entries_buf.write_all(&[key.view])?;
                 entries_buf.write_all(&key.options_hash.to_be_bytes())?;
-                entries_buf.write_all(&remaining.to_be_bytes())?;
+                // Store the original TTL and age separately. Remaining TTL
+                // alone cannot represent an already-expired entry that is
+                // still eligible for optimistic serving.
+                entries_buf.write_all(&entry.original_ttl.to_be_bytes())?;
+                entries_buf.write_all(&age.to_be_bytes())?;
 
                 let msg_wire = entry.resp_wire.as_slice();
                 if msg_wire.len() > u32::MAX as usize {
@@ -838,7 +944,8 @@ impl Cache {
 
     /// Load cache entries from a binary file written by [`dump_to_file`].
     ///
-    /// Entries that have expired between dump and load are skipped.
+    /// Entries that were already beyond the optimistic window at dump time,
+    /// or that fell out of it while the process was stopped, are skipped.
     /// Returns the number of entries loaded.
     async fn load_from_file(&self, path: &Path) -> io::Result<usize> {
         let path = path.to_path_buf();
@@ -888,6 +995,7 @@ impl Cache {
             .unwrap_or_default()
             .as_secs() as i64;
         let elapsed_since_dump = (now_ts - dump_ts).max(0) as u32;
+        let optimistic_secs = self.inner.optimistic_ttl.as_secs().min(u32::MAX as u64) as u32;
 
         let mut loaded = 0;
         for _ in 0..entry_count {
@@ -909,7 +1017,7 @@ impl Cache {
             let qtype_u16 = u16::from_be_bytes([data[pos], data[pos + 1]]);
             pos += 2;
 
-            if pos + 2 + 1 + 8 + 4 > data.len() {
+            if pos + 2 + 1 + 8 + 4 + 4 > data.len() {
                 break;
             }
             let qclass_u16 = u16::from_be_bytes([data[pos], data[pos + 1]]);
@@ -931,7 +1039,14 @@ impl Cache {
             if pos + 4 > data.len() {
                 break;
             }
-            let remaining_at_dump =
+            let original_ttl =
+                u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+
+            if pos + 4 > data.len() {
+                break;
+            }
+            let age_at_dump =
                 u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
 
@@ -949,15 +1064,26 @@ impl Cache {
             let msg_wire = &data[pos..pos + msg_len];
             pos += msg_len;
 
-            let effective_remaining = remaining_at_dump.saturating_sub(elapsed_since_dump);
-            if effective_remaining == 0 {
+            let age = age_at_dump.saturating_add(elapsed_since_dump);
+            if age > original_ttl.saturating_add(optimistic_secs) {
                 continue;
             }
 
-            // Validate the wire before adopting the entry.
-            if Message::from_vec(msg_wire).is_err() {
+            // Validate the wire before adopting the entry, and recover whether
+            // it is an Optimistic Positive Answer.
+            let Ok(parsed) = Message::from_vec(msg_wire) else {
                 continue;
-            }
+            };
+            let optimistic_eligible = parsed.response_code
+                == hickory_proto::op::ResponseCode::NoError
+                && !parsed.answers.is_empty();
+
+            // Reconstruct the original store time so remaining_ttl() and the
+            // optimistic window continue to age correctly after a restart.
+            let Some(stored_at) = Instant::now().checked_sub(Duration::from_secs(age as u64))
+            else {
+                continue;
+            };
 
             let key = CacheKey {
                 qname,
@@ -967,19 +1093,21 @@ impl Cache {
                 options_hash,
             };
 
-            // Normalize the loaded wire so all record TTLs equal the remaining
-            // TTL, matching how freshly-stored responses are kept.
+            // Normalize the loaded wire so all record TTLs equal the original
+            // TTL, matching how freshly-stored responses are kept. Hits patch
+            // the TTL to the remaining/optimistic value.
             let mut wire = msg_wire.to_vec();
             let offsets = extract_ttl_offsets(&wire);
-            set_ttl_in_wire(&mut wire, &offsets, effective_remaining);
+            set_ttl_in_wire(&mut wire, &offsets, original_ttl);
 
             self.get_shard(&key).insert(
                 key,
                 CachedEntry {
                     resp_wire: Arc::new(wire),
                     ttl_offsets: offsets.into(),
-                    stored_at: Instant::now(),
-                    original_ttl: effective_remaining,
+                    stored_at,
+                    original_ttl,
+                    optimistic_eligible,
                 },
             );
             loaded += 1;
@@ -1206,6 +1334,25 @@ mod tests {
             ttl_offsets: offsets.into(),
             stored_at: Instant::now(),
             original_ttl: ttl,
+            optimistic_eligible: false,
+        }
+    }
+
+    fn positive_entry(ttl: u32) -> CachedEntry {
+        let mut resp = Message::response(0, OpCode::Query);
+        resp.metadata.response_code = ResponseCode::NoError;
+        resp.add_answer(Record::from_rdata(
+            Name::from_ascii("expired.example.").unwrap(),
+            ttl,
+            RData::A(Ipv4Addr::new(192, 0, 2, 1).into()),
+        ));
+        let (wire, offsets) = build_stored_wire(&resp, ttl).unwrap();
+        CachedEntry {
+            resp_wire: Arc::new(wire),
+            ttl_offsets: offsets.into(),
+            stored_at: Instant::now(),
+            original_ttl: ttl,
+            optimistic_eligible: true,
         }
     }
 
@@ -1217,6 +1364,82 @@ mod tests {
             view: 0,
             options_hash: 0,
         }
+    }
+
+    #[test]
+    fn optimistic_ttl_is_capped_at_one_week() {
+        let cache = Cache::new(128, Duration::from_secs(8 * 24 * 60 * 60), None);
+        assert_eq!(cache.inner.optimistic_ttl, MAX_OPTIMISTIC_TTL);
+    }
+
+    #[test]
+    fn expired_entry_is_served_only_inside_the_optimistic_window() {
+        let key = plain_key("expired.example");
+        let mut entry = positive_entry(1);
+        entry.stored_at = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("instant supports a five-second offset");
+
+        let cache = Cache::new(128, Duration::from_secs(10), None);
+        cache.get_shard(&key).insert(key.clone(), entry.clone());
+        assert!(matches!(
+            cache.lookup_and_build(&key, 1),
+            CacheLookup::Stale(_)
+        ));
+
+        let cache = Cache::new(128, Duration::from_secs(3), None);
+        cache.get_shard(&key).insert(key.clone(), entry);
+        assert!(matches!(cache.lookup_and_build(&key, 1), CacheLookup::Miss));
+    }
+
+    #[test]
+    fn expired_negative_answer_is_not_served_optimistically() {
+        let key = plain_key("negative.example");
+        let mut entry = empty_entry(1);
+        entry.stored_at = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("instant supports a five-second offset");
+
+        let cache = Cache::new(128, Duration::from_secs(10), None);
+        cache.get_shard(&key).insert(key.clone(), entry);
+        assert!(
+            matches!(cache.lookup_and_build(&key, 1), CacheLookup::Miss),
+            "expired negative answers must be confirmed upstream"
+        );
+        assert!(
+            cache.get_shard(&key).get(&key).is_none(),
+            "expired negative entry should be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn optimistic_entries_survive_dump_and_load() {
+        let path = std::env::temp_dir().join(format!(
+            "redns-optimistic-cache-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let key = plain_key("stale.example");
+        let mut entry = positive_entry(1);
+        entry.stored_at = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("instant supports a five-second offset");
+
+        let cache = Cache::new(128, Duration::from_secs(60), None);
+        cache.get_shard(&key).insert(key.clone(), entry);
+        assert_eq!(cache.dump_to_file(&path).await.unwrap(), 1);
+
+        let loaded = Cache::new(128, Duration::from_secs(60), None);
+        assert_eq!(loaded.load_from_file(&path).await.unwrap(), 1);
+        assert!(matches!(
+            loaded.lookup_and_build(&key, 1),
+            CacheLookup::Stale(_)
+        ));
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
@@ -1270,7 +1493,7 @@ mod tests {
         seq.exec(&mut first).await.unwrap();
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
 
-        // Make entry stale but still within lazy window.
+        // Make entry stale but still within the optimistic window.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Trigger one background refresh.
