@@ -19,20 +19,21 @@
 
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
-use std::collections::HashSet;
 
 /// Matches if the response rcode is in the allowed set.
 /// Returns `false` if there is no response yet.
 #[derive(Debug, Clone)]
 pub struct RcodeMatcher {
-    allowed: HashSet<u16>,
+    /// Sorted, deduplicated rcode values.
+    allowed: Vec<u16>,
 }
 
 impl RcodeMatcher {
     pub fn new(codes: impl IntoIterator<Item = u16>) -> Self {
-        Self {
-            allowed: codes.into_iter().collect(),
-        }
+        let mut allowed: Vec<u16> = codes.into_iter().collect();
+        allowed.sort_unstable();
+        allowed.dedup();
+        Self { allowed }
     }
 
     /// Parses a space-separated string of integer rcode values.
@@ -48,7 +49,10 @@ impl RcodeMatcher {
 impl Matcher for RcodeMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(resp) = ctx.response() {
-            Ok(self.allowed.contains(&resp.response_code.into()))
+            Ok(self
+                .allowed
+                .binary_search(&resp.response_code.into())
+                .is_ok())
         } else {
             Ok(false)
         }

@@ -424,6 +424,20 @@ impl Context {
         self.response_wire.take()
     }
 
+    /// Takes the response message by value, decoding the pre-serialized wire
+    /// first when needed. Afterwards the context holds no response output: the
+    /// wire is consumed together with the decoded message.
+    pub fn take_response(&mut self) -> Option<Message> {
+        if self.response.get().is_none()
+            && let Some(wire) = self.response_wire.as_deref()
+        {
+            let resp = Message::from_vec(wire).ok()?;
+            let _ = self.response.set(resp);
+        }
+        self.response_wire = None;
+        std::mem::replace(&mut self.response, OnceLock::new()).into_inner()
+    }
+
     /// Returns true when either response representation is present.
     pub fn has_response_output(&self) -> bool {
         self.response.get().is_some() || self.response_wire.is_some()

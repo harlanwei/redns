@@ -4,6 +4,7 @@
 
 //! CNAME matcher — matches CNAME targets in DNS response against domain set.
 
+use crate::domain_set::DomainTrie;
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use std::collections::HashSet;
@@ -11,15 +12,20 @@ use std::collections::HashSet;
 /// Matches CNAME record targets in the DNS response.
 #[derive(Debug, Clone)]
 pub struct CnameMatcher {
-    exact: HashSet<String>,
-    suffixes: Vec<String>,
+    exact: HashSet<Box<str>>,
+    /// Suffix patterns (leading `.`), lowercased and trimmed of trailing
+    /// dots at load; matched on label boundaries via the domain trie.
+    suffixes: DomainTrie,
+    /// A pattern consisting only of dots (e.g. `.`) matches every name.
+    match_all: bool,
 }
 
 impl CnameMatcher {
     pub fn new() -> Self {
         Self {
             exact: HashSet::new(),
-            suffixes: Vec::new(),
+            suffixes: DomainTrie::new(),
+            match_all: false,
         }
     }
 
@@ -29,9 +35,14 @@ impl CnameMatcher {
             return;
         }
         if let Some(stripped) = p.strip_prefix('.') {
-            self.suffixes.push(stripped.to_string());
+            let suffix = stripped.trim_end_matches('.');
+            if suffix.is_empty() {
+                self.match_all = true;
+            } else {
+                self.suffixes.insert(suffix);
+            }
         } else {
-            self.exact.insert(p);
+            self.exact.insert(p.into_boxed_str());
         }
     }
 
@@ -43,17 +54,18 @@ impl CnameMatcher {
         m
     }
 
-    fn matches_name(&self, name: &str) -> bool {
-        let name_lower = name.to_lowercase();
-        if self.exact.contains(&name_lower) {
+    fn matches_name(&self, name: &hickory_proto::rr::Name) -> bool {
+        if self.match_all {
             return true;
         }
-        for suffix in &self.suffixes {
-            if name_lower.ends_with(suffix)
-                || name_lower
-                    .trim_end_matches('.')
-                    .ends_with(suffix.trim_end_matches('.'))
-            {
+        if self.suffixes.matches_labels(name.iter()) {
+            return true;
+        }
+        // Exact patterns compare whole strings; only build the lowercase
+        // name when exact patterns are configured.
+        if !self.exact.is_empty() {
+            let name_lower = name.to_ascii().to_lowercase();
+            if self.exact.contains(name_lower.as_str()) {
                 return true;
             }
         }
@@ -77,7 +89,7 @@ impl Matcher for CnameMatcher {
             if rr.record_type() == hickory_proto::rr::RecordType::CNAME {
                 let rdata = &rr.data;
                 if let hickory_proto::rr::RData::CNAME(cname) = rdata
-                    && self.matches_name(&cname.0.to_ascii())
+                    && self.matches_name(&cname.0)
                 {
                     return Ok(true);
                 }
@@ -147,5 +159,31 @@ mod tests {
         });
         let ctx = Context::new(msg);
         assert!(!m.match_ctx(&ctx).unwrap());
+    }
+
+    #[test]
+    fn suffix_match_respects_label_boundaries() {
+        let m = CnameMatcher::from_str_args(".cdn.example.com.");
+        assert!(
+            m.match_ctx(&make_ctx_with_cname("cdn.example.com."))
+                .unwrap()
+        );
+        assert!(
+            m.match_ctx(&make_ctx_with_cname("a.cdn.example.com."))
+                .unwrap()
+        );
+        // A bare string suffix without a label boundary must not match.
+        assert!(
+            !m.match_ctx(&make_ctx_with_cname("xcdn.example.com."))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dot_only_pattern_matches_everything() {
+        // Legacy behavior: a `.` pattern trims to an empty suffix, which
+        // every name ends with.
+        let m = CnameMatcher::from_str_args(".");
+        assert!(m.match_ctx(&make_ctx_with_cname("anything.net.")).unwrap());
     }
 }

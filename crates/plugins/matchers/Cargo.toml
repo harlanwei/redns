@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 redns-core = { path = "../../core" }
+aho-corasick = "1"
+fastrand = "2"
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 ipnet = "2"
 maxminddb = "0.30"

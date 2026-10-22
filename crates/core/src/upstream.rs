@@ -80,8 +80,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex as StdMutex;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -141,8 +141,16 @@ const DOH_MAX_GET_URL_LEN: usize = 2048;
 /// data; cap it here to protect against memory exhaustion.
 const MAX_DNS_RESPONSE: usize = 65535;
 
-static GLOBAL_LATENCY_SUM_US: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Per-upstream counters behind [`global_average_latency`]. Each
+/// [`UpstreamWrapper`] registers a weak reference at construction so the
+/// global aggregate is summed on demand, and exchanges touch only their own
+/// upstream's counters instead of contending on process-wide atomics.
+struct LatencyCounters {
+    completed: AtomicU64,
+    sum_us: AtomicU64,
+}
+
+static LATENCY_REGISTRY: StdMutex<Vec<Weak<LatencyCounters>>> = StdMutex::new(Vec::new());
 
 /// An upstream DNS transport that can exchange raw DNS wire messages.
 #[async_trait]
@@ -162,6 +170,9 @@ pub struct UdpUpstream {
     timeout: Duration,
     max_idle_sockets: usize,
     pool: Mutex<VecDeque<UdpSocket>>,
+    /// Recv buffers reused across exchanges, avoiding a fresh zero-initialized
+    /// allocation per query. Bounded by `max_idle_sockets`, like the socket pool.
+    buf_pool: StdMutex<VecDeque<Vec<u8>>>,
 }
 
 impl UdpUpstream {
@@ -171,6 +182,7 @@ impl UdpUpstream {
             timeout: DEFAULT_TIMEOUT,
             max_idle_sockets: DEFAULT_MAX_IDLE_UDP_SOCKETS,
             pool: Mutex::new(VecDeque::new()),
+            buf_pool: StdMutex::new(VecDeque::new()),
         }
     }
 
@@ -233,6 +245,28 @@ impl UdpUpstream {
         pool.push_back(sock);
     }
 
+    fn get_buf(&self, cap: usize) -> Vec<u8> {
+        let mut buf = match self.buf_pool.lock().pop_front() {
+            Some(buf) => buf,
+            None => return vec![0u8; cap],
+        };
+        if buf.capacity() < cap {
+            buf.reserve(cap - buf.len());
+        }
+        buf.resize(cap, 0);
+        buf
+    }
+
+    fn put_buf(&self, buf: Vec<u8>) {
+        if self.max_idle_sockets == 0 {
+            return;
+        }
+        let mut pool = self.buf_pool.lock();
+        if pool.len() < self.max_idle_sockets {
+            pool.push_back(buf);
+        }
+    }
+
     /// Remaining time until `deadline`, or an error if the budget is exhausted.
     fn remaining_until(deadline: Instant) -> PluginResult<Duration> {
         match deadline.checked_duration_since(Instant::now()) {
@@ -253,24 +287,133 @@ fn dns_header_tc(wire: &[u8]) -> bool {
     wire.len() >= 3 && (wire[2] & 0x02) != 0
 }
 
-/// True when `resp_wire` is a DNS response that echoes `query_wire`'s question
-/// (name matched case-insensitively, plus type and class).
+/// Skip a DNS name (possibly compressed) starting at `pos`, returning the
+/// offset just past the name in the outer message. None on malformed wire.
+fn skip_wire_name(wire: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        if pos >= wire.len() {
+            return None;
+        }
+        let b = wire[pos];
+        if b == 0 {
+            return Some(pos + 1);
+        }
+        if b & 0xc0 == 0xc0 {
+            // Compression pointer: 2 bytes total, always terminates.
+            return Some(pos + 2);
+        }
+        pos = pos.checked_add(1 + b as usize)?;
+    }
+}
+
+/// End offset of the question section (which starts at byte 12). None on
+/// malformed wire.
+fn question_section_end(wire: &[u8]) -> Option<usize> {
+    if wire.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([wire[4], wire[5]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        pos = skip_wire_name(wire, pos)?;
+        pos = pos.checked_add(4)?; // QTYPE + QCLASS
+        if pos > wire.len() {
+            return None;
+        }
+    }
+    Some(pos)
+}
+
+/// Skip one resource record starting at `pos`, returning the offset just past
+/// its RDATA. None on malformed wire.
+fn skip_wire_record(wire: &[u8], pos: usize) -> Option<usize> {
+    let pos = skip_wire_name(wire, pos)?;
+    let fixed = pos.checked_add(10)?; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+    if fixed > wire.len() {
+        return None;
+    }
+    let rdlength = u16::from_be_bytes([wire[fixed - 2], wire[fixed - 1]]) as usize;
+    let end = fixed.checked_add(rdlength)?;
+    if end > wire.len() {
+        return None;
+    }
+    Some(end)
+}
+
+/// The advertised EDNS0 UDP payload size (the OPT pseudo-record's CLASS
+/// field), located by walking the wire format instead of parsing. Outer
+/// `None` means the walk failed (malformed wire); inner `None` means the
+/// message carries no OPT record.
+fn wire_edns_max_payload(wire: &[u8]) -> Option<Option<u16>> {
+    let mut pos = question_section_end(wire)?;
+    let ancount = u16::from_be_bytes([wire[6], wire[7]]) as usize;
+    let nscount = u16::from_be_bytes([wire[8], wire[9]]) as usize;
+    let arcount = u16::from_be_bytes([wire[10], wire[11]]) as usize;
+    for _ in 0..ancount + nscount {
+        pos = skip_wire_record(wire, pos)?;
+    }
+    // OPT lives in the additional section.
+    for _ in 0..arcount {
+        let name_end = skip_wire_name(wire, pos)?;
+        let fixed = name_end.checked_add(10)?;
+        if fixed > wire.len() {
+            return None;
+        }
+        if u16::from_be_bytes([wire[name_end], wire[name_end + 1]]) == 41 {
+            // TYPE=41 (OPT): CLASS carries the requestor's UDP payload size.
+            return Some(Some(u16::from_be_bytes([
+                wire[name_end + 2],
+                wire[name_end + 3],
+            ])));
+        }
+        pos = fixed.checked_add(u16::from_be_bytes([wire[fixed - 2], wire[fixed - 1]]) as usize)?;
+        if pos > wire.len() {
+            return None;
+        }
+    }
+    Some(None)
+}
+
+/// True when `resp_wire` is a DNS response that echoes the question of
+/// `query_wire` (name matched case-insensitively, plus type and class).
+/// `query_msg` is the query parsed once per exchange; when it is `None` (the
+/// query did not parse) no datagram matches.
 ///
 /// Pooled UDP sockets can receive late or duplicate datagrams from earlier
 /// exchanges, so an ID match alone is not proof a datagram answers *this*
-/// question. Parsing both messages keeps the check robust against servers
-/// that re-case or re-encode the echoed question.
-fn response_matches_question(resp_wire: &[u8], query_wire: &[u8]) -> bool {
+/// question. Compliant servers echo the question section verbatim, so the
+/// common case is a raw byte comparison of the two question sections; only
+/// when the bytes differ (a server re-casing or re-encoding the echoed
+/// question) is the response fully parsed.
+fn response_matches_question(
+    resp_wire: &[u8],
+    query_wire: &[u8],
+    query_msg: Option<&hickory_proto::op::Message>,
+) -> bool {
     use hickory_proto::op::{Message, MessageType};
 
-    let (Ok(resp), Ok(query)) = (Message::from_vec(resp_wire), Message::from_vec(query_wire))
-    else {
+    let Some(query_msg) = query_msg else {
+        return false;
+    };
+    // QR bit (header byte 2, top bit) must mark a response.
+    if resp_wire.len() < 12 || resp_wire[2] & 0x80 == 0 {
+        return false;
+    }
+    if let (Some(q_end), Some(r_end)) = (
+        question_section_end(query_wire),
+        question_section_end(resp_wire),
+    ) && q_end > 12
+        && query_wire[12..q_end] == resp_wire[12..r_end]
+    {
+        return true;
+    }
+    let Ok(resp) = Message::from_vec(resp_wire) else {
         return false;
     };
     if resp.message_type != MessageType::Response {
         return false;
     }
-    match (resp.queries.first(), query.queries.first()) {
+    match (resp.queries.first(), query_msg.queries.first()) {
         (Some(rq), Some(qq)) => {
             // `Name: PartialEq` compares case-insensitively.
             rq.query_type() == qq.query_type()
@@ -286,12 +429,38 @@ fn response_matches_question(resp_wire: &[u8], query_wire: &[u8]) -> bool {
 fn udp_recv_capacity(query: &[u8]) -> usize {
     use hickory_proto::op::Message;
 
-    if let Ok(msg) = Message::from_vec(query)
-        && let Some(edns) = msg.edns
-    {
-        return (edns.max_payload() as usize).clamp(MIN_UDP_RECV, MAX_UDP_SIZE);
+    let payload = match wire_edns_max_payload(query) {
+        Some(payload) => payload,
+        // The wire walk rejected the message; a full parse is authoritative.
+        None => Message::from_vec(query)
+            .ok()
+            .and_then(|msg| msg.edns.map(|e| e.max_payload())),
+    };
+    match payload {
+        Some(p) => (p as usize).clamp(MIN_UDP_RECV, MAX_UDP_SIZE),
+        None => DEFAULT_UDP_RECV.min(MAX_UDP_SIZE),
     }
-    DEFAULT_UDP_RECV.min(MAX_UDP_SIZE)
+}
+
+/// Returns the exchange recv buffer to the upstream's pool on drop, unless
+/// the response took ownership of it via [`BufGuard::take`].
+struct BufGuard<'a> {
+    upstream: &'a UdpUpstream,
+    buf: Option<Vec<u8>>,
+}
+
+impl BufGuard<'_> {
+    fn take(&mut self) -> Vec<u8> {
+        self.buf.take().expect("recv buffer present")
+    }
+}
+
+impl Drop for BufGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.upstream.put_buf(buf);
+        }
+    }
 }
 
 #[async_trait]
@@ -314,6 +483,9 @@ impl Upstream for UdpUpstream {
         let mut wire = query.to_vec();
         wire[0..2].copy_from_slice(&transport_id.to_be_bytes());
 
+        // Parsed once per exchange; the recv loop matches datagrams against it.
+        let query_msg = hickory_proto::op::Message::from_vec(query).ok();
+
         let sock = self.get_socket().await?;
 
         // Bound the whole exchange (send + recv), not just the receive side.
@@ -329,20 +501,24 @@ impl Upstream for UdpUpstream {
             Err(_) => return Err("udp exchange timed out".into()),
         }
 
-        let mut buf = vec![0u8; udp_recv_capacity(query)];
+        let mut guard = BufGuard {
+            upstream: self,
+            buf: Some(self.get_buf(udp_recv_capacity(query))),
+        };
         loop {
             let remaining = Self::remaining_until(deadline)?;
 
-            match tokio::time::timeout(remaining, sock.recv(&mut buf)).await {
+            let buf = guard.buf.as_mut().expect("recv buffer present");
+            match tokio::time::timeout(remaining, sock.recv(buf)).await {
                 Ok(Ok(n)) => {
                     // Ignore datagrams whose ID does not match this exchange's
                     // transport ID (a stale/duplicate response), or that do not
                     // echo this query's question.
                     let id_ok = n >= 2 && buf[0..2] == transport_id.to_be_bytes();
-                    if !id_ok || !response_matches_question(&buf[..n], query) {
+                    if !id_ok || !response_matches_question(&buf[..n], query, query_msg.as_ref()) {
                         continue;
                     }
-                    let mut resp = buf;
+                    let mut resp = guard.take();
                     resp.truncate(n);
                     // Done with the UDP socket whether or not we fall back to TCP.
                     self.put_socket(sock).await;
@@ -673,17 +849,19 @@ impl PipelinedConn {
         }
     }
 
-    fn alloc_id(&self) -> u16 {
+    /// Allocate an unused transaction ID. The caller must hold the `pending`
+    /// lock so the capacity check, allocation, and insertion are one atomic
+    /// section (and stay serialized against `close`'s drain).
+    fn alloc_id_locked(
+        &self,
+        pending: &HashMap<u16, tokio::sync::oneshot::Sender<PluginResult<Vec<u8>>>>,
+    ) -> u16 {
         loop {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            if !self.pending.lock().contains_key(&id) {
+            if !pending.contains_key(&id) {
                 return id;
             }
         }
-    }
-
-    fn inflight(&self) -> usize {
-        self.pending.lock().len()
     }
 }
 
@@ -942,27 +1120,28 @@ async fn pipelined_exchange_on(
     query: &[u8],
     timeout: Duration,
 ) -> PluginResult<Vec<u8>> {
-    if conn.inflight() >= PIPELINE_MAX_INFLIGHT {
-        return Err("pipelined connection at capacity".into());
-    }
-
     let original_id = if query.len() >= 2 {
         u16::from_be_bytes([query[0], query[1]])
     } else {
         0
     };
 
-    let pipe_id = conn.alloc_id();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
+    // Capacity check, ID allocation, and registration in a single locked
+    // section, serialized with close's drain so a query cannot be stranded
+    // after the reader and writer have already shut down.
+    let (pipe_id, rx) = {
         let mut pending = conn.pending.lock();
-        // Serialize registration with close's drain so a query cannot be
-        // stranded after the reader and writer have already shut down.
+        if pending.len() >= PIPELINE_MAX_INFLIGHT {
+            return Err("pipelined connection at capacity".into());
+        }
         if !conn.alive.load(Ordering::Acquire) {
             return Err("pipelined connection closed".into());
         }
+        let pipe_id = conn.alloc_id_locked(&pending);
+        let (tx, rx) = tokio::sync::oneshot::channel();
         pending.insert(pipe_id, tx);
-    }
+        (pipe_id, rx)
+    };
     let guard = PendingSlotGuard {
         conn: conn.clone(),
         id: pipe_id,
@@ -1128,10 +1307,11 @@ async fn stream_exchange<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let len = query.len() as u16;
+    let mut frame = Vec::with_capacity(2 + query.len());
+    frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    frame.extend_from_slice(query);
     let exchange = tokio::time::timeout(timeout, async {
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(query).await?;
+        stream.write_all(&frame).await?;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u16::from_be_bytes(len_buf) as usize;
@@ -1985,22 +2165,30 @@ pub struct UpstreamWrapper {
     ema_latency_ms: AtomicI64,
     query_count: AtomicU64,
     inflight_count: AtomicU64,
-    completed_count: AtomicU64,
     error_count: AtomicU64,
     consecutive_failures: AtomicU32,
     adopted_count: AtomicU64,
     final_selected_count: AtomicU64,
     rejected_rcode_count: AtomicU64,
-    latency_sum_us: AtomicU64,
+    latency_counters: Arc<LatencyCounters>,
 }
 
-/// Returns the global average upstream latency across all completed exchanges.
+/// Returns the global average upstream latency across all completed exchanges,
+/// summed from the live per-upstream counters.
 pub fn global_average_latency() -> Option<Duration> {
-    let completed = GLOBAL_COMPLETED_TOTAL.load(Ordering::Relaxed);
+    let (mut completed, mut sum_us) = (0u64, 0u64);
+    // Prune upstreams that have been dropped while aggregating.
+    LATENCY_REGISTRY.lock().retain(|weak| match weak.upgrade() {
+        Some(c) => {
+            completed += c.completed.load(Ordering::Relaxed);
+            sum_us += c.sum_us.load(Ordering::Relaxed);
+            true
+        }
+        None => false,
+    });
     if completed == 0 {
         return None;
     }
-    let sum_us = GLOBAL_LATENCY_SUM_US.load(Ordering::Relaxed);
     Some(Duration::from_micros(sum_us / completed))
 }
 
@@ -2009,6 +2197,13 @@ impl UpstreamWrapper {
     const ALPHA: f64 = 0.3;
 
     pub fn new(inner: Box<dyn Upstream>, name: String, protocol: String) -> Self {
+        let latency_counters = Arc::new(LatencyCounters {
+            completed: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+        });
+        LATENCY_REGISTRY
+            .lock()
+            .push(Arc::downgrade(&latency_counters));
         Self {
             inner,
             name,
@@ -2016,13 +2211,12 @@ impl UpstreamWrapper {
             ema_latency_ms: AtomicI64::new(0),
             query_count: AtomicU64::new(0),
             inflight_count: AtomicU64::new(0),
-            completed_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             adopted_count: AtomicU64::new(0),
             final_selected_count: AtomicU64::new(0),
             rejected_rcode_count: AtomicU64::new(0),
-            latency_sum_us: AtomicU64::new(0),
+            latency_counters,
         }
     }
 
@@ -2039,7 +2233,7 @@ impl UpstreamWrapper {
         self.query_count.load(Ordering::Relaxed)
     }
     pub fn completed_count(&self) -> u64 {
-        self.completed_count.load(Ordering::Relaxed)
+        self.latency_counters.completed.load(Ordering::Relaxed)
     }
     pub fn inflight_count(&self) -> u64 {
         self.inflight_count.load(Ordering::Relaxed)
@@ -2077,9 +2271,9 @@ impl UpstreamWrapper {
     /// Returns a point-in-time snapshot of this upstream's metrics.
     pub fn snapshot(&self) -> UpstreamMetrics {
         let query_total = self.query_count.load(Ordering::Relaxed);
-        let completed_total = self.completed_count.load(Ordering::Relaxed);
+        let completed_total = self.latency_counters.completed.load(Ordering::Relaxed);
         let inflight_total = self.inflight_count.load(Ordering::Relaxed);
-        let latency_sum = self.latency_sum_us.load(Ordering::Relaxed);
+        let latency_sum = self.latency_counters.sum_us.load(Ordering::Relaxed);
         UpstreamMetrics {
             name: self.name.clone(),
             protocol: self.protocol.clone(),
@@ -2119,11 +2313,12 @@ impl UpstreamWrapper {
         let result = self.inner.exchange(query).await;
         let elapsed = start.elapsed();
         let elapsed_ms = elapsed.as_millis() as i64;
-        self.completed_count.fetch_add(1, Ordering::Relaxed);
-        self.latency_sum_us
+        self.latency_counters
+            .completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.latency_counters
+            .sum_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-        GLOBAL_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        GLOBAL_LATENCY_SUM_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 
         // Feed the EMA latency on both success and failure. A failure — most
         // importantly a timeout — burns real wall-clock time, so folding it into
@@ -2848,6 +3043,39 @@ mod tests {
         assert_eq!(udp_recv_capacity(&bare.to_vec().unwrap()), DEFAULT_UDP_RECV);
     }
 
+    #[test]
+    fn response_matches_recased_question_via_parsed_fallback() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+
+        fn wire(mt: MessageType, qname: &str) -> Vec<u8> {
+            let mut msg = Message::new(1, mt, OpCode::Query);
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(Name::from_ascii(qname).unwrap())
+                    .set_query_type(RecordType::A);
+                q
+            });
+            msg.to_vec().unwrap()
+        }
+
+        let query_wire = wire(MessageType::Query, "example.com.");
+        let query_msg = Message::from_vec(&query_wire).unwrap();
+
+        // Verbatim echo: matched by the raw question-section byte comparison.
+        let echo = wire(MessageType::Response, "example.com.");
+        assert!(response_matches_question(&echo, &query_wire, Some(&query_msg)));
+
+        // Re-cased echo (0x20 randomization): bytes differ, the parsed
+        // fallback compares names case-insensitively.
+        let recased = wire(MessageType::Response, "EXAMPLE.COM.");
+        assert!(response_matches_question(&recased, &query_wire, Some(&query_msg)));
+
+        // A query (QR=0) is never a match, and an unparseable query matches nothing.
+        assert!(!response_matches_question(&query_wire, &query_wire, Some(&query_msg)));
+        assert!(!response_matches_question(&echo, &query_wire, None));
+    }
+
     /// A stale datagram on a reused socket must be discarded rather than
     /// returned as the answer to a different query. The fake upstream first
     /// sends a datagram with a mismatched ID, then one with the right ID but a
@@ -3270,7 +3498,7 @@ mod tests {
         conn.pending.lock().insert(2, tx2);
 
         // next_id starts at 0, so alloc_id should skip 0, 1, 2 and return 3.
-        let id = conn.alloc_id();
+        let id = conn.alloc_id_locked(&conn.pending.lock());
         assert_eq!(id, 3);
     }
 

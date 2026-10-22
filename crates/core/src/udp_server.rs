@@ -58,7 +58,7 @@ fn build_udp_query(
 ) -> Result<(Message, QueryMeta), hickory_proto::ProtoError> {
     let query = Message::from_vec(query_wire.as_slice())?;
     let meta = QueryMeta {
-        protocol: Some("udp".to_string()),
+        protocol: Some("udp"),
         from_udp: true,
         client_addr: Some(client_ip),
         url_path: None,
@@ -360,7 +360,7 @@ mod tests {
         let (parsed, meta) = build_udp_query(expected_wire.clone(), client_ip).unwrap();
 
         assert_eq!(parsed.id, 1);
-        assert_eq!(meta.protocol.as_deref(), Some("udp"));
+        assert_eq!(meta.protocol, Some("udp"));
         assert!(meta.from_udp);
         assert_eq!(meta.client_addr, Some(client_ip));
         assert_eq!(

@@ -83,13 +83,13 @@ struct BranchOutcome {
     path: Vec<QueryPathStep>,
 }
 
-fn branch_outcome_from_ctx(ctx: &Context) -> BranchOutcome {
+fn branch_outcome_from_ctx(ctx: &mut Context) -> BranchOutcome {
     let response_wire = ctx.response_wire().map(ToOwned::to_owned);
     BranchOutcome {
         response: if response_wire.is_some() {
             None
         } else {
-            ctx.response().cloned()
+            ctx.take_response()
         },
         response_wire,
         selected_upstream: ctx
@@ -166,7 +166,7 @@ impl BranchTask {
         let mut ctx = Context::fork_from(parent);
         let handle = tokio::spawn(async move {
             match exec.exec(&mut ctx).await {
-                Ok(()) => branch_outcome_from_ctx(&ctx),
+                Ok(()) => branch_outcome_from_ctx(&mut ctx),
                 Err(e) => {
                     warn!(branch = name, error = %e, "fallback branch failed");
                     // Keep whatever the branch recorded before failing: a

@@ -559,6 +559,10 @@ pub struct UringUdpServer {
     shutdown: Arc<AtomicBool>,
     /// Kernel-visible wakeup for channel activity and shutdown.
     wakeup: Option<Arc<WakeupFd>>,
+    /// Set while the event loop is blocked in (or about to enter)
+    /// `submit_and_wait`. Handler tasks skip the eventfd write when the loop
+    /// is awake, since its next channel drain submits the response anyway.
+    waiting: Arc<AtomicBool>,
     /// Multishot: provided-buffer ring.
     buf_ring: Option<BufRing>,
     /// Multishot: template msghdr submitted with RecvMsgMulti.
@@ -622,6 +626,7 @@ impl UringUdpServer {
             pending_sends: VecDeque::new(),
             shutdown,
             wakeup,
+            waiting: Arc::new(AtomicBool::new(false)),
             buf_ring: None,
             msghdr_template: None,
             multishot_template: None,
@@ -750,7 +755,7 @@ impl UringUdpServer {
     ) {
         if let Ok(query) = Message::from_vec(&query_data) {
             let meta = QueryMeta {
-                protocol: Some("udp".to_string()),
+                protocol: Some("udp"),
                 from_udp: true,
                 client_addr: peer.map(|a| a.ip()),
                 url_path: None,
@@ -774,6 +779,7 @@ impl UringUdpServer {
             let handler = handler.clone();
             let tx = send_tx.clone();
             let wakeup = self.wakeup.clone();
+            let waiting = self.waiting.clone();
 
             tokio::runtime::Handle::current().spawn(async move {
                 let _permit = permit;
@@ -787,10 +793,17 @@ impl UringUdpServer {
                                 })
                                 .await;
                             if sent.is_ok() {
-                                // The event loop is blocked in the kernel;
-                                // give it a wakeup so the response is sent
-                                // without waiting for other network traffic.
-                                if let Some(w) = &wakeup {
+                                // Wake the event loop only when it is blocked
+                                // in the kernel; when it is awake its next
+                                // channel drain submits the response anyway,
+                                // so the eventfd write would be pure overhead.
+                                // The loop publishes `waiting` (SeqCst) before
+                                // draining, and this load (SeqCst) happens after
+                                // the channel send, so a response is never
+                                // stranded by a skipped wakeup.
+                                if let Some(w) = &wakeup
+                                    && waiting.load(Ordering::SeqCst)
+                                {
                                     w.notify();
                                 }
                             }
@@ -845,6 +858,14 @@ impl UringUdpServer {
                 break;
             }
 
+            // Publish that the loop is about to block BEFORE draining the send
+            // channel. A handler that observes `false` pushed its response
+            // before this drain, so the drain submits it and no wakeup is
+            // needed; a handler that observes `true` writes the eventfd and
+            // wakes the wait below. Both sides use SeqCst, so no response is
+            // stranded by a skipped wakeup.
+            self.waiting.store(true, Ordering::SeqCst);
+
             self.drain_and_submit_sends(&mut send_rx);
 
             if !wake_armed {
@@ -868,6 +889,7 @@ impl UringUdpServer {
                     continue;
                 }
             }
+            self.waiting.store(false, Ordering::SeqCst);
 
             // Collect all completions.
             let completions: Vec<(u64, i32, u32)> = self

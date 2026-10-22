@@ -9,7 +9,6 @@ use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Executable};
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// A hosts entry: domain → list of IPs.
@@ -22,13 +21,13 @@ struct HostEntry {
 /// Hosts plugin — resolves queries from a hosts-style mapping.
 #[derive(Debug, Clone)]
 pub struct Hosts {
-    entries: HashMap<Name, HostEntry>,
+    entries: ahash::HashMap<Name, HostEntry>,
 }
 
 impl Hosts {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: ahash::HashMap::default(),
         }
     }
 
@@ -88,7 +87,7 @@ impl Default for Hosts {
 impl Executable for Hosts {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
         let question = match ctx.question() {
-            Some(q) => q.clone(),
+            Some(q) => q,
             None => return Ok(()),
         };
         let qname = question.name();
@@ -113,6 +112,8 @@ impl Executable for Hosts {
                 return Ok(());
             }
 
+            // Clone the question only on a confirmed hit.
+            let question = question.clone();
             let mut resp = Message::response(ctx.query().id, OpCode::Query);
         resp.metadata.response_code = ResponseCode::NoError;
             resp.add_query(question);

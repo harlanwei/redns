@@ -1318,7 +1318,7 @@ async fn handle_forward_subprocess_conn(
         };
 
         let meta = QueryMeta {
-            protocol: Some("unix".to_string()),
+            protocol: Some("unix"),
             from_udp: false,
             client_addr: None,
             url_path: None,

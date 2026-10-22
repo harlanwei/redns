@@ -16,16 +16,10 @@ pub struct DebugPrint;
 #[async_trait]
 impl Executable for DebugPrint {
     async fn exec(&self, ctx: &mut Context) -> PluginResult<()> {
-        let id = ctx.id();
-        let question = ctx
-            .question()
-            .map(|q| format!("{}", q.name()))
-            .unwrap_or_default();
-        let has_resp = ctx.response().is_some();
         debug!(
-            ctx_id = id,
-            question = %question,
-            has_response = has_resp,
+            ctx_id = ctx.id(),
+            question = %ctx.question().map(|q| q.name().to_string()).unwrap_or_default(),
+            has_response = ctx.response().is_some(),
             elapsed = ?ctx.start_time().elapsed(),
             "debug_print"
         );

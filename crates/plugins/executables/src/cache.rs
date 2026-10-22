@@ -15,7 +15,6 @@ use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
 use serde::Serialize;
-use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
@@ -315,7 +314,7 @@ struct CacheInner {
     shards: Vec<QuickCache<CacheKey, CachedEntry>>,
     shard_hasher: ahash::RandomState,
     /// Deduplicates background optimistic refreshes for the same key.
-    inflight_refreshes: Mutex<HashSet<CacheKey>>,
+    inflight_refreshes: Mutex<ahash::HashSet<CacheKey>>,
     /// Coalesces concurrent cache misses so only one query fetches upstream.
     inflight_misses: Mutex<ahash::HashMap<CacheKey, Arc<MissState>>>,
     /// How long expired records may still be served while refreshing.
@@ -455,7 +454,7 @@ impl Cache {
             shard_count,
             shards,
             shard_hasher: ahash::RandomState::new(),
-            inflight_refreshes: Mutex::new(HashSet::new()),
+            inflight_refreshes: Mutex::new(ahash::HashSet::default()),
             inflight_misses: Mutex::new(ahash::HashMap::default()),
             optimistic_ttl,
             persist_path,
@@ -813,13 +812,15 @@ impl Cache {
         let optimistic_eligible = rcode == ResponseCode::NoError && !resp.answers.is_empty();
 
         let (wire, offsets) = build_stored_wire(resp, ttl)?;
+        let wire = Arc::new(wire);
+        let offsets: Arc<[usize]> = offsets.into();
 
         if cacheable {
             self.get_shard(key).insert(
                 key.clone(),
                 CachedEntry {
-                    resp_wire: Arc::new(wire.clone()),
-                    ttl_offsets: offsets.clone().into(),
+                    resp_wire: wire.clone(),
+                    ttl_offsets: offsets.clone(),
                     stored_at: Instant::now(),
                     original_ttl: ttl,
                     optimistic_eligible,
@@ -828,8 +829,8 @@ impl Cache {
         }
 
         Some(SharedOutcome::Response {
-            resp_wire: Arc::new(wire),
-            ttl_offsets: offsets.into(),
+            resp_wire: wire,
+            ttl_offsets: offsets,
             ttl,
         })
     }

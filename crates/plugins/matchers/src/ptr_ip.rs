@@ -4,6 +4,7 @@
 
 //! PTR IP matcher — matches IPs extracted from PTR query names against CIDRs.
 
+use crate::prefix_set::PrefixSet;
 use ipnet::IpNet;
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
@@ -11,12 +12,23 @@ use std::net::IpAddr;
 
 /// PTR IP matcher — extracts IP from PTR query name and matches against CIDR ranges.
 pub struct PtrIpMatcher {
-    ranges: Vec<IpNet>,
+    v4: PrefixSet<u32>,
+    v6: PrefixSet<u128>,
 }
 
 impl PtrIpMatcher {
     pub fn new(ranges: Vec<IpNet>) -> Self {
-        Self { ranges }
+        let mut m = Self {
+            v4: PrefixSet::default(),
+            v6: PrefixSet::default(),
+        };
+        for net in ranges {
+            match net {
+                IpNet::V4(n) => m.v4.insert(u32::from(n.network()), n.prefix_len()),
+                IpNet::V6(n) => m.v6.insert(u128::from(n.network()), n.prefix_len()),
+            }
+        }
+        m
     }
 
     /// Parse from string args: space-separated CIDRs.
@@ -26,38 +38,79 @@ impl PtrIpMatcher {
             .filter(|s| !s.is_empty())
             .map(|s| s.parse::<IpNet>())
             .collect();
-        Ok(Self { ranges: ranges? })
+        Ok(Self::new(ranges?))
     }
+
+    fn matches_ip(&self, addr: IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(a) => self.v4.contains(u32::from(a)),
+            IpAddr::V6(a) => self.v6.contains(u128::from(a)),
+        }
+    }
+}
+
+/// Strip `suffix` from `s`, comparing ASCII-case-insensitively.
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let mid = s.len().checked_sub(suffix.len())?;
+    let (head, tail) = (s.get(..mid)?, s.get(mid..)?);
+    tail.eq_ignore_ascii_case(suffix).then_some(head)
+}
+
+/// Parse a dotted-quad PTR fragment like `4.3.2.1` → `1.2.3.4`
+/// (octets reversed). Rejects leading zeros and out-of-range octets,
+/// matching `Ipv4Addr`'s string parsing.
+fn parse_ptr_v4(stripped: &str) -> Option<IpAddr> {
+    let mut octets = [0u8; 4];
+    let mut count = 0usize;
+    for part in stripped.split('.') {
+        if count == 4
+            || part.is_empty()
+            || part.len() > 3
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        octets[3 - count] = part.parse().ok()?;
+        count += 1;
+    }
+    if count != 4 {
+        return None;
+    }
+    Some(IpAddr::V4(octets.into()))
+}
+
+/// Parse a 32-nibble PTR fragment (`b.a.9...` reversed nibbles) into an
+/// IPv6 address without intermediate strings.
+fn parse_ptr_v6(stripped: &str) -> Option<IpAddr> {
+    let mut value: u128 = 0;
+    let mut count = 0u32;
+    for part in stripped.split('.') {
+        let b = part.as_bytes();
+        if count == 32 || b.len() != 1 {
+            return None;
+        }
+        let digit = (b[0] as char).to_digit(16)?;
+        value |= (digit as u128) << (4 * count);
+        count += 1;
+    }
+    if count != 32 {
+        return None;
+    }
+    Some(IpAddr::V6(value.into()))
 }
 
 /// Parse a PTR name like `4.3.2.1.in-addr.arpa.` → `1.2.3.4`.
 fn parse_ptr_name(name: &str) -> Option<IpAddr> {
-    let lower = name.to_lowercase();
-    if let Some(stripped) = lower
-        .strip_suffix(".in-addr.arpa.")
-        .or_else(|| lower.strip_suffix(".in-addr.arpa"))
+    if let Some(stripped) =
+        strip_suffix_ci(name, ".in-addr.arpa.").or_else(|| strip_suffix_ci(name, ".in-addr.arpa"))
     {
-        let parts: Vec<&str> = stripped.split('.').collect();
-        if parts.len() == 4 {
-            let s = format!("{}.{}.{}.{}", parts[3], parts[2], parts[1], parts[0]);
-            return s.parse().ok();
-        }
+        return parse_ptr_v4(stripped);
     }
-    if let Some(stripped) = lower
-        .strip_suffix(".ip6.arpa.")
-        .or_else(|| lower.strip_suffix(".ip6.arpa"))
+    if let Some(stripped) =
+        strip_suffix_ci(name, ".ip6.arpa.").or_else(|| strip_suffix_ci(name, ".ip6.arpa"))
     {
-        let nibbles: Vec<&str> = stripped.split('.').collect();
-        if nibbles.len() == 32 {
-            let hex: String = nibbles.iter().rev().copied().collect();
-            if hex.len() == 32 {
-                let mut octets = [0u8; 16];
-                for i in 0..16 {
-                    octets[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
-                }
-                return Some(IpAddr::V6(octets.into()));
-            }
-        }
+        return parse_ptr_v6(stripped);
     }
     None
 }
@@ -69,7 +122,7 @@ impl Matcher for PtrIpMatcher {
             if question.query_type() == RecordType::PTR {
                 let name = question.name().to_ascii();
                 if let Some(ip) = parse_ptr_name(&name)
-                    && self.ranges.iter().any(|r: &IpNet| r.contains(&ip))
+                    && self.matches_ip(ip)
                 {
                     return Ok(true);
                 }

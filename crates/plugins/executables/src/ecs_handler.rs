@@ -8,7 +8,6 @@
 //! using either a preset address or the client address.
 
 use async_trait::async_trait;
-use hickory_proto::op::Edns;
 use hickory_proto::rr::rdata::opt::ClientSubnet;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
@@ -88,7 +87,7 @@ impl EcsHandler {
     /// Add ECS option to the query via the Edns API.
     fn add_ecs_to_query(msg: &mut hickory_proto::op::Message, subnet: ClientSubnet) {
         // Use the Edns builder to attach ECS.
-        let mut edns = msg.edns.as_ref().cloned().unwrap_or_else(Edns::new);
+        let mut edns = msg.edns.take().unwrap_or_default();
         edns.options_mut()
             .insert(hickory_proto::rr::rdata::opt::EdnsOption::Subnet(subnet));
         msg.set_edns(edns);

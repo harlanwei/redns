@@ -10,13 +10,13 @@
 use async_trait::async_trait;
 use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use parking_lot::Mutex;
 use quick_cache::sync::Cache as QuickCache;
 use redns_core::context::MARK_CACHE_HIT;
 use redns_core::plugin::PluginResult;
 use redns_core::sequence::ChainWalker;
 use redns_core::{Context, RecursiveExecutable};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Reverse lookup configuration.
@@ -56,14 +56,14 @@ impl ReverseLookupConfig {
 
 #[derive(Clone)]
 struct CacheEntry {
-    domain: String,
+    domain: Arc<str>,
     expires: Instant,
 }
 
 /// Reverse IP→domain cache.
 pub struct ReverseLookup {
     config: ReverseLookupConfig,
-    cache: Mutex<QuickCache<IpAddr, CacheEntry>>,
+    cache: QuickCache<IpAddr, CacheEntry>,
 }
 
 impl ReverseLookup {
@@ -71,15 +71,14 @@ impl ReverseLookup {
         let cap = config.size.max(1);
         Self {
             config,
-            cache: Mutex::new(QuickCache::new(cap)),
+            cache: QuickCache::new(cap),
         }
     }
 
     /// Look up the cached domain for an IP.
-    fn lookup(&self, addr: &IpAddr) -> Option<String> {
-        let cache = self.cache.lock();
+    fn lookup(&self, addr: &IpAddr) -> Option<Arc<str>> {
         // `get` bumps recency, which is what we want for an LRU PTR cache.
-        cache.get(addr).and_then(|entry| {
+        self.cache.get(addr).and_then(|entry| {
             if entry.expires > Instant::now() {
                 Some(entry.domain)
             } else {
@@ -96,7 +95,6 @@ impl ReverseLookup {
         // Use the query name as the canonical domain if available.
         let qname = query.queries.first().map(|q| q.name().to_ascii());
 
-        let cache = self.cache.lock();
         for rr in &response.answers {
             let ip: Option<IpAddr> = match rr.data {
                 RData::A(a) => Some(IpAddr::V4(a.0)),
@@ -104,10 +102,11 @@ impl ReverseLookup {
                 _ => None,
             };
             if let Some(ip) = ip {
-                let domain = qname.clone().unwrap_or_else(|| rr.name.to_ascii());
+                let domain: Arc<str> =
+                    qname.clone().unwrap_or_else(|| rr.name.to_ascii()).into();
                 // `quick_cache` bounds capacity itself, evicting cold entries in
-                // O(1) — no full-map scan or sort under the lock.
-                cache.insert(
+                // O(1) — no full-map scan or sort under a lock.
+                self.cache.insert(
                     ip,
                     CacheEntry {
                         domain,
@@ -139,7 +138,7 @@ impl ReverseLookup {
         resp.add_query(question.clone());
 
         let ptr_rdata = RData::PTR(hickory_proto::rr::rdata::PTR(
-            Name::from_ascii(&domain).unwrap_or_else(|_| Name::root()),
+            Name::from_ascii(domain.as_ref()).unwrap_or_else(|_| Name::root()),
         ));
         let mut rr = Record::from_rdata(question.name().clone(), 5, ptr_rdata);
         rr.dns_class = DNSClass::IN;
@@ -149,12 +148,19 @@ impl ReverseLookup {
     }
 }
 
+/// Strip a suffix case-insensitively, without lowercasing the whole name.
+fn strip_suffix_ci<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    if name.len() < suffix.len() {
+        return None;
+    }
+    let (head, tail) = name.split_at(name.len() - suffix.len());
+    tail.eq_ignore_ascii_case(suffix).then_some(head)
+}
+
 /// Parse a PTR name like `1.0.168.192.in-addr.arpa.` → `192.168.0.1`.
 fn parse_ptr_name(name: &str) -> Option<IpAddr> {
-    let lower = name.to_lowercase();
-    if let Some(stripped) = lower
-        .strip_suffix(".in-addr.arpa.")
-        .or_else(|| lower.strip_suffix(".in-addr.arpa"))
+    if let Some(stripped) = strip_suffix_ci(name, ".in-addr.arpa.")
+        .or_else(|| strip_suffix_ci(name, ".in-addr.arpa"))
     {
         let parts: Vec<&str> = stripped.split('.').collect();
         if parts.len() == 4 {
@@ -162,9 +168,8 @@ fn parse_ptr_name(name: &str) -> Option<IpAddr> {
             return s.parse().ok();
         }
     }
-    if let Some(stripped) = lower
-        .strip_suffix(".ip6.arpa.")
-        .or_else(|| lower.strip_suffix(".ip6.arpa"))
+    if let Some(stripped) = strip_suffix_ci(name, ".ip6.arpa.")
+        .or_else(|| strip_suffix_ci(name, ".ip6.arpa"))
     {
         let nibbles: Vec<&str> = stripped.split('.').collect();
         if nibbles.len() == 32 {

@@ -11,7 +11,7 @@ use redns_core::context::{KV_SELECTED_UPSTREAM, QueryPathStep};
 use redns_core::plugin::PluginResult;
 use redns_core::upstream::{self, UpstreamOpts, UpstreamWrapper};
 use redns_core::{Context, Executable};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -58,8 +58,16 @@ fn record_attempt(attempts: &mut AttemptRecorder, name: &str, failed: bool) {
     }
 }
 
-fn hedge_delay_for(uw: &UpstreamWrapper) -> Duration {
-    let base_ms = uw.ema_latency() as f64;
+/// QNAME string for log fields; evaluated only when a warn/debug event fires.
+fn qname_for_log(query: &Message) -> String {
+    query
+        .queries
+        .first()
+        .map(|q| q.name().to_ascii())
+        .unwrap_or_default()
+}
+
+fn hedge_delay_for(uw: &UpstreamWrapper) -> Duration {    let base_ms = uw.ema_latency() as f64;
     let base_ms = if base_ms > 0.0 {
         base_ms
     } else {
@@ -329,9 +337,12 @@ pub const REDNS_FORWARD_PARENT_PID_ENV: &str = "REDNS_FORWARD_PARENT_PID";
 const SUBPROCESS_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the parent waits for the helper to bind its socket after spawn.
 const SUBPROCESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on pooled idle helper connections.
+const SUBPROCESS_MAX_IDLE_CONNS: usize = 8;
 
 struct SubprocessUpstream {
     socket_path: String,
+    pool: Mutex<VecDeque<UnixStream>>,
     child: Mutex<Option<Child>>,
 }
 
@@ -401,6 +412,7 @@ impl SubprocessUpstream {
 
         Ok(Self {
             socket_path: socket_path.to_string(),
+            pool: Mutex::new(VecDeque::new()),
             child: Mutex::new(Some(child)),
         })
     }
@@ -409,11 +421,14 @@ impl SubprocessUpstream {
 #[async_trait]
 impl upstream::Upstream for SubprocessUpstream {
     async fn exchange(&self, query: &[u8]) -> PluginResult<Vec<u8>> {
-        let mut stream = UnixStream::connect(&self.socket_path).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("subprocess: connect failed: {e}").into()
-            },
-        )?;
+        let mut stream = match self.pool.lock().await.pop_front() {
+            Some(stream) => stream,
+            None => UnixStream::connect(&self.socket_path).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("subprocess: connect failed: {e}").into()
+                },
+            )?,
+        };
 
         let exchange = async {
             let len = query.len() as u16;
@@ -429,7 +444,16 @@ impl upstream::Upstream for SubprocessUpstream {
         };
 
         match tokio::time::timeout(SUBPROCESS_EXCHANGE_TIMEOUT, exchange).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => {
+                // The framing stayed in sync, so the stream is safe to reuse.
+                let mut pool = self.pool.lock().await;
+                if pool.len() < SUBPROCESS_MAX_IDLE_CONNS {
+                    pool.push_back(stream);
+                }
+                Ok(resp)
+            }
+            // On error or timeout the length-prefixed stream may be desynced;
+            // it is dropped instead of returned to the pool.
             Ok(Err(e)) => Err(format!("subprocess exchange: {e}").into()),
             Err(_) => Err("subprocess exchange timed out".into()),
         }
@@ -695,8 +719,8 @@ impl Forward {
 
     async fn resolve_once(
         &self,
+        query: &Message,
         query_bytes: Arc<Vec<u8>>,
-        qname: &str,
         attempts: &mut AttemptRecorder,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
         let selected_indices = self.selector.select(self.concurrent);
@@ -712,19 +736,19 @@ impl Forward {
         );
 
         if selected.len() == 1 {
-            let name = selected[0].name().to_string();
+            let name = selected[0].name();
             let resp_bytes = match selected[0].exchange(query_bytes.as_slice()).await {
                 Ok(resp_bytes) => resp_bytes,
                 Err(e) => {
-                    record_attempt(attempts, &name, true);
+                    record_attempt(attempts, name, true);
                     return Err(e);
                 }
             };
             let Some(resp) = parse_response(&resp_bytes) else {
-                record_attempt(attempts, &name, true);
+                record_attempt(attempts, name, true);
                 return Err("invalid upstream response".into());
             };
-            record_attempt(attempts, &name, false);
+            record_attempt(attempts, name, false);
             selected[0].record_adopted();
             return Ok((resp, selected[0].clone()));
         }
@@ -807,7 +831,7 @@ impl Forward {
                     let rcode = match dns_header_rcode(&resp_bytes) {
                         Some(rcode) => rcode,
                         None => {
-                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, "invalid upstream response (too short)");
+                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname_for_log(query), "invalid upstream response (too short)");
                             record_attempt(attempts, upstream_name, true);
                             last_err = Some("invalid response: short dns header".into());
                             continue;
@@ -839,7 +863,7 @@ impl Forward {
                             return Ok((resp, selected[sel_idx].clone()));
                         }
                         None => {
-                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname, "invalid upstream response");
+                            warn!(plugin = %self.name, upstream = %upstream_name, qname = %qname_for_log(query), "invalid upstream response");
                             record_attempt(attempts, upstream_name, true);
                             last_err = Some("invalid response".into());
                         }
@@ -870,12 +894,7 @@ impl Forward {
         query_bytes: Arc<Vec<u8>>,
         attempts: &mut AttemptRecorder,
     ) -> PluginResult<(Message, Arc<UpstreamWrapper>)> {
-        let qname = query
-            .queries
-            .first()
-            .map(|q| q.name().to_ascii())
-            .unwrap_or_default();
-        let (resp, upstream) = self.resolve_once(query_bytes, &qname, attempts).await?;
+        let (resp, upstream) = self.resolve_once(query, query_bytes, attempts).await?;
         // A parsed response that doesn't answer *this* question must not be
         // adopted or cached — reject it before it reaches the caller.
         if let Err(e) = validate_response(&resp, query) {

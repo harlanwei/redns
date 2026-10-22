@@ -25,6 +25,8 @@ use redns_core::{Context, Matcher};
 pub struct RandomMatcher {
     /// Probability of matching, in the range [0.0, 1.0].
     probability: f64,
+    /// `probability` scaled to the full `u64` range, for an integer compare.
+    threshold: u64,
 }
 
 impl RandomMatcher {
@@ -37,7 +39,10 @@ impl RandomMatcher {
             (0.0..=1.0).contains(&probability),
             "probability must be in [0.0, 1.0], got {probability}"
         );
-        Self { probability }
+        Self {
+            probability,
+            threshold: (probability * u64::MAX as f64) as u64,
+        }
     }
 
     /// Parses a probability from a string like "0.5".
@@ -58,17 +63,8 @@ impl Matcher for RandomMatcher {
         if self.probability <= 0.0 {
             return Ok(false);
         }
-        Ok(rand_f64() < self.probability)
+        Ok(fastrand::u64(..) < self.threshold)
     }
-}
-
-/// Simple pseudo-random float in [0.0, 1.0) using thread-local state.
-fn rand_f64() -> f64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(std::time::Instant::now().elapsed().as_nanos() as u64);
-    (hasher.finish() as f64) / (u64::MAX as f64)
 }
 
 #[cfg(test)]

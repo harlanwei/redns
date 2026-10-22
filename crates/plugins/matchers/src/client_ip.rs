@@ -4,92 +4,31 @@
 
 //! Client IP matcher — matches client address against CIDR ranges.
 
+use crate::prefix_set::{PrefixSet, parse_cidr};
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use std::net::IpAddr;
 
-/// A CIDR range.
-#[derive(Debug, Clone)]
-struct CidrRange {
-    network: IpAddr,
-    prefix_len: u8,
-}
-
-impl CidrRange {
-    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some((addr_str, len_str)) = s.split_once('/') {
-            let network: IpAddr = addr_str.parse()?;
-            let prefix_len: u8 = len_str.parse()?;
-            let max_len = match network {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            if prefix_len > max_len {
-                return Err(format!(
-                    "prefix length {prefix_len} is too large for {network} (max {max_len})"
-                )
-                .into());
-            }
-            Ok(Self {
-                network,
-                prefix_len,
-            })
-        } else {
-            // Single IP — /32 or /128.
-            let network: IpAddr = s.parse()?;
-            let prefix_len = match network {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            Ok(Self {
-                network,
-                prefix_len,
-            })
-        }
-    }
-
-    fn contains(&self, addr: &IpAddr) -> bool {
-        match (&self.network, addr) {
-            (IpAddr::V4(net), IpAddr::V4(a)) => {
-                let net_bits = u32::from(*net);
-                let addr_bits = u32::from(*a);
-                let mask = if self.prefix_len == 0 {
-                    0
-                } else {
-                    !0u32 << (32 - self.prefix_len)
-                };
-                (net_bits & mask) == (addr_bits & mask)
-            }
-            (IpAddr::V6(net), IpAddr::V6(a)) => {
-                let net_bits = u128::from(*net);
-                let addr_bits = u128::from(*a);
-                let mask = if self.prefix_len == 0 {
-                    0
-                } else {
-                    !0u128 << (128 - self.prefix_len)
-                };
-                (net_bits & mask) == (addr_bits & mask)
-            }
-            _ => false,
-        }
-    }
-}
-
 /// Matches the client IP from `Context.server_meta.client_addr`
 /// against a list of CIDR ranges.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientIpMatcher {
-    ranges: Vec<CidrRange>,
+    v4: PrefixSet<u32>,
+    v6: PrefixSet<u128>,
 }
 
 impl ClientIpMatcher {
     pub fn new() -> Self {
-        Self { ranges: Vec::new() }
+        Self::default()
     }
 
     /// Adds a CIDR range (e.g. "192.168.0.0/16" or "10.0.0.1").
     pub fn add_cidr(&mut self, cidr: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.ranges.push(CidrRange::parse(cidr)?);
+        let (addr, prefix_len) = parse_cidr(cidr)?;
+        match addr {
+            IpAddr::V4(a) => self.v4.insert(u32::from(a), prefix_len),
+            IpAddr::V6(a) => self.v6.insert(u128::from(a), prefix_len),
+        }
         Ok(())
     }
 
@@ -101,18 +40,19 @@ impl ClientIpMatcher {
         }
         Ok(m)
     }
-}
 
-impl Default for ClientIpMatcher {
-    fn default() -> Self {
-        Self::new()
+    fn matches_ip(&self, addr: IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(a) => self.v4.contains(u32::from(a)),
+            IpAddr::V6(a) => self.v6.contains(u128::from(a)),
+        }
     }
 }
 
 impl Matcher for ClientIpMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
-        if let Some(client_addr) = &ctx.server_meta.client_addr {
-            Ok(self.ranges.iter().any(|r| r.contains(client_addr)))
+        if let Some(client_addr) = ctx.server_meta.client_addr {
+            Ok(self.matches_ip(client_addr))
         } else {
             Ok(false)
         }

@@ -110,9 +110,7 @@ impl RecursiveExecutable for UseAnswerOf {
                     1,
                     RData::CNAME(hickory_proto::rr::rdata::CNAME(self.target.clone())),
                 );
-                let mut new_answers = vec![cname_rr];
-                new_answers.extend(resp.answers.iter().cloned());
-                resp.answers = new_answers;
+                resp.answers.insert(0, cname_rr);
             }
         }
 

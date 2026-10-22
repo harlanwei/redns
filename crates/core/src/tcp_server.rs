@@ -128,7 +128,7 @@ pub async fn serve_tcp(
                         };
 
                         let meta = QueryMeta {
-                            protocol: Some("tcp".to_string()),
+                            protocol: Some("tcp"),
                             from_udp: false,
                             client_addr: Some(peer.ip()),
                             url_path: None,
@@ -140,11 +140,10 @@ pub async fn serve_tcp(
 
                         match handler.handle_tcp(query, meta).await {
                             Ok(resp_bytes) => {
-                                let len = (resp_bytes.len() as u16).to_be_bytes();
-                                let write = async {
-                                    stream.write_all(&len).await?;
-                                    stream.write_all(&resp_bytes).await
-                                };
+                                let mut frame = Vec::with_capacity(2 + resp_bytes.len());
+                                frame.extend_from_slice(&(resp_bytes.len() as u16).to_be_bytes());
+                                frame.extend_from_slice(&resp_bytes);
+                                let write = stream.write_all(&frame);
                                 match tokio::time::timeout(WRITE_TIMEOUT, write).await {
                                     Ok(Ok(())) => {}
                                     _ => return,

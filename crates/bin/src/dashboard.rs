@@ -1194,13 +1194,10 @@ fn dashboard_query_details(query: &Message, meta: &QueryMeta) -> (String, String
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let protocol = meta.protocol.clone().unwrap_or_else(|| {
-        if meta.from_udp {
-            "udp".to_string()
-        } else {
-            "tcp".to_string()
-        }
-    });
+    let protocol = meta
+        .protocol
+        .unwrap_or(if meta.from_udp { "udp" } else { "tcp" })
+        .to_string();
 
     (qname, qtype, client_ip, protocol)
 }

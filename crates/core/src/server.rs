@@ -36,7 +36,7 @@ pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Default)]
 pub struct QueryMeta {
     /// Transport protocol label (e.g. "udp", "tcp", "doh").
-    pub protocol: Option<String>,
+    pub protocol: Option<&'static str>,
     /// Whether the query was received over UDP.
     pub from_udp: bool,
     /// The client's IP address.
@@ -248,8 +248,7 @@ impl EntryHandler {
             Ok(()) => match ctx.take_response_wire() {
                 Some(wire) => ResponsePayload::Wire(wire),
                 None => ResponsePayload::Message(
-                    ctx.response()
-                        .cloned()
+                    ctx.take_response()
                         .unwrap_or_else(|| noerror_response(ctx.query())),
                 ),
             },

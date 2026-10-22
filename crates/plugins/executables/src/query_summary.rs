@@ -38,19 +38,13 @@ impl Default for QuerySummary {
 impl RecursiveExecutable for QuerySummary {
     async fn exec_recursive(&self, ctx: &mut Context, mut next: ChainWalker) -> PluginResult<()> {
         let result = next.exec_next(ctx).await;
-        let question = ctx
-            .question()
-            .map(|q| format!("{}", q.name()))
-            .unwrap_or_default();
-        let has_resp = ctx.response().is_some();
-        let rcode = ctx.response().map(|r| format!("{}", r.response_code));
-        let elapsed = ctx.start_time().elapsed();
+        let resp = ctx.response();
         match &result {
             Ok(()) => {
-                info!(msg = %self.msg, id = ctx.id(), question = %question, has_response = has_resp, rcode = ?rcode, elapsed = ?elapsed)
+                info!(msg = %self.msg, id = ctx.id(), question = %ctx.question().map(|q| q.name().to_string()).unwrap_or_default(), has_response = resp.is_some(), rcode = ?resp.map(|r| r.response_code), elapsed = ?ctx.start_time().elapsed())
             }
             Err(e) => {
-                info!(msg = %self.msg, id = ctx.id(), question = %question, has_response = has_resp, elapsed = ?elapsed, error = %e)
+                info!(msg = %self.msg, id = ctx.id(), question = %ctx.question().map(|q| q.name().to_string()).unwrap_or_default(), has_response = resp.is_some(), elapsed = ?ctx.start_time().elapsed(), error = %e)
             }
         }
         result

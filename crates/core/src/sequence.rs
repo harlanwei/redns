@@ -123,12 +123,11 @@ impl ChainWalker {
                 match &node.executor {
                     NodeExecutor::Simple(exec) => {
                         debug!(node = idx, kind = "simple", "executing node");
-                        let label = Arc::clone(&node.label);
                         // Record before running so the node precedes any steps
                         // its executor contributes (e.g. a forward's upstream
                         // attempts), then attribute a failure to it.
                         let step = ctx.path_len();
-                        ctx.record_path_step(&*label, false);
+                        ctx.record_path_step(&*node.label, false);
                         let result = if tracing::enabled!(tracing::Level::DEBUG) {
                             let start = std::time::Instant::now();
                             let result = exec.exec(ctx).await;
@@ -145,9 +144,8 @@ impl ChainWalker {
                     }
                     NodeExecutor::Recursive(re) => {
                         debug!(node = idx, kind = "recursive", "executing node");
-                        let label = Arc::clone(&node.label);
                         let step = ctx.path_len();
-                        ctx.record_path_step(&*label, false);
+                        ctx.record_path_step(&*node.label, false);
                         let next = ChainWalker {
                             pos: self.pos + 1,
                             chain: Arc::clone(&self.chain),

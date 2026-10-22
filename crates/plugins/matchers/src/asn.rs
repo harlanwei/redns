@@ -35,6 +35,7 @@
 use maxminddb::geoip2;
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::info;
@@ -126,6 +127,21 @@ impl AsnDb {
             }
         })
     }
+
+    /// Returns `true` when `addr`'s ASN — looked up and decoded once per
+    /// database — is in `asns`. Returns `false` when the lookup fails or the
+    /// record carries no `autonomous_system_number`.
+    pub fn contains_any(&self, asns: &HashSet<u32>, addr: IpAddr) -> bool {
+        self.mmdb.iter().any(|reader| match reader.lookup(addr) {
+            Ok(result) => match result.decode::<geoip2::Asn>() {
+                Ok(Some(record)) => record
+                    .autonomous_system_number
+                    .is_some_and(|asn| asns.contains(&asn)),
+                _ => false,
+            },
+            Err(_) => false,
+        })
+    }
 }
 
 /// Returns `true` when the byte slice looks like a MaxMind DB (the metadata
@@ -139,12 +155,15 @@ fn is_maxmind_db(bytes: &[u8]) -> bool {
 /// configured ASNs.
 pub struct AsnMatcher {
     db: Arc<AsnDb>,
-    asns: Vec<u32>,
+    asns: HashSet<u32>,
 }
 
 impl AsnMatcher {
     pub fn new(db: Arc<AsnDb>, asns: Vec<u32>) -> Self {
-        Self { db, asns }
+        Self {
+            db,
+            asns: asns.into_iter().collect(),
+        }
     }
 
     /// Parses matcher args: whitespace-separated ASN numbers, optionally with
@@ -165,7 +184,7 @@ impl AsnMatcher {
             )?;
             asns.push(asn);
         }
-        Ok(Self { db, asns })
+        Ok(Self::new(db, asns))
     }
 }
 
@@ -182,7 +201,7 @@ impl Matcher for AsnMatcher {
                 _ => None,
             };
             if let Some(ip) = ip
-                && self.asns.iter().any(|&asn| self.db.contains(asn, ip))
+                && self.db.contains_any(&self.asns, ip)
             {
                 return Ok(true);
             }

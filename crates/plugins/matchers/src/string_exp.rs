@@ -42,7 +42,7 @@ impl StringOp {
 
 /// Source of the string to match against.
 enum StringSource {
-    /// Environment variable value.
+    /// Environment variable value, resolved once at construction.
     Env(String),
     /// URL path from server metadata.
     UrlPath,
@@ -51,11 +51,11 @@ enum StringSource {
 }
 
 impl StringSource {
-    fn get_str(&self, ctx: &Context) -> String {
+    fn get_str<'a>(&'a self, ctx: &'a Context) -> &'a str {
         match self {
-            StringSource::Env(key) => std::env::var(key).unwrap_or_default(),
-            StringSource::UrlPath => ctx.server_meta.url_path.clone().unwrap_or_default(),
-            StringSource::ServerName => ctx.server_meta.server_name.clone().unwrap_or_default(),
+            StringSource::Env(value) => value,
+            StringSource::UrlPath => ctx.server_meta.url_path.as_deref().unwrap_or(""),
+            StringSource::ServerName => ctx.server_meta.server_name.as_deref().unwrap_or(""),
         }
     }
 }
@@ -80,7 +80,7 @@ impl StringExpMatcher {
 
         // Parse source.
         let source = if let Some(env_key) = src_name.strip_prefix('$') {
-            StringSource::Env(env_key.to_string())
+            StringSource::Env(std::env::var(env_key).unwrap_or_default())
         } else {
             match src_name {
                 "url_path" => StringSource::UrlPath,
@@ -110,8 +110,7 @@ impl StringExpMatcher {
 
 impl Matcher for StringExpMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
-        let s = self.source.get_str(ctx);
-        Ok(self.op.match_str(&s))
+        Ok(self.op.match_str(self.source.get_str(ctx)))
     }
 }
 

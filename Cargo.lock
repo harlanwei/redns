@@ -1402,6 +1402,8 @@ dependencies = [
 name = "redns-matchers"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
+ "fastrand",
  "hickory-proto",
  "ipnet",
  "maxminddb",

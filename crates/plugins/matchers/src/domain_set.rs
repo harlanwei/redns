@@ -12,10 +12,12 @@
 //!
 //! Without a prefix, defaults to subdomain matching.
 
+use aho_corasick::AhoCorasick;
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use regex::{Regex, RegexBuilder};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use tracing::warn;
 
 // ── Domain Suffix Trie ──────────────────────────────────────────
@@ -24,30 +26,51 @@ use tracing::warn;
 ///
 /// For example, inserting "google.com" stores labels ["com", "google"].
 /// Lookup for "www.google.com" walks: root → "com" → "google" (terminal) → match.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct TrieNode {
     children: HashMap<Box<str>, TrieNode>,
     /// If true, this node represents a terminal domain entry.
     terminal: bool,
 }
 
+impl TrieNode {
+    /// Look up a child by label, case-insensitively (trie keys are
+    /// lowercased at insert time). No allocation for DNS-sized labels.
+    fn child(&self, label: &[u8]) -> Option<&TrieNode> {
+        let mut buf = [0u8; 63];
+        if label.len() <= buf.len() {
+            buf[..label.len()].copy_from_slice(label);
+            buf[..label.len()].make_ascii_lowercase();
+            let key = std::str::from_utf8(&buf[..label.len()]).ok()?;
+            self.children.get(key)
+        } else {
+            let key = String::from_utf8_lossy(label).to_lowercase();
+            self.children.get(key.as_str())
+        }
+    }
+}
+
 /// A domain suffix trie for efficient subdomain matching.
 ///
 /// Replaces `HashSet<String>` with O(labels) single-pass lookup
 /// instead of O(labels) hash lookups with substring slicing.
-struct DomainTrie {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DomainTrie {
     root: TrieNode,
 }
 
 impl DomainTrie {
-    fn new() -> Self {
-        Self {
-            root: TrieNode::default(),
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.root.children.is_empty()
     }
 
     /// Insert a domain (e.g. "google.com") into the trie.
-    fn insert(&mut self, domain: &str) {
+    /// The domain must already be normalized (lowercased, no outer dots).
+    pub(crate) fn insert(&mut self, domain: &str) {
         let mut node = &mut self.root;
         for label in domain.rsplit('.') {
             node = node.children.entry(label.into()).or_default();
@@ -56,10 +79,16 @@ impl DomainTrie {
     }
 
     /// Check if a domain or any of its parent domains is in the trie.
-    fn matches(&self, domain: &str) -> bool {
+    ///
+    /// Labels are given in wire order (leftmost first) and compared
+    /// case-insensitively.
+    pub(crate) fn matches_labels<'a>(
+        &self,
+        labels: impl DoubleEndedIterator<Item = &'a [u8]>,
+    ) -> bool {
         let mut node = &self.root;
-        for label in domain.rsplit('.') {
-            match node.children.get(label) {
+        for label in labels.rev() {
+            match node.child(label) {
                 Some(child) => {
                     node = child;
                     if node.terminal {
@@ -71,6 +100,21 @@ impl DomainTrie {
         }
         false
     }
+
+    /// Check if the exact domain (all labels) is in the trie.
+    pub(crate) fn matches_exact_labels<'a>(
+        &self,
+        labels: impl DoubleEndedIterator<Item = &'a [u8]>,
+    ) -> bool {
+        let mut node = &self.root;
+        for label in labels.rev() {
+            match node.child(label) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        node.terminal
+    }
 }
 
 // ── DomainSet ───────────────────────────────────────────────────
@@ -80,14 +124,18 @@ impl DomainTrie {
 /// Supports loading from inline expressions (`exps`) and files (`files`).
 pub struct DomainSet {
     /// Full/exact match domains (lowercased, without trailing dot).
-    full: HashSet<String>,
+    full: DomainTrie,
     /// Subdomain match via suffix trie — matches the domain itself
     /// and all subdomains in a single traversal.
     domain: DomainTrie,
     /// Keyword substring matches.
     keywords: Vec<String>,
+    /// Aho-Corasick automaton over `keywords`, built on first use.
+    keyword_automaton: OnceLock<Option<AhoCorasick>>,
     /// Regex matches.
     regexes: Vec<Regex>,
+    /// `regexes` combined into a single alternation, built on first use.
+    combined_regex: OnceLock<Option<Regex>>,
 }
 
 /// YAML args for domain_set plugin.
@@ -145,16 +193,18 @@ where
 impl DomainSet {
     pub fn new() -> Self {
         Self {
-            full: HashSet::new(),
+            full: DomainTrie::new(),
             domain: DomainTrie::new(),
             keywords: Vec::new(),
+            keyword_automaton: OnceLock::new(),
             regexes: Vec::new(),
+            combined_regex: OnceLock::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
         self.full.is_empty()
-            && self.domain.root.children.is_empty()
+            && self.domain.is_empty()
             && self.keywords.is_empty()
             && self.regexes.is_empty()
     }
@@ -205,7 +255,7 @@ impl DomainSet {
             }
             match typ {
                 "full" => {
-                    self.full.insert(pattern);
+                    self.full.insert(&pattern);
                 }
                 "domain" => {
                     self.domain.insert(&pattern);
@@ -306,32 +356,80 @@ impl DomainSet {
     /// Check if a domain name matches any pattern in this set.
     pub fn matches_domain(&self, name: &str) -> bool {
         let normalized = Self::normalize(name);
+        self.matches_normalized(&normalized)
+    }
 
+    /// Match against an already-normalized domain string.
+    fn matches_normalized(&self, normalized: &str) -> bool {
         // Full/exact match.
-        if self.full.contains(&normalized) {
+        if self
+            .full
+            .matches_exact_labels(normalized.split('.').map(str::as_bytes))
+        {
             return true;
         }
 
         // Subdomain match — single trie traversal.
-        if self.domain.matches(&normalized) {
+        if self
+            .domain
+            .matches_labels(normalized.split('.').map(str::as_bytes))
+        {
             return true;
         }
 
-        // Keyword match.
-        for kw in &self.keywords {
-            if normalized.contains(kw.as_str()) {
-                return true;
-            }
-        }
+        self.matches_keywords(normalized) || self.matches_regexes(normalized)
+    }
 
-        // Regex match.
-        for re in &self.regexes {
-            if re.is_match(&normalized) {
-                return true;
-            }
+    /// Match a query name. Exact/suffix checks walk the name's labels
+    /// directly without allocation; keywords and regexes need the normalized
+    /// string form and are only evaluated when configured.
+    fn matches_name(&self, name: &hickory_proto::rr::Name) -> bool {
+        if self.full.matches_exact_labels(name.iter()) || self.domain.matches_labels(name.iter()) {
+            return true;
         }
+        if self.keywords.is_empty() && self.regexes.is_empty() {
+            return false;
+        }
+        let normalized = Self::normalize(&name.to_ascii());
+        self.matches_keywords(&normalized) || self.matches_regexes(&normalized)
+    }
 
-        false
+    /// Keyword match — a single Aho-Corasick pass over all keywords.
+    fn matches_keywords(&self, name: &str) -> bool {
+        if self.keywords.is_empty() {
+            return false;
+        }
+        match self
+            .keyword_automaton
+            .get_or_init(|| AhoCorasick::new(&self.keywords).ok())
+        {
+            Some(ac) => ac.is_match(name),
+            // Automaton construction can only fail for pathological patterns;
+            // fall back to the linear scan rather than panicking.
+            None => self.keywords.iter().any(|kw| name.contains(kw.as_str())),
+        }
+    }
+
+    /// Regex match — a single pass of the combined alternation.
+    fn matches_regexes(&self, name: &str) -> bool {
+        if self.regexes.is_empty() {
+            return false;
+        }
+        match self.combined_regex.get_or_init(|| {
+            let pattern = self
+                .regexes
+                .iter()
+                .map(|re| format!("(?:{})", re.as_str()))
+                .collect::<Vec<_>>()
+                .join("|");
+            RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()
+                .ok()
+        }) {
+            Some(re) => re.is_match(name),
+            None => self.regexes.iter().any(|re| re.is_match(name)),
+        }
     }
 }
 
@@ -344,8 +442,7 @@ impl Default for DomainSet {
 impl Matcher for DomainSet {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(q) = ctx.question() {
-            let name = q.name().to_ascii();
-            Ok(self.matches_domain(&name))
+            Ok(self.matches_name(q.name()))
         } else {
             Ok(false)
         }

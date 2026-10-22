@@ -19,20 +19,21 @@
 
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
-use std::collections::HashSet;
 
 /// Matches if the query type is in the allowed set.
 #[derive(Debug, Clone)]
 pub struct QTypeMatcher {
-    allowed: HashSet<u16>,
+    /// Sorted, deduplicated type codes.
+    allowed: Vec<u16>,
 }
 
 impl QTypeMatcher {
     /// Creates a new matcher from a set of allowed record type values.
     pub fn new(types: impl IntoIterator<Item = u16>) -> Self {
-        Self {
-            allowed: types.into_iter().collect(),
-        }
+        let mut allowed: Vec<u16> = types.into_iter().collect();
+        allowed.sort_unstable();
+        allowed.dedup();
+        Self { allowed }
     }
 
     /// Parses a space-separated string of integer type codes.
@@ -48,7 +49,7 @@ impl QTypeMatcher {
 impl Matcher for QTypeMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(q) = ctx.question() {
-            Ok(self.allowed.contains(&q.query_type().into()))
+            Ok(self.allowed.binary_search(&q.query_type().into()).is_ok())
         } else {
             Ok(false)
         }

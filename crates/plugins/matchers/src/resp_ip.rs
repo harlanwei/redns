@@ -4,85 +4,29 @@
 
 //! Response IP matcher — matches A/AAAA IPs in DNS response against CIDR ranges.
 
+use crate::prefix_set::{PrefixSet, parse_cidr};
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
 use std::net::IpAddr;
 
-/// CIDR range (shared logic with client_ip).
-#[derive(Debug, Clone)]
-struct CidrRange {
-    network: IpAddr,
-    prefix_len: u8,
-}
-
-impl CidrRange {
-    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some((addr_str, len_str)) = s.split_once('/') {
-            let network: IpAddr = addr_str.parse()?;
-            let prefix_len: u8 = len_str.parse()?;
-            let max_len = match network {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            if prefix_len > max_len {
-                return Err(format!(
-                    "prefix length {prefix_len} is too large for {network} (max {max_len})"
-                )
-                .into());
-            }
-            Ok(Self {
-                network,
-                prefix_len,
-            })
-        } else {
-            let network: IpAddr = s.parse()?;
-            let prefix_len = match network {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            Ok(Self {
-                network,
-                prefix_len,
-            })
-        }
-    }
-
-    fn contains(&self, addr: &IpAddr) -> bool {
-        match (&self.network, addr) {
-            (IpAddr::V4(net), IpAddr::V4(a)) => {
-                let mask = if self.prefix_len == 0 {
-                    0
-                } else {
-                    !0u32 << (32 - self.prefix_len)
-                };
-                (u32::from(*net) & mask) == (u32::from(*a) & mask)
-            }
-            (IpAddr::V6(net), IpAddr::V6(a)) => {
-                let mask = if self.prefix_len == 0 {
-                    0
-                } else {
-                    !0u128 << (128 - self.prefix_len)
-                };
-                (u128::from(*net) & mask) == (u128::from(*a) & mask)
-            }
-            _ => false,
-        }
-    }
-}
-
 /// Matches A/AAAA records in the DNS response against CIDR ranges.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RespIpMatcher {
-    ranges: Vec<CidrRange>,
+    v4: PrefixSet<u32>,
+    v6: PrefixSet<u128>,
 }
 
 impl RespIpMatcher {
     pub fn new() -> Self {
-        Self { ranges: Vec::new() }
+        Self::default()
     }
 
     pub fn add_cidr(&mut self, cidr: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.ranges.push(CidrRange::parse(cidr)?);
+        let (addr, prefix_len) = parse_cidr(cidr)?;
+        match addr {
+            IpAddr::V4(a) => self.v4.insert(u32::from(a), prefix_len),
+            IpAddr::V6(a) => self.v6.insert(u128::from(a), prefix_len),
+        }
         Ok(())
     }
 
@@ -93,11 +37,12 @@ impl RespIpMatcher {
         }
         Ok(m)
     }
-}
 
-impl Default for RespIpMatcher {
-    fn default() -> Self {
-        Self::new()
+    fn matches_ip(&self, addr: IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(a) => self.v4.contains(u32::from(a)),
+            IpAddr::V6(a) => self.v6.contains(u128::from(a)),
+        }
     }
 }
 
@@ -115,7 +60,7 @@ impl Matcher for RespIpMatcher {
                 _ => None,
             };
             if let Some(ip) = ip
-                && self.ranges.iter().any(|r| r.contains(&ip))
+                && self.matches_ip(ip)
             {
                 return Ok(true);
             }

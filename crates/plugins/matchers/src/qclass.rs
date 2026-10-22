@@ -19,19 +19,20 @@
 
 use redns_core::plugin::PluginResult;
 use redns_core::{Context, Matcher};
-use std::collections::HashSet;
 
 /// Matches if the query class is in the allowed set.
 #[derive(Debug, Clone)]
 pub struct QClassMatcher {
-    allowed: HashSet<u16>,
+    /// Sorted, deduplicated class codes.
+    allowed: Vec<u16>,
 }
 
 impl QClassMatcher {
     pub fn new(classes: impl IntoIterator<Item = u16>) -> Self {
-        Self {
-            allowed: classes.into_iter().collect(),
-        }
+        let mut allowed: Vec<u16> = classes.into_iter().collect();
+        allowed.sort_unstable();
+        allowed.dedup();
+        Self { allowed }
     }
 
     /// Parses a space-separated string of integer class codes.
@@ -47,7 +48,7 @@ impl QClassMatcher {
 impl Matcher for QClassMatcher {
     fn match_ctx(&self, ctx: &Context) -> PluginResult<bool> {
         if let Some(q) = ctx.question() {
-            Ok(self.allowed.contains(&q.query_class().into()))
+            Ok(self.allowed.binary_search(&q.query_class().into()).is_ok())
         } else {
             Ok(false)
         }

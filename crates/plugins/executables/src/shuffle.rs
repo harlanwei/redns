@@ -49,19 +49,7 @@ impl Executable for Shuffle {
 }
 
 fn shuffle_slice<T>(slice: &mut [T]) {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let len = slice.len();
-    if len <= 1 {
-        return;
-    }
-    let state = RandomState::new();
-    for i in (1..len).rev() {
-        let mut hasher = state.build_hasher();
-        hasher.write_usize(i);
-        let j = (hasher.finish() as usize) % (i + 1);
-        slice.swap(i, j);
-    }
+    fastrand::shuffle(slice);
 }
 
 #[cfg(test)]
